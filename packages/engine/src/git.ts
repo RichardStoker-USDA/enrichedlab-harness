@@ -6,12 +6,38 @@ import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import { contained, trustedGit } from "./tools/workspace.ts";
 import { SECRET_NAME } from "./util.ts";
 
+/** Each repository's folders git may write: the working folder, its top, and its git folders (main and worktree). */
+const writableFor = new Map<string, string[]>();
+
+/**
+ * git on the project's own repository. Its settings and attributes are project content (an agent can write them),
+ * and some make git run a program (filter and diff drivers, fsmonitor, hooks), so the engine's git runs contained
+ * like the agent's commands: it may write the repository and nothing else, with no network. Hooks and fsmonitor are
+ * off as well. Where this computer has no facility, it runs as before with those two turned off.
+ */
 function git(cwd: string, args: string[], env?: Record<string, string>): string {
-	// The engine's own git work in the project never runs the repository's hooks or fsmonitor program.
-	return execFileSync("git", ["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", ...args], { cwd, env: { ...process.env, ...env, GIT_TERMINAL_PROMPT: "0" }, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+	const program = trustedGit() ?? "git";
+	const full = [program, "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", ...args];
+	const options = { cwd, env: { ...process.env, ...env, GIT_TERMINAL_PROMPT: "0" }, encoding: "utf8" as const, stdio: ["ignore", "pipe", "pipe"] as ["ignore", "pipe", "pipe"] };
+	let writable = writableFor.get(cwd);
+	if (!writable) {
+		// Asked once per folder, contained to writing nothing: where the repository's folders are.
+		const probe = contained(full[0]!, ["rev-parse", "--show-toplevel", "--absolute-git-dir", "--git-common-dir"], { writable: [], network: "none" });
+		let found: string[] = [cwd];
+		try {
+			found = [cwd, ...execFileSync(probe.file, probe.args, options).trim().split("\n").map((p) => resolve(cwd, p))];
+		} catch {
+			// Not a repository yet (git init comes next): the folder itself.
+		}
+		writable = [...new Set(found)];
+		writableFor.set(cwd, writable);
+	}
+	const launch = contained(full[0]!, full.slice(1), { writable, network: "none" });
+	return execFileSync(launch.file, launch.args, options).trim();
 }
 
 /** The repository's top folder, or undefined outside git. */

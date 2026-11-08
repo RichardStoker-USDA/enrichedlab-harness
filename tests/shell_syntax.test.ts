@@ -4,10 +4,11 @@
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { closeSync, constants, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { LabConfig } from "../packages/engine/src/config.ts";
 import { allowKeys, decide, HIDDEN_REASON, PUSH_REASON } from "../packages/engine/src/permissions.ts";
+import { snapshot } from "../packages/engine/src/git.ts";
 import { mkdirPhysical, openPhysical, unlinkPhysical } from "../packages/engine/src/tools/anchored.ts";
 import { isReadOnlyCommand } from "../packages/engine/src/tools/shell.ts";
 import type { Tool } from "../packages/engine/src/tools/types.ts";
@@ -301,6 +302,29 @@ describe("round 5: one boundary", () => {
 		const lab = new SandboxWorkspace({ title: "Field Lab", run: async () => ({ exitCode: 0, stdout: "el-fence no\n", stderr: "" }) } as unknown as SandboxApi, "/sandbox/work/p");
 		await lab.prepare();
 		expect(decide(edit, { path: "notes.txt" }, lab, mode("auto"), new Set()).action).toBe("ask");
+	});
+
+	test.skipIf(process.platform !== "darwin")("the engine's own git runs a project's filter drivers contained", () => {
+		const repo = realpathSync(mkdtempSync(join(tmpdir(), "el-gitfilter-")));
+		// Outside the project and outside the temp folders contained commands may write.
+		const outside = realpathSync(mkdtempSync(join(homedir(), ".el-gitfilter-out-")));
+		try {
+			const git = trustedGit()!;
+			spawnSync(git, ["init", "-q"], { cwd: repo });
+			// Project content an agent can write: a filter that tries to write outside the project.
+			spawnSync(git, ["config", "filter.evil.clean", `sh -c 'touch ${outside}/pwned; cat'`], { cwd: repo });
+			writeFileSync(join(repo, ".gitattributes"), "* filter=evil\n");
+			writeFileSync(join(repo, "a.txt"), "x");
+			try {
+				snapshot(repo, "s1", "test");
+			} catch {
+				// A failing filter may fail the snapshot; what matters is where it could write.
+			}
+			expect(existsSync(join(outside, "pwned"))).toBe(false);
+		} finally {
+			rmSync(repo, { recursive: true, force: true });
+			rmSync(outside, { recursive: true, force: true });
+		}
 	});
 });
 
