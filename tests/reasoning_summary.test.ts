@@ -120,6 +120,46 @@ describe("reasoning summaries", () => {
 		expect(lab.asked).not.toContain("summary");
 	});
 
+	test("each step's reasoning goes only where its own model runs, even when the model changes while a summary is out", async () => {
+		// The cloud model's summary is held until the session has moved to a model on this computer and made a step.
+		let release = () => undefined as void;
+		const held = new Promise<void>((resolve) => (release = resolve));
+		const asked: { cloud: string[]; device: string[] } = { cloud: [], device: [] };
+		const chunk = (delta: Record<string, unknown>, finish?: string) => `data: ${JSON.stringify({ choices: [{ index: 0, delta, finish_reason: finish ?? null }] })}\n\n`;
+		const serve = (name: "cloud" | "device") => {
+			const s = Bun.serve({
+				port: 0,
+				hostname: "127.0.0.1",
+				async fetch(request) {
+					const body = (await request.json()) as { messages: { role: string; content: string }[] };
+					const system = body.messages[0]?.content ?? "";
+					const kind = system.startsWith("You summarize") ? "summary" : system.startsWith("You name") ? "title" : "step";
+					asked[name].push(kind === "summary" ? `summary:${body.messages.at(-1)?.content.includes(`${name} thinking`) ? name : "other"}` : kind);
+					if (kind === "summary" && name === "cloud") await held;
+					const parts = kind === "step" ? [chunk({ reasoning_content: `${name} thinking. `.repeat(40) }), chunk({ content: "Done." }), chunk({}, "stop")] : [chunk({ content: kind === "summary" ? `${name} summary.` : "Plots" }), chunk({}, "stop")];
+					return new Response(parts.join("") + "data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } });
+				},
+			});
+			afterAll(() => s.stop(true));
+			return `http://127.0.0.1:${s.port}/v1`;
+		};
+		const cloud = profile("cloud/reasoner", serve("cloud"), { kind: "cloud", name: "Example" });
+		const device = profile("local/qwen3-30b", serve("device"), { kind: "device", name: "this computer" });
+		const runtime = session("s5", [cloud, device], DEFAULT_CONFIG);
+		const settle = async (until: () => boolean) => {
+			for (let i = 0; i < 300 && !until(); i++) await Bun.sleep(10);
+		};
+		runtime.prompt("Compare the plots.");
+		await settle(() => asked.cloud.some((k) => k.startsWith("summary")) && !runtime.isRunning);
+		runtime.setModel(device.ref, undefined);
+		runtime.prompt("Now the second pair.");
+		await settle(() => runtime.events.filter((e) => e.t === "assistant").length >= 2 && !runtime.isRunning);
+		release();
+		await settle(() => runtime.events.filter((e) => e.t === "reasoning_summary").length >= 2);
+		expect(asked.cloud.filter((k) => k.startsWith("summary"))).toEqual(["summary:cloud"]);
+		expect(asked.device.filter((k) => k.startsWith("summary"))).toEqual(["summary:device"]);
+	});
+
 	test("not chosen, summaries go to a fast model in the same place, never elsewhere, and on this computer to the session's own", () => {
 		const lab: ModelWhere = { kind: "lab", name: "Field Lab" };
 		const big = profile("lab/qwen3-235b", "https://lab.example.org/v1", lab);
