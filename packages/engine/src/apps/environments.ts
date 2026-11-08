@@ -5,9 +5,8 @@
 
 import { createHash } from "node:crypto";
 import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync, statSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { contained, physical } from "../tools/workspace.ts";
+import { contained, containedTempEnvironment, physical, safeTemp } from "../tools/workspace.ts";
 
 export const PIXI_VERSION = "0.82.0";
 
@@ -84,8 +83,9 @@ export async function inEnvironment(dir: string, command: string[], tools: strin
 	// pixi keeps conda packages, repodata and its uv cache under PIXI_CACHE_DIR.
 	const caches = join(tools, "pixi-cache");
 	mkdirSync(caches, { recursive: true });
-	const env: Record<string, string> = { PIXI_NO_PATH_UPDATE: "1", PIXI_CACHE_DIR: caches, PIXI_HOME: caches };
-	for (const key of ["PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "SYSTEMROOT", "SSL_CERT_FILE", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY"]) if (process.env[key]) env[key] = process.env[key]!;
+	const inherited: Record<string, string> = { PIXI_NO_PATH_UPDATE: "1", PIXI_CACHE_DIR: caches, PIXI_HOME: caches };
+	for (const key of ["PATH", "HOME", "LANG", "LC_ALL", "SYSTEMROOT", "SSL_CERT_FILE", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY"]) if (process.env[key]) inherited[key] = process.env[key]!;
+	const env = containedTempEnvironment(inherited);
 	const launch = contained(program, ["install", "--manifest-path", manifest], { writable: [home, physical(caches)], readable: [program], network: "all", exact: true });
 	// Build scripts never run uncontained: without a facility here, nothing is installed (the consent card says contained).
 	if (!launch.facility) throw new Error("This computer has no sandbox to contain the app's install (Seatbelt on macOS, bubblewrap on Linux), so nothing was installed.");
@@ -93,7 +93,7 @@ export async function inEnvironment(dir: string, command: string[], tools: strin
 	// is watched for edits.
 	let install: ReturnType<typeof Bun.spawn>;
 	try {
-		install = Bun.spawn([launch.file, ...launch.args], { cwd: tmpdir(), stdio: ["ignore", "pipe", "pipe", ...(launch.pass ?? [])], env });
+		install = Bun.spawn([launch.file, ...launch.args], { cwd: safeTemp(), stdio: ["ignore", "pipe", "pipe", ...(launch.pass ?? [])], env });
 		const lines = async (stream: ReadableStream<Uint8Array>) => {
 			for await (const chunk of stream) for (const line of new TextDecoder().decode(chunk).split(/\r|\n/)) if (line.trim()) log(line.trim());
 		};

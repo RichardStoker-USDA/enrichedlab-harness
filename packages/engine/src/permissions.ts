@@ -13,7 +13,7 @@ import { lstatSync, readlinkSync, realpathSync, statSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import type { FolderAccess, LabConfig, PermissionMode } from "./config.ts";
 import { allowedCommand, isReadOnlyCommand, type Judging, pathsInside } from "./tools/shell.ts";
-import { everyCommand, plainCommands } from "./tools/shell_syntax.ts";
+import { everyCommand, everyPowerShellCommand, plainCommands } from "./tools/shell_syntax.ts";
 import type { Tool } from "./tools/types.ts";
 import { isOpenPort } from "./sites/port_proxy.ts";
 import { FULL_CONTAINMENT, physical } from "./tools/workspace.ts";
@@ -222,6 +222,20 @@ const WRAPPERS = new Set(["command", "builtin", "exec", "env", "xargs", "nice", 
 
 /** A glob pattern as a regular expression for one name, as bash matches it. */
 function patternRegex(pattern: string): RegExp | undefined {
+	// These replacements are used only against the fixed ASCII publishing names below. Unsupported POSIX,
+	// equivalence and collating classes stay unresolved and therefore fail closed.
+	const posix: Record<string, string> = {
+		alnum: "A-Za-z0-9", alpha: "A-Za-z", ascii: "\\x00-\\x7f", blank: " \\t", cntrl: "\\x00-\\x1f\\x7f",
+		digit: "0-9", graph: "\\x21-\\x7e", lower: "a-z", print: "\\x20-\\x7e", space: " \\t\\r\\n\\v\\f",
+		upper: "A-Z", word: "A-Za-z0-9_", xdigit: "A-Fa-f0-9",
+	};
+	let unsupported = false;
+	pattern = pattern.replace(/\[:([a-z]+):\]/gi, (_all, name: string) => {
+		const translated = posix[name.toLowerCase()];
+		if (translated === undefined) unsupported = true;
+		return translated ?? "";
+	});
+	if (unsupported || /\[\[[.=]/.test(pattern)) return undefined;
 	let out = "";
 	for (let i = 0; i < pattern.length; i++) {
 		const c = pattern[i]!;
@@ -254,7 +268,7 @@ function patternRegex(pattern: string): RegExp | undefined {
  * expands or arrives on its input, or a line that doesn't parse.
  */
 function publishing(command: string, depth = 0): "push" | "hidden" | undefined {
-	const line = everyCommand(command);
+	const line = process.platform === "win32" ? everyPowerShellCommand(command) : everyCommand(command);
 	if (!line || depth > 4) return /\bgit\b|\bpush\b|\bsend-pack\b/i.test(command) ? "push" : "hidden";
 	const name = (w: string) => {
 		const base = w.replace(process.platform === "win32" ? /^.*[\\/]/ : /^.*\//, "");
@@ -285,7 +299,7 @@ function publishing(command: string, depth = 0): "push" | "hidden" | undefined {
 		}
 		// A wrapper given an expanded word (command "$CMD" push), env splitting a string into a command (env -S), or
 		// git settings handed to env (env GIT_SSH_COMMAND=...): what runs depends on more than the line.
-		if (WRAPPERS.has(lead) && argv.includes(undefined)) hidden = true;
+		if (WRAPPERS.has(lead) && (argv.includes(undefined) || patterns.some((pattern) => pattern !== undefined))) hidden = true;
 		if (lead === "env" && argv.some((w) => w !== undefined && (/^(-[a-zA-Z]*S|--split-string)/.test(w) || /^GIT_/i.test(w)))) hidden = true;
 		for (let i = 0; i < argv.length; i++) {
 			// git's publishing programs named directly (git-send-pack, git-push).

@@ -6,7 +6,7 @@
 
 import { CString, dlopen, FFIType, toArrayBuffer, type Pointer } from "bun:ffi";
 import { randomBytes } from "node:crypto";
-import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, rmdirSync, rmSync } from "node:fs";
+import { chmodSync, closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, rmdirSync, rmSync } from "node:fs";
 import { dirname, isAbsolute, join, sep } from "node:path";
 
 const DARWIN_NOFOLLOW_ANY = 0x20000000;
@@ -124,7 +124,7 @@ export function holdFolder(path: string): number {
 /** Hold a Linux project through launch and cleanup. Every walk and rename is relative to held, no-follow folders. */
 export function holdGitEntries(path: string, maxEntries = 50_000, maxDepth = 64): {
 	paths: string[];
-	quarantine(): { moved: { from: string; to: string }[]; error?: string };
+	quarantine(final?: boolean): { moved: { from: string; to: string }[]; error?: string };
 	release(): void;
 } {
 	if (process.platform !== "linux") throw new Error("Git quarantine is for Linux.");
@@ -135,19 +135,26 @@ export function holdGitEntries(path: string, maxEntries = 50_000, maxDepth = 64)
 		released = true;
 	};
 	const errno = new Int32Array(toArrayBuffer(lib().__errno_location(), 0, 4));
-	const walk = (visit: (dir: number, name: string, relative: string) => void) => {
+	const walk = (visit: (dir: number, name: string, relative: string) => void, final = false) => {
 		if (released) throw new Error("The project folder is no longer held.");
 		let seen = 0;
 		const descend = (dir: number, relative: string, depth: number) => {
-			// A fresh open gives each scan its own directory position; dup would share the previous scan's offset.
-			const opened = lib().openat(dir, c("."), constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW | LINUX_O_CLOEXEC, 0);
-			if (opened < 0) throw new Error(`Couldn't scan ${relative || "."} for .git entries.`);
-			const stream = lib().fdopendir(opened);
-			if (!stream) {
-				lib().close(opened);
-				throw new Error(`Couldn't enumerate ${relative || "."}.`);
-			}
+			// After every sandbox process has ended, temporarily restore owner access that the command removed. The
+			// held descriptor names the same directory even if its path was renamed. Restore the command's mode after
+			// the scan. The earlier foreground pass never changes modes while a background child may still be running.
+			const originalMode = fstatSync(dir).mode & 0o7777;
+			const changedMode = final && (originalMode & 0o700) !== 0o700;
+			if (changedMode) chmodSync(`/proc/self/fd/${dir}`, originalMode | 0o700);
+			let stream: Pointer | null = null;
 			try {
+				// A fresh open gives each scan its own directory position; dup would share the previous scan's offset.
+				const opened = lib().openat(dir, c("."), constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW | LINUX_O_CLOEXEC, 0);
+				if (opened < 0) throw new Error(`Couldn't scan ${relative || "."} for .git entries.`);
+				stream = lib().fdopendir(opened);
+				if (!stream) {
+					lib().close(opened);
+					throw new Error(`Couldn't enumerate ${relative || "."}.`);
+				}
 				for (;;) {
 					errno[0] = 0;
 					const entry = lib().readdir(stream);
@@ -157,7 +164,7 @@ export function holdGitEntries(path: string, maxEntries = 50_000, maxDepth = 64)
 					}
 					const name = new CString(entry, 19).toString();
 					if (name === "." || name === "..") continue;
-					if (++seen > maxEntries) throw new Error(`The project has more than ${maxEntries} entries; .git protection couldn't be completed.`);
+					if (!final && ++seen > maxEntries) throw new Error(`The project has more than ${maxEntries} entries; .git protection couldn't be completed.`);
 					const next = relative ? `${relative}/${name}` : name;
 					if (name.toLowerCase() === ".git") {
 						visit(dir, name, next);
@@ -167,7 +174,7 @@ export function holdGitEntries(path: string, maxEntries = 50_000, maxDepth = 64)
 					if (child < 0) throw new Error(`Couldn't check ${next} during the .git scan.`);
 					try {
 						if (fstatSync(child).isDirectory()) {
-							if (depth >= maxDepth) throw new Error(`The project is deeper than ${maxDepth} folders; .git protection couldn't be completed.`);
+							if (!final && depth >= maxDepth) throw new Error(`The project is deeper than ${maxDepth} folders; .git protection couldn't be completed.`);
 							descend(child, next, depth + 1);
 						}
 					} finally {
@@ -175,24 +182,29 @@ export function holdGitEntries(path: string, maxEntries = 50_000, maxDepth = 64)
 					}
 				}
 			} finally {
-				lib().closedir(stream);
+				if (stream) lib().closedir(stream);
+				if (changedMode) chmodSync(`/proc/self/fd/${dir}`, originalMode);
 			}
 		};
 		descend(root, "", 0);
 	};
-	const identity = (dir: number, name: string): string => {
+	const identity = (dir: number, name: string): { id: string; symlink: boolean } => {
 		const fd = lib().openat(dir, c(name), LINUX_O_PATH | constants.O_NOFOLLOW | LINUX_O_CLOEXEC, 0);
 		if (fd < 0) throw new Error(`Couldn't check the identity of ${name}.`);
 		try {
 			const stat = fstatSync(fd, { bigint: true });
-			return `${stat.dev}:${stat.ino}`;
+			return { id: `${stat.dev}:${stat.ino}`, symlink: stat.isSymbolicLink() };
 		} finally {
 			lib().close(fd);
 		}
 	};
 	const initial = new Map<string, string>();
 	try {
-		walk((dir, name, relative) => initial.set(relative, identity(dir, name)));
+		walk((dir, name, relative) => {
+			const entry = identity(dir, name);
+			if (entry.symlink) throw new Error(`${relative} is a symbolic link. Linux commands cannot run until the .git link is replaced with Git's regular directory or pointer-file layout.`);
+			initial.set(relative, entry.id);
+		});
 	} catch (error) {
 		release();
 		throw error;
@@ -200,18 +212,18 @@ export function holdGitEntries(path: string, maxEntries = 50_000, maxDepth = 64)
 	return {
 		paths: [...initial.keys()].map((relative) => join(path, relative)),
 		release,
-		quarantine() {
+		quarantine(final = true) {
 			const moved: { from: string; to: string }[] = [];
 			try {
 				walk((dir, name, relative) => {
 					// Moving an old metadata directory away and making a new one at its name is still a new entry.
-					if (initial.get(relative) === identity(dir, name)) return;
+					if (initial.get(relative) === identity(dir, name).id) return;
 					const blocked = `.git.enrichedlab-blocked-${randomBytes(6).toString("hex")}`;
 					// renameat2 never follows the final entry, even if it is a symlink. NOREPLACE prevents any loss of
 					// existing data at the destination. No pathname lookup can escape the held parent folder.
 					if (lib().renameat2(dir, c(name), dir, c(blocked), 1) !== 0) throw new Error(`Couldn't move aside ${relative} (errno ${errno[0]}).`);
 					moved.push({ from: relative, to: join(dirname(relative), blocked) });
-				});
+				}, final);
 				return { moved };
 			} catch (error) {
 				return { moved, error: (error as Error).message };

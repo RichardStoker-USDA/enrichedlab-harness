@@ -8,7 +8,7 @@ import { closeSync, constants, existsSync, linkSync, mkdtempSync, readFileSync, 
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { inflateSync } from "node:zlib";
 import { mkdirPhysical, openPhysical, unlinkPhysical } from "./tools/anchored.ts";
-import { contained, engineEnvironment, FULL_CONTAINMENT, GIT_SETTINGS_PATTERNS, physical, projectGitPattern, safeTemp, sandboxer, trustedGit, type CommitTarget } from "./tools/workspace.ts";
+import { contained, engineEnvironment, engineTemp, FULL_CONTAINMENT, GIT_SETTINGS_PATTERNS, physical, projectGitPattern, sandboxer, trustedGit, type CommitTarget } from "./tools/workspace.ts";
 import { SECRET_NAME } from "./util.ts";
 
 /**
@@ -18,13 +18,14 @@ import { SECRET_NAME } from "./util.ts";
  * no network, no keys or tokens in its environment, hooks and fsmonitor off, and the repository's settings, hooks and
  * info folder read only. Where this computer can't contain it, it doesn't run (snapshots and worktrees are off there).
  */
-function git(cwd: string, args: string[], env?: Record<string, string>, scratch: string[] = []): string {
+/** `scratch`: folders the call writes (a temporary index, a bundle being made). `readable`: files it only reads. */
+function git(cwd: string, args: string[], env?: Record<string, string>, scratch: string[] = [], readable: string[] = []): string {
 	const program = trustedGit();
 	if (!program) throw new Error("No git from the system's or Homebrew's own folders was found, so the engine's git work didn't run.");
 	const full = ["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgSign=false", ...args];
 	const facility = sandboxer();
 	if (!facility || !FULL_CONTAINMENT.has(facility)) throw new Error("This computer has no sandbox for the engine's git work (Seatbelt on macOS, bubblewrap on Linux), so it didn't run.");
-	const options = { cwd, env: engineEnvironment({ ...env, GIT_TERMINAL_PROMPT: "0" }), encoding: "utf8" as const };
+	const probeOptions = { cwd, env: engineEnvironment({ ...env, GIT_TERMINAL_PROMPT: "0" }), encoding: "utf8" as const };
 	const here = physical(cwd);
 	// Where the repository's folders are, asked each time under containment that writes nothing. The answers are
 	// project content (a .git file, core.worktree), so they widen what git may write only in layouts git makes itself:
@@ -35,7 +36,7 @@ function git(cwd: string, args: string[], env?: Record<string, string>, scratch:
 	let writable = [here, ...scratchFolders];
 	const probe = contained(program, ["rev-parse", "--show-toplevel", "--git-common-dir"], { writable: [], readable: [here], network: "none" });
 	try {
-		const [top = "", common = ""] = execFileSync(probe.file, probe.args, { ...options, stdio: ["ignore", "pipe", "pipe"] }).trim().split("\n").map((p) => physical(resolve(cwd, p)));
+		const [top = "", common = ""] = execFileSync(probe.file, probe.args, { ...probeOptions, stdio: ["ignore", "pipe", "pipe"] }).trim().split("\n").map((p) => physical(resolve(cwd, p)));
 		if (common === join(top, ".git") && within(here, top)) writable = [...new Set([here, top, common, ...scratchFolders])];
 		else if (within(common, here) || within(here, common)) writable = [...new Set([here, common, ...scratchFolders])];
 	} catch {
@@ -43,12 +44,19 @@ function git(cwd: string, args: string[], env?: Record<string, string>, scratch:
 	}
 	const gitDirs = writable.filter((w) => basename(w) === ".git" || existsSync(join(w, "HEAD"))).concat(writable.map((w) => join(w, ".git")).filter((g) => existsSync(g)));
 	const protect = [...new Set(gitDirs)].flatMap((g) => [join(g, "config"), join(g, "hooks"), join(g, "info")]);
+	const processTemp = mkdtempSync(join(engineTemp(), "git-run-"));
+	writable = [...new Set([...writable, processTemp])];
+	const options = { cwd, env: engineEnvironment({ ...env, GIT_TERMINAL_PROMPT: "0", TMPDIR: processTemp, TMP: processTemp, TEMP: processTemp }), encoding: "utf8" as const };
 	// Each folder granted as the one just checked (bubblewrap binds it by handle; Seatbelt judges real paths).
-	const launch = contained(program, full, { writable, network: "none", exact: true, protect, protectPatterns: GIT_SETTINGS_PATTERNS });
 	try {
-		return execFileSync(launch.file, launch.args, { ...options, stdio: ["ignore", "pipe", "pipe", ...(launch.pass ?? [])] }).trim();
+		const launch = contained(program, full, { writable, readable: readable.map(physical), network: "none", exact: true, protect, protectPatterns: GIT_SETTINGS_PATTERNS });
+		try {
+			return execFileSync(launch.file, launch.args, { ...options, stdio: ["ignore", "pipe", "pipe", ...(launch.pass ?? [])] }).trim();
+		} finally {
+			launch.release?.();
+		}
 	} finally {
-		launch.release?.();
+		rmSync(processTemp, { recursive: true, force: true });
 	}
 }
 
@@ -59,16 +67,21 @@ function exactGit(cwd: string, args: string[], writable: string[], env: Record<s
 	const facility = sandboxer();
 	if (!facility || !FULL_CONTAINMENT.has(facility)) throw new Error("This computer has no sandbox for the engine's git work (Seatbelt on macOS, bubblewrap on Linux), so it didn't run.");
 	const full = ["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgSign=false", "-c", "gc.auto=0", ...args];
-	const launch = contained(program, full, { writable: writable.map(physical), readable: readable.map(physical), network: "none", exact: true, protect, protectPatterns });
+	const processTemp = mkdtempSync(join(engineTemp(), "git-run-"));
 	try {
-		return execFileSync(launch.file, launch.args, {
-			cwd,
-			env: engineEnvironment({ ...env, GIT_TERMINAL_PROMPT: "0" }),
-			encoding: "utf8",
-			stdio: ["ignore", "pipe", "pipe", ...(launch.pass ?? [])],
-		}).trim();
+		const launch = contained(program, full, { writable: [...writable, processTemp], readable: readable.map(physical), network: "none", exact: true, protect, protectPatterns });
+		try {
+			return execFileSync(launch.file, launch.args, {
+				cwd,
+				env: engineEnvironment({ ...env, GIT_TERMINAL_PROMPT: "0", TMPDIR: processTemp, TMP: processTemp, TEMP: processTemp }),
+				encoding: "utf8",
+				stdio: ["ignore", "pipe", "pipe", ...(launch.pass ?? [])],
+			}).trim();
+		} finally {
+			launch.release?.();
+		}
 	} finally {
-		launch.release?.();
+		rmSync(processTemp, { recursive: true, force: true });
 	}
 }
 
@@ -112,7 +125,7 @@ export function removeWorktree(root: string, path: string, branch?: string, drop
  * Returns the commit id.
  */
 export function snapshot(cwd: string, sessionId: string, message: string): string {
-	const scratch = mkdtempSync(join(safeTemp(), "git-index-"));
+	const scratch = mkdtempSync(join(engineTemp(), "git-index-"));
 	try {
 		const env = { GIT_INDEX_FILE: join(scratch, "index") };
 		git(cwd, ["add", "-A", "."], env);
@@ -142,7 +155,7 @@ export function restoreSnapshot(cwd: string, commit: string): string[] {
 	const now = snapshot(cwd, "restore-scratch", "before restore");
 	const changed = git(cwd, ["diff", "--name-only", commit, now]).split("\n").filter(Boolean);
 	if (changed.length) {
-		const scratch = mkdtempSync(join(safeTemp(), "git-index-"));
+		const scratch = mkdtempSync(join(engineTemp(), "git-index-"));
 		try {
 			const env = { GIT_INDEX_FILE: join(scratch, "index") };
 			git(cwd, ["read-tree", commit], env);
@@ -212,7 +225,7 @@ function metadataGit(target: CommitTarget, args: string[], env: Record<string, s
 /** Stage in an isolated repository, then update only the branch named by the permission decision. */
 export function commit(target: CommitTarget, message: string, verify: () => boolean): string {
 	if (!verify()) throw new Error("The repository or branch changed after git_commit was allowed, so nothing was committed.");
-	const scratch = mkdtempSync(join(safeTemp(), "git-commit-"));
+	const scratch = mkdtempSync(join(engineTemp(), "git-commit-"));
 	const stage = join(scratch, "repo.git");
 	try {
 		exactGit(scratch, ["init", "--quiet", "--bare", `--object-format=${target.objectFormat}`, stage], [scratch]);
@@ -272,7 +285,7 @@ export interface Pack {
 export function packForSend(repo: string, bundle: string): Pack {
 	const id = randomBytes(4).toString("hex");
 	const ref = `refs/enrichedlab/send/${id}`;
-	const scratch = mkdtempSync(join(safeTemp(), "git-index-"));
+	const scratch = mkdtempSync(join(engineTemp(), "git-index-"));
 	try {
 		const env = { GIT_INDEX_FILE: join(scratch, "index") };
 		let head: string | undefined;
@@ -321,7 +334,8 @@ export function fetchBundle(repo: string, bundle: string, source: string, branch
 	// The bundle is a file EnrichedLab downloaded: only the file transport, never a network or helper transport.
 	// A folder would make git start upload-pack there; only a plain file is a bundle.
 	if (!isAbsolute(bundle) || !statSync(bundle, { throwIfNoEntry: false })?.isFile()) throw new Error(`${bundle} isn't a bundle file.`);
-	git(repo, ["fetch", "-q", "--no-recurse-submodules", bundle, `${source}:${temp}`], { GIT_ALLOW_PROTOCOL: "file" }, [dirname(bundle)]);
+	// Fetching only reads the bundle: it's granted read only, wherever it sits (bubblewrap's /tmp is private).
+	git(repo, ["fetch", "-q", "--no-recurse-submodules", bundle, `${source}:${temp}`], { GIT_ALLOW_PROTOCOL: "file" }, [], [bundle]);
 	try {
 		const tip = home === base ? git(repo, ["rev-parse", temp]) : rebuild(repo, base, home, temp);
 		git(repo, ["update-ref", `refs/heads/${branch}`, tip]);
@@ -334,7 +348,7 @@ export function fetchBundle(repo: string, bundle: string, source: string, branch
 /** The commits `from..tip` made again on `onto`, with the files `onto` has and `from` lacks put back. Returns the new tip. */
 function rebuild(repo: string, from: string, onto: string, tip: string): string {
 	const restore = git(repo, ["diff", "--name-only", "--diff-filter=A", "-z", from, onto]).split("\0").filter(Boolean);
-	const scratch = mkdtempSync(join(safeTemp(), "git-rebuild-"));
+	const scratch = mkdtempSync(join(engineTemp(), "git-rebuild-"));
 	const env = { GIT_INDEX_FILE: join(scratch, "index") };
 	const made = new Map([[from, onto]]);
 	let last = onto;

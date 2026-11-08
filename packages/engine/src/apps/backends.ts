@@ -17,7 +17,7 @@ import { basename, dirname, join } from "node:path";
 import { Client, type Transport } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import type { AppToolResult } from "@enrichedlab/protocol";
-import { contained, type NetworkAccess } from "../tools/workspace.ts";
+import { contained, containedTempEnvironment, type NetworkAccess } from "../tools/workspace.ts";
 import { VERSION } from "../util.ts";
 import type { AppManifest } from "./manifest.ts";
 import { hasEnvironment, inEnvironment } from "./environments.ts";
@@ -100,11 +100,11 @@ function runnerPath(runDir: string): string {
 
 function baseEnv(manifest: AppManifest, ctx: BackendContext): Record<string, string> {
 	const env: Record<string, string> = {};
-	for (const key of ["PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "SYSTEMROOT", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "R_LIBS_USER", "R_HOME"]) {
+	for (const key of ["PATH", "HOME", "LANG", "LC_ALL", "SYSTEMROOT", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "R_LIBS_USER", "R_HOME"]) {
 		const value = process.env[key];
 		if (value !== undefined) env[key] = value;
 	}
-	return { ...env, APP_NAME: manifest.name, APP_VERSION: manifest.version, APP_DATA_DIR: ctx.dataDir, ...(ctx.projectDir ? { PROJECT_DIR: ctx.projectDir } : {}) };
+	return containedTempEnvironment({ ...env, APP_NAME: manifest.name, APP_VERSION: manifest.version, APP_DATA_DIR: ctx.dataDir, ...(ctx.projectDir ? { PROJECT_DIR: ctx.projectDir } : {}) });
 }
 
 async function connectStdio(command: string, args: string[], env: Record<string, string>, cwd: string, ctx: BackendContext): Promise<McpBackend> {
@@ -345,7 +345,7 @@ export async function startBackend(manifest: AppManifest, ctx: BackendContext): 
 			// folder and its reload.
 			const launch = contained(program!, args, { writable: [ctx.dataDir, join(ctx.dir, ".pixi")], readable: [ctx.dir, ctx.toolsDir], network: ctx.network ? "all" : "loopback", server: true });
 			uncontainedOk(launch);
-			const proc = spawn(launch.file, launch.args, { cwd: ctx.dir, env: { ...env, PORT: String(port), HOST: "127.0.0.1", TMPDIR: ctx.dataDir }, stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" });
+			const proc = spawn(launch.file, launch.args, { cwd: ctx.dir, env: { ...env, PORT: String(port), HOST: "127.0.0.1" }, stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" });
 			for (const stream of [proc.stdout, proc.stderr]) stream?.on("data", (chunk: Buffer) => chunk.toString("utf8").split("\n").forEach((line) => line.trim() && ctx.log(line)));
 			const url = `http://127.0.0.1:${port}${backend.path ?? "/"}`;
 			try {

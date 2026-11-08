@@ -1,7 +1,7 @@
-// Shell lines read the way the shell reads them: mvdan/sh's parser (compiled to WebAssembly, through sh-syntax)
-// gives the syntax tree, and the words each command receives come from it once quotes and escapes are done. A word
-// is literal only when its text alone decides it; anything that expands, substitutes or runs code isn't, and a line
-// that holds such a word, a compound command or a here-document has no plain reading (docs/security.md, "Approvals").
+// POSIX shell lines are read with mvdan/sh's parser (compiled to WebAssembly, through sh-syntax), which gives the
+// syntax tree and the words each command receives once quotes and escapes are done. A word is literal only when its
+// text alone decides it; anything that expands, substitutes or runs code isn't. The publishing gate uses the
+// constrained PowerShell reader below on Windows (docs/security.md, "Approvals").
 
 import { readFileSync } from "node:fs";
 // Go's WebAssembly runtime (it defines globalThis.Go). sh-syntax's sideEffects list leaves it out, so a bundle drops a
@@ -204,6 +204,98 @@ export function everyCommand(line: string): { commands: AnyCommand[]; heredocs: 
 	};
 	visit(file.stmts);
 	return { commands, heredocs, functions };
+}
+
+/**
+ * Literal native-command words from PowerShell. Backslashes are ordinary characters there, unlike in bash. This
+ * intentionally accepts only the part of PowerShell whose executed argv is fixed by the line. Variables,
+ * expressions, splatting, script blocks and the stop-parsing token return undefined so publishing fails closed.
+ */
+export function everyPowerShellCommand(line: string): { commands: AnyCommand[]; heredocs: string[]; functions: boolean } | undefined {
+	const commands: AnyCommand[] = [];
+	let words: string[] = [];
+	let patterns: (string | undefined)[] = [];
+	let word = "";
+	let active = false;
+	let patterned = false;
+	let quote: "single" | "double" | undefined;
+	const add = (character: string, quoted: boolean) => {
+		word += character;
+		active = true;
+		if (!quoted && GLOB.has(character)) patterned = true;
+	};
+	const finishWord = () => {
+		if (!active) return;
+		words.push(word);
+		patterns.push(patterned ? word : undefined);
+		word = "";
+		active = false;
+		patterned = false;
+	};
+	const finishCommand = () => {
+		finishWord();
+		if (!words.length) return;
+		if (words.includes("--%")) throw new Error("PowerShell's stop-parsing token hides the command arguments.");
+		commands.push({ words, patterns, assigns: [] });
+		words = [];
+		patterns = [];
+	};
+	try {
+		for (let i = 0; i < line.length; i++) {
+			const character = line[i]!;
+			if (character === "\0") return undefined;
+			if (quote === "single") {
+				if (character === "'" && line[i + 1] === "'") {
+					add("'", true);
+					i++;
+				} else if (character === "'") quote = undefined;
+				else add(character, true);
+				continue;
+			}
+			if (quote === "double") {
+				if (character === "`") {
+					if (i + 1 >= line.length) return undefined;
+					if (line[i + 1] === "\r" && line[i + 2] === "\n") i += 2;
+					else if (line[i + 1] === "\n") i++;
+					else add(line[++i]!, true);
+				} else if (character === '"') quote = undefined;
+				else if (character === "$") return undefined;
+				else add(character, true);
+				continue;
+			}
+			if (character === "`") {
+				if (i + 1 >= line.length) return undefined;
+				if (line[i + 1] === "\r" && line[i + 2] === "\n") i += 2;
+				else if (line[i + 1] === "\n") i++;
+				else add(line[++i]!, true);
+			} else if (character === "'") {
+				active = true;
+				quote = "single";
+			} else if (character === '"') {
+				active = true;
+				quote = "double";
+			} else if (character === "#") {
+				finishCommand();
+				while (i + 1 < line.length && line[i + 1] !== "\n") i++;
+			} else if (/\s/.test(character)) {
+				finishWord();
+				if (character === "\n") finishCommand();
+			} else if (character === ";" || character === "|") {
+				finishCommand();
+				if (line[i + 1] === character) i++;
+			} else if (character === "&") {
+				// At the start of a command this is PowerShell's call operator. Else it separates/backgrounds commands.
+				if (active || words.length) finishCommand();
+				if (line[i + 1] === "&") i++;
+			} else if ("$@{}()".includes(character)) return undefined;
+			else add(character, false);
+		}
+		if (quote) return undefined;
+		finishCommand();
+	} catch {
+		return undefined;
+	}
+	return { commands, heredocs: [], functions: false };
 }
 
 /** A word's source text as far as it is literal, for scanning (here-document bodies). */

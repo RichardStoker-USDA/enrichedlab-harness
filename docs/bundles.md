@@ -15,11 +15,13 @@ How EnrichedLab handles git on a person's computer and in a lab sandbox, and how
   ones merged into the current branch.
 - **What asks.** In its own recorded worktree the agent edits files and uses the built-in `git_commit` tool without asking.
   File tools reject `.git` paths. With the local sandbox on, macOS shell commands also reject them. Linux shell
-  commands can write the worktree, with existing `.git` entries bound read only and new ones moved aside when the
-  command and its background children end. A new `.git` exists until cleanup; see [security.md](security.md).
+  commands can write the worktree. Existing regular `.git` entries are bound read only, existing `.git` symbolic
+  links refuse launch, and normal completion moves new entries aside after all background children end. A new
+  `.git` exists until cleanup, and an engine crash can prevent cleanup; see [security.md](security.md).
   `git_commit` stages all changes and commits
   through an isolated staging repository, then rechecks the recorded repository, worktree admin directory, branch
-  and old commit before advancing only that branch. Project helpers have no shared metadata write grant. Outside the
+  and old commit before advancing only that branch. Its staging scratch is not in the temp folder agent commands can
+  write, and project helpers have no shared metadata write grant. Outside the
   session's recorded worktree the question names the repository and branch it covers, except that Allow Everything
   keeps its no-question behavior with the same target checks. Worktrees need Seatbelt or bubblewrap;
   elsewhere sessions work in the checkout. `git push` (and `send-pack`, `svn dcommit` and the like) asks in every

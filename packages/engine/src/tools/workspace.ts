@@ -151,31 +151,49 @@ export function shellSafe(env: Record<string, string | undefined>): Record<strin
 	return Object.fromEntries(Object.entries(env).filter((entry): entry is [string, string] => entry[1] !== undefined && !drop.test(entry[0]) && !entry[1].startsWith("() {")));
 }
 
-let privateTemp: string | undefined;
+let commandTemp: string | undefined;
+let engineScratch: string | undefined;
 
-/** A private engine-created temp folder. Project content and TMPDIR never choose the containment grant. */
-export function safeTemp(): string {
-	if (privateTemp && existsSync(privateTemp)) return privateTemp;
+function makeTemp(prefix: string): string {
 	const base = process.platform === "darwin" ? "/private/tmp" : process.platform === "linux" ? "/tmp" : join(homedir(), "AppData", "Local", "Temp");
-	privateTemp = mkdtempSync(join(base, "enrichedlab-"));
-	process.once("exit", () => {
-		if (privateTemp) rmSync(privateTemp, { recursive: true, force: true });
-	});
-	return privateTemp;
+	return mkdtempSync(join(base, prefix));
+}
+
+/** The temp folder granted to contained commands, package installers and app backends. */
+export function safeTemp(): string {
+	if (!commandTemp || !existsSync(commandTemp)) commandTemp = makeTemp("enrichedlab-command-");
+	return commandTemp;
+}
+
+/** Engine-only scratch. This folder is never an implicit write grant for an untrusted command. */
+export function engineTemp(): string {
+	if (!engineScratch || !existsSync(engineScratch)) engineScratch = makeTemp("enrichedlab-engine-");
+	return engineScratch;
+}
+
+process.once("exit", () => {
+	for (const path of [commandTemp, engineScratch]) if (path) rmSync(path, { recursive: true, force: true });
+});
+
+/** Override every platform temp variable with the temp folder containment grants. */
+export function containedTempEnvironment(env: Record<string, string> = {}): Record<string, string> {
+	const temp = safeTemp();
+	return { ...env, TMPDIR: temp, TMP: temp, TEMP: temp };
 }
 
 const ENGINE_PATH = process.platform === "win32" ? "C:\\Windows\\System32" : "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin";
 
 /** Minimal environment for engine-owned programs. The only caller Git settings retained disable config files. */
 export function engineEnvironment(extra: Record<string, string> = {}): Record<string, string> {
+	const temp = engineTemp();
 	return {
 		PATH: ENGINE_PATH,
 		HOME: homedir(),
 		LANG: "C",
 		LC_ALL: "C",
-		TMPDIR: safeTemp(),
-		TMP: safeTemp(),
-		TEMP: safeTemp(),
+		TMPDIR: temp,
+		TMP: temp,
+		TEMP: temp,
 		...(process.env.GIT_CONFIG_GLOBAL === "/dev/null" ? { GIT_CONFIG_GLOBAL: "/dev/null" } : {}),
 		...(process.env.GIT_CONFIG_SYSTEM === "/dev/null" ? { GIT_CONFIG_SYSTEM: "/dev/null" } : {}),
 		...extra,
@@ -398,12 +416,13 @@ export function contained(file: string, args: string[], options: { writable: str
 	}
 	const net = options.network === "none" ? [] : ["--share-net"];
 	// Without temp folders (a replay), the private /tmp and /run that hide the host's sockets can't be written either.
+	// Made read only after the binds: bubblewrap makes their mount points first, and a folder under /tmp needs one.
 	const sealed = options.temp === false ? ["--remount-ro", "/tmp", "--remount-ro", "/run"] : [];
 	// The monitor can exit before redirected background children. PID 1 keeps this pipe until the sandbox is empty.
 	const syncFd = options.waitForChildren ? 3 + held.length : undefined;
 	return {
 		file: trustedBwrap() ?? "/usr/bin/bwrap",
-		args: ["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--tmpfs", "/run", ...sealed, ...hidden, ...binds, "--unshare-all", ...net, "--die-with-parent", "--new-session", ...(syncFd === undefined ? [] : ["--sync-fd", String(syncFd)]), "--", file, ...args],
+		args: ["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--tmpfs", "/run", ...hidden, ...binds, ...sealed, "--unshare-all", ...net, "--die-with-parent", "--new-session", ...(syncFd === undefined ? [] : ["--sync-fd", String(syncFd)]), "--", file, ...args],
 		facility,
 		...(syncFd === undefined ? {} : { syncFd }),
 		...(held.length ? { pass: [...held], release: () => held.splice(0).forEach((fd) => closeSync(fd)) } : {}),
@@ -523,8 +542,9 @@ export class LocalWorkspace implements Workspace {
 	}
 
 	/**
-	 * Agent commands write the project with existing .git entries protected. macOS also denies new .git paths;
-	 * Linux moves new entries aside at command completion. Engine git has a separate containment path.
+	 * Agent commands write the project with existing regular .git entries protected. macOS also denies new .git
+	 * paths. Linux refuses existing .git links and moves new entries aside at command completion. Engine git has a
+	 * separate containment path.
 	 */
 	private writable(): { writable: string[]; protect: string[]; protectPatterns: string[] } {
 		return { writable: [this.root], protect: projectGitPaths(this.root), protectPatterns: [projectGitPattern(this.root)] };
@@ -713,15 +733,15 @@ export class LocalWorkspace implements Workspace {
 		// Exact allowCommands argv uses only the person's launch environment. Project activation may select programs
 		// and loader settings from project content, so it is for contained shell commands only.
 		const selected = isContained && !options.argv ? activated(this.root, env) : env;
-		const childEnv: Record<string, string> = {
+		const executionEnvironment: Record<string, string> = {
 			...selected,
-			...(isContained ? { TMPDIR: safeTemp(), TMP: safeTemp(), TEMP: safeTemp() } : {}),
 			LAB_AGENT: "1",
 			PAGER: "cat",
 			GIT_PAGER: "cat",
 			TERM: "dumb",
 			NO_COLOR: "1",
 		};
+		const childEnv = isContained ? containedTempEnvironment(executionEnvironment) : executionEnvironment;
 		let argv = options.argv;
 		if (argv) {
 			if (process.platform === "win32") return Promise.resolve({ exitCode: 126, output: "allowCommands is off on Windows, so this command didn't run.\n", timedOut: false });
@@ -771,18 +791,18 @@ export class LocalWorkspace implements Workspace {
 			child.stdout!.on("data", take);
 			child.stderr!.on("data", take);
 			let cleanupFailed = false;
-			const quarantine = () => {
-				const result = launch.quarantine?.();
+			const quarantine = (final: boolean) => {
+				const result = launch.quarantine?.(final);
 				if (!result) return;
-				for (const { from, to } of result.moved) take(Buffer.from(`\nEnrichedLab moved ${JSON.stringify(from)} to ${JSON.stringify(to)} because it was created during a contained command. New .git entries cannot remain active; nothing was deleted.\n`));
-				if (result.error) {
+				for (const { from, to } of result.moved) take(Buffer.from(`\nEnrichedLab moved ${JSON.stringify(from)} to ${JSON.stringify(to)} because it was created during a contained command. Nothing was deleted.\n`));
+				if (result.error && final) {
 					cleanupFailed = true;
 					take(Buffer.from(`\nEnrichedLab could not finish checking new .git entries: ${result.error}\n`));
 				}
 			};
 			// Foreground completion and, separately, the end of every background child. The sync pipe is part of
 			// child.stdio, so close waits for it even when a background job redirects all its own output.
-			if (launch.quarantine) child.on("exit", quarantine);
+			if (launch.quarantine) child.on("exit", () => quarantine(false));
 			if (launch.syncFd !== undefined) (child.stdio[launch.syncFd] as NodeJS.ReadableStream).resume();
 			const kill = () => {
 				if (closed || !child.pid) return;
@@ -818,7 +838,7 @@ export class LocalWorkspace implements Workspace {
 				failure = `\n${error.message}`;
 			});
 			child.on("close", (code) => {
-				quarantine();
+				quarantine(true);
 				launch.release?.();
 				closed = true;
 				clearTimeout(timer);

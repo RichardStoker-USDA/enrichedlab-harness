@@ -1011,7 +1011,7 @@ describe("repository handoff with secret-looking files in the history", () => {
 		writeFileSync(join(far, "b.txt"), "made far away\n");
 		git(far, "add", ".");
 		git(far, "commit", "-q", "-m", "Add b");
-		const back = join(far, "..", `${sent.id}-h.bundle`);
+		const back = join(scratch("back"), `${sent.id}-h.bundle`);
 		git(far, "bundle", "create", "-q", back, `${sent.commit}..work`);
 		expect(fetchBundle(repo, back, "refs/heads/work", "enrichedlab/far", sent.commit, sent.home).map((l) => l.split(" ").slice(1).join(" "))).toEqual(["Add b"]);
 		// The branch grows from main, keeps the tracked example, and carries the work.

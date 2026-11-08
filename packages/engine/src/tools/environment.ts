@@ -9,7 +9,7 @@ import { basename, join } from "node:path";
 import { pixi, pixiHere } from "../apps/environments.ts";
 import { type Tool, ToolError } from "./types.ts";
 import { openPhysical } from "./anchored.ts";
-import { contained, type NetworkAccess, physical } from "./workspace.ts";
+import { contained, containedTempEnvironment, type NetworkAccess, physical, safeTemp } from "./workspace.ts";
 
 /** Where a lab's vetted packages come from (its descriptor's `packages`). */
 export interface PackageSources {
@@ -54,7 +54,7 @@ async function run(program: string, args: string[], root: string, env: Record<st
 	if (!launch.facility) throw new ToolError("This computer has no sandbox to contain package installs (Seatbelt on macOS, bubblewrap on Linux), so nothing was installed.");
 	let child: ReturnType<typeof Bun.spawn>;
 	try {
-		child = Bun.spawn([launch.file, ...launch.args], { cwd: tmpdir(), stdio: ["ignore", "pipe", "pipe", ...(launch.pass ?? [])], env });
+		child = Bun.spawn([launch.file, ...launch.args], { cwd: safeTemp(), stdio: ["ignore", "pipe", "pipe", ...(launch.pass ?? [])], env });
 	} catch (error) {
 		launch.release?.();
 		throw error;
@@ -116,8 +116,9 @@ export const environmentTool: Tool<{ action: Action; packages?: string[]; pypi?:
 		const caches = join(tools, "pixi-cache");
 		// Made first: containment can only let the install write a folder that exists.
 		mkdirSync(caches, { recursive: true });
-		const env: Record<string, string> = { PIXI_NO_PATH_UPDATE: "1", PIXI_CACHE_DIR: caches, PIXI_HOME: caches };
-		for (const key of ["PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "SYSTEMROOT", "SSL_CERT_FILE", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY"]) if (process.env[key]) env[key] = process.env[key]!;
+		const inherited: Record<string, string> = { PIXI_NO_PATH_UPDATE: "1", PIXI_CACHE_DIR: caches, PIXI_HOME: caches };
+		for (const key of ["PATH", "HOME", "LANG", "LC_ALL", "SYSTEMROOT", "SSL_CERT_FILE", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY"]) if (process.env[key]) inherited[key] = process.env[key]!;
+		const env = containedTempEnvironment(inherited);
 		const file = join(root, "pixi.toml");
 		pinned();
 		const made = !existsSync(file);

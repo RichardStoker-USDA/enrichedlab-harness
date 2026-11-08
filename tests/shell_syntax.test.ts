@@ -12,8 +12,8 @@ import { restoreSnapshot, snapshot } from "../packages/engine/src/git.ts";
 import { holdGitEntries, mkdirPhysical, openPhysical, removeEmptyTreePhysical, unlinkPhysical } from "../packages/engine/src/tools/anchored.ts";
 import { allowedCommand, isReadOnlyCommand } from "../packages/engine/src/tools/shell.ts";
 import type { Tool } from "../packages/engine/src/tools/types.ts";
-import { engineEnvironment, LocalWorkspace, projectGitPaths, projectGitPattern, safeTemp, sandboxer, trustedGit } from "../packages/engine/src/tools/workspace.ts";
-import { everyCommand, plainCommands } from "../packages/engine/src/tools/shell_syntax.ts";
+import { containedTempEnvironment, engineEnvironment, engineTemp, LocalWorkspace, projectGitPaths, projectGitPattern, safeTemp, sandboxer, trustedGit } from "../packages/engine/src/tools/workspace.ts";
+import { everyCommand, everyPowerShellCommand, plainCommands } from "../packages/engine/src/tools/shell_syntax.ts";
 import { FENCE_PY } from "../packages/engine/src/sites/sandbox_fence.ts";
 import { bashPattern, type SandboxApi, SandboxWorkspace } from "../packages/engine/src/sites/sandbox_workspace.ts";
 
@@ -27,6 +27,12 @@ describe("shell syntax", () => {
 		expect(words("ls a; cat b | wc -l && echo ok")).toEqual([["ls", "a"], ["cat", "b"], ["wc", "-l"], ["echo", "ok"]]);
 		expect(plainCommands("x > out 2>&1 < in")?.[0]?.redirects).toEqual([{ op: ">", target: "out" }, { op: ">&", fd: "2", target: "1" }, { op: "<", target: "in" }]);
 		expect(plainCommands("A=1 B='two words' cmd")?.[0]?.assigns).toEqual([{ name: "A", value: "1" }, { name: "B", value: "two words" }]);
+	});
+
+	test("PowerShell keeps native Windows paths intact and fails closed on dynamic command words", () => {
+		expect(everyPowerShellCommand(String.raw`C:\Tools\Git\cmd\git.exe push origin main`)?.commands[0]?.words).toEqual([String.raw`C:\Tools\Git\cmd\git.exe`, "push", "origin", "main"]);
+		expect(everyPowerShellCommand(String.raw`& 'C:\Program Files\Git\bin\Git.exe' push origin main`)?.commands[0]?.words).toEqual([String.raw`C:\Program Files\Git\bin\Git.exe`, "push", "origin", "main"]);
+		expect(everyPowerShellCommand(String.raw`& $program push origin main`)).toBeUndefined();
 	});
 
 	test("anything more than text has no plain reading", () => {
@@ -446,7 +452,7 @@ describe("round 6: containment is the boundary", () => {
 	});
 
 	test.skipIf(process.platform !== "win32")("Windows Git names and backslash paths cannot hide a push", () => {
-		for (const command of ["Git push origin main", String.raw`'C:\Program Files\Git\bin\Git.exe' push origin main`]) {
+		for (const command of ["Git push origin main", String.raw`C:\Tools\Git\cmd\git.exe push origin main`, String.raw`'C:\Program Files\Git\bin\Git.exe' push origin main`, String.raw`& 'C:\Program Files\Git\bin\Git.exe' push origin main`]) {
 			expect(allowKeys(shell, { command }).keys[0]).toBe("shell!push");
 		}
 	});
@@ -500,7 +506,14 @@ describe("round 6: containment is the boundary", () => {
 				get: async (from: string, to: string) => writeFileSync(to, readFileSync(from.replace("/sandbox/out", out))),
 			} as unknown as SandboxApi;
 			// This "lab" can't fence (no Landlock here), so nothing runs in it but the probe.
-			await expect(fetchRepo(api, dir, { repo, base: head, home: head }, "enrichedlab/test-1")).rejects.toThrow("can't fence");
+			// Where this computer can fence (Linux with Landlock), the work comes back fenced; elsewhere it refuses. Either
+			// way, none of the project's hooks or filters ran.
+			const outcome = await fetchRepo(api, dir, { repo, base: head, home: head }, "enrichedlab/test-1").then(
+				(commits) => ({ commits }),
+				(error: Error) => ({ error }),
+			);
+			if ("error" in outcome) expect(outcome.error.message).toContain("can't fence");
+			else expect(outcome.commits.length).toBe(1);
 			expect(readdirSync(marks)).toEqual([]);
 		} finally {
 			rmSync(base, { recursive: true, force: true });
@@ -557,6 +570,11 @@ describe("round 6: containment is the boundary", () => {
 		for (const command of ["/usr/lib/git-core/git-svn dcommit", "/usr/lib/git-core/git-svn d[c]ommit", "/usr/lib/git-core/git-p4 submit", "p4 submit", "p4 s[u]bmit"]) {
 			expect([command, allowKeys(shell, { command }).keys[0]]).toEqual([command, "shell!push"]);
 		}
+		for (const command of ["env ./g[[:lower:]]t push origin main", "env ./p[[:digit:]] submit"]) {
+			expect([command, allowKeys(shell, { command }).keys[0]]).toEqual([command, "shell!push"]);
+		}
+		expect(allowKeys(shell, { command: "env ./tool[[:lower:]] status" }).keys[0]).toBe("shell!hidden");
+		expect(allowKeys(shell, { command: "env ./tool[[:unknown:]] status" }).keys[0]).toMatch(/^shell!/);
 		for (const command of ["timeout 5 env GIT_SSH_COMMAND=./x git fetch", "nice env GIT_CONFIG_COUNT=1 git status", "export GIT_SSH_COMMAND", "declare -x GIT_CONFIG_COUNT", "readonly GIT_ASKPASS", "builtin export GIT_CONFIG_COUNT", "builtin declare -x GIT_SSH_COMMAND", "git -c gc.recentObjectsHook=./x gc", "git -c core.fsm[o]nitor=./x status", "git -c tar.x.command=./y archive HEAD", "git -c difftool.t.cmd=./y difftool"]) {
 			expect([command, allowKeys(shell, { command }).keys[0]]).toEqual([command, "shell!hidden"]);
 		}
@@ -571,6 +589,9 @@ describe("round 6: containment is the boundary", () => {
 		process.env.TMPDIR = attack;
 		try {
 			expect(safeTemp()).not.toBe(attack);
+			expect(engineTemp()).not.toBe(safeTemp());
+			expect(engineEnvironment().TMPDIR).toBe(engineTemp());
+			expect(containedTempEnvironment({ TMPDIR: attack, TMP: attack, TEMP: attack })).toMatchObject({ TMPDIR: safeTemp(), TMP: safeTemp(), TEMP: safeTemp() });
 		} finally {
 			if (before === undefined) delete process.env.TMPDIR;
 			else process.env.TMPDIR = before;
@@ -585,6 +606,19 @@ describe("round 6: containment is the boundary", () => {
 			mkdirSync(join(root, "deep", "deeper"), { recursive: true });
 			expect(() => projectGitPaths(root, 100, 0)).toThrow("deeper than");
 		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test.skipIf(!["seatbelt", "bubblewrap"].includes(sandboxer() ?? ""))("contained commands cannot write engine Git scratch", async () => {
+		const root = realpathSync(mkdtempSync(join(tmpdir(), "el-engine-temp-")));
+		const marker = join(engineTemp(), "command-owned");
+		try {
+			const result = await new LocalWorkspace(root, "workspace").exec(`printf blocked > '${marker}'`, { timeoutMs: 5_000, signal: AbortSignal.timeout(5_000) });
+			expect(result.exitCode).not.toBe(0);
+			expect(existsSync(marker)).toBe(false);
+		} finally {
+			rmSync(marker, { force: true });
 			rmSync(root, { recursive: true, force: true });
 		}
 	});
@@ -650,6 +684,49 @@ describe("round 6: containment is the boundary", () => {
 		}
 	});
 
+	test.skipIf(process.platform !== "linux")("Linux refuses existing .git links and final quarantine survives hostile modes and launch bounds", () => {
+		const base = realpathSync(mkdtempSync(join(tmpdir(), "el-git-hostile-")));
+		const linked = join(base, "linked");
+		const dangling = join(base, "dangling");
+		const target = join(base, "metadata");
+		const root = join(base, "project");
+		mkdirSync(linked);
+		mkdirSync(dangling);
+		mkdirSync(target);
+		mkdirSync(root);
+		symlinkSync(target, join(linked, ".git"));
+		symlinkSync(join(base, "missing"), join(dangling, ".GiT"));
+		expect(() => holdGitEntries(linked)).toThrow("symbolic link");
+		expect(() => holdGitEntries(dangling)).toThrow("symbolic link");
+		const held = holdGitEntries(root, 1, 0);
+		try {
+			mkdirSync(join(root, "sealed", "deeper", ".git"), { recursive: true });
+			writeFileSync(join(root, "sealed", "deeper", ".git", "config"), "keep\n");
+			writeFileSync(join(root, "extra-one"), "1");
+			writeFileSync(join(root, "extra-two"), "2");
+			chmodSync(join(root, "sealed"), 0);
+			chmodSync(root, 0);
+			expect(held.quarantine(false).error).toBeDefined();
+			const result = held.quarantine();
+			expect(result.error).toBeUndefined();
+			expect(result.moved.map((move) => move.from)).toEqual(["sealed/deeper/.git"]);
+			expect(lstatSync(root).mode & 0o777).toBe(0);
+			chmodSync(root, 0o700);
+			chmodSync(join(root, "sealed"), 0o700);
+			const blocked = result.moved[0]!.to;
+			expect(readFileSync(join(root, blocked, "config"), "utf8")).toBe("keep\n");
+		} finally {
+			held.release();
+			try {
+				chmodSync(root, 0o700);
+				chmodSync(join(root, "sealed"), 0o700);
+			} catch {
+				// The setup may have failed before changing modes.
+			}
+			rmSync(base, { recursive: true, force: true });
+		}
+	});
+
 	test.skipIf(process.platform !== "linux" || sandboxer() !== "bubblewrap")("Linux commands write results, protect existing .git, and quarantine new metadata after foreground and background work", async () => {
 		const root = realpathSync(mkdtempSync(join(tmpdir(), "el-linux-metadata-")));
 		try {
@@ -679,7 +756,22 @@ describe("round 6: containment is the boundary", () => {
 				expect((folder === "made" ? foreground : background).output).toContain(`EnrichedLab moved "${folder}/.git"`);
 			}
 			expect(output.join("")).toContain('EnrichedLab moved "later/.git"');
+			const hostile = await ws.exec("mkdir -p sealed/deeper/.git && printf keep > sealed/deeper/.git/config && chmod 000 sealed && chmod 500 .", options);
+			expect(hostile.exitCode).toBe(0);
+			expect(lstatSync(root).mode & 0o777).toBe(0o500);
+			chmodSync(root, 0o700);
+			chmodSync(join(root, "sealed"), 0o700);
+			expect(existsSync(join(root, "sealed", "deeper", ".git"))).toBe(false);
+			const blocked = readdirSync(join(root, "sealed", "deeper")).find((name) => name.startsWith(".git.enrichedlab-blocked-"));
+			expect(blocked).toBeDefined();
+			expect(readFileSync(join(root, "sealed", "deeper", blocked!, "config"), "utf8")).toBe("keep");
 		} finally {
+			try {
+				chmodSync(root, 0o700);
+				chmodSync(join(root, "sealed"), 0o700);
+			} catch {
+				// The setup may not have reached its mode changes.
+			}
 			rmSync(root, { recursive: true, force: true });
 		}
 	}, 15_000);
