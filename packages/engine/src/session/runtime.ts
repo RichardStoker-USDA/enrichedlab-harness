@@ -50,7 +50,7 @@ const MAX_ATTEMPTS = 5;
 const DELTA_FLUSH_MS = 24;
 const PARALLEL_KINDS = new Set(["read", "net", "site-read"]);
 /** Tool kinds that may change the folder: a snapshot follows each step that used one. */
-const CHANGES = new Set(["write", "exec", "sandbox"]);
+const CHANGES = new Set(["write", "exec", "sandbox", "packages"]);
 /** Model names that say small and fast: mini, flash, haiku, nano, a few billion parameters (4b, 7b). */
 const QUICK = /(^|[-_.:/\s])(mini|small|flash|lite|haiku|nano|fast|instant|tiny|turbo|[1-9](\.\d)?b)([-_.:/\s]|$)/i;
 /** Models that don't chat. */
@@ -597,7 +597,9 @@ export class SessionRuntime {
 		// A lab that checkpoints whole sandboxes keeps the whole disk too, changed in git's view or not, and goes on
 		// doing so if git history fails.
 		const sandbox = this.workspace instanceof SandboxWorkspace && this.workspace.checkpoints ? this.workspace : undefined;
-		if (!history && !sandbox) return;
+		// A turn's start is marked even when nothing could be kept, so undo never takes an earlier turn's start for it.
+		const mark = () => callId === "turn" && this.append({ t: "checkpoint", id: newId("e"), at: now(), callId, files: [] });
+		if (!history && !sandbox) return void mark();
 		let shot: Snapshot | undefined;
 		if (history) {
 			try {
@@ -611,7 +613,7 @@ export class SessionRuntime {
 		const lab = sandbox ? await sandbox.checkpoint(label) : undefined;
 		if (sandbox && !lab && !this.labCheckpointWarned) this.notice("warn", "The lab couldn't checkpoint the sandbox for this step, so commands outside the project ask until it can again.");
 		if (sandbox) this.labCheckpointWarned = !lab;
-		if (!shot && !lab) return;
+		if (!shot && !lab) return void mark();
 		// For showing: the commit itself names everything it left out (history.ts keptOut).
 		const left = shot ? [...shot.skipped, ...shot.nested.map((path) => `${path}/ (its own repository)`)] : [];
 		this.append({ t: "checkpoint", id: newId("e"), at: now(), callId, files: [], ...(shot ? { history: shot.commit } : {}), ...(lab ? { lab } : {}), ...(calls ? { calls } : {}), ...(left.length ? { skipped: left.slice(0, 200) } : {}) });
@@ -688,9 +690,7 @@ export class SessionRuntime {
 		if (this.running) return { ok: false, files: [], detail: "Wait for the current turn to finish, or cancel it." };
 		// With step history: back to the start of the last turn, shell changes included, here or at a lab. Only that
 		// turn's own start counts: a turn whose history couldn't be kept never falls back to an earlier turn's.
-		const lastUser = this.events.findLastIndex((e) => e.t === "user");
-		const turnStart = this.events.findLast((e) => e.t === "checkpoint" && e.callId === "turn") as Ev<"checkpoint"> | undefined;
-		const own = turnStart && this.events.indexOf(turnStart) > lastUser ? turnStart : undefined;
+		const own = this.events.findLast((e) => e.t === "checkpoint" && e.callId === "turn") as Ev<"checkpoint"> | undefined;
 		if (own && !own.history && own.lab) return { ok: false, files: [], detail: "This turn was kept only as a whole-sandbox checkpoint. Go Back the Whole Sandbox, from a step's menu, puts every folder there back." };
 		const start = own?.history ? own : undefined;
 		const after = start ? this.events.slice(this.events.indexOf(start)) : [];
@@ -1100,6 +1100,7 @@ export class SessionRuntime {
 				project: projectRoot(this.cwd),
 				sealed: this.deps.sealed?.(this.site),
 				fence: verdict.action === "run" && verdict.fence === true,
+				outside: Boolean(tool.ask?.(args, { workspace: this.workspace })),
 				tools: this.deps.toolsDir,
 				packages: this.deps.packageSources?.(this.site),
 				apps: this.deps.apps?.(this.id),

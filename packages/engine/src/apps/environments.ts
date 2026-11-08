@@ -21,6 +21,11 @@ const PIXI_BUILDS: Record<string, [string, string]> = {
 	"win32-x64": ["pixi-x86_64-pc-windows-msvc.exe", "89c7455923dac401c1853310894d87fa06602911b838e389a46c7bc8df00171e"],
 };
 
+/** True when pixi is here without downloading: on PATH, or the pinned build already under `tools`. */
+export function pixiPresent(tools: string): boolean {
+	return Boolean(Bun.which("pixi")) || existsSync(join(tools, `pixi-${PIXI_VERSION}${process.platform === "win32" ? ".exe" : ""}`));
+}
+
 /** The pixi program: on PATH, else the pinned build under `tools`, downloaded and checked the first time. */
 export async function pixi(tools: string, log: (line: string) => void = () => undefined): Promise<string> {
 	const found = Bun.which("pixi");

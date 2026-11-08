@@ -41,6 +41,8 @@ export interface ToolContext {
 	surface?: { call(capability: string, op: string, args: Record<string, unknown>, signal: AbortSignal): Promise<SurfaceAnswer> };
 	/** Starting and collecting subagents; absent inside a subagent. */
 	agents?: AgentHost;
+	/** The call names a path outside the project and ran because the person allowed that; otherwise writes stay inside. */
+	outside?: boolean;
 	/** It runs because of the paths it names, in a lab's sandbox: the sandbox checks where they lead first. */
 	fence?: boolean;
 	/** Where shared tools (pixi and its caches) are kept on this computer. */

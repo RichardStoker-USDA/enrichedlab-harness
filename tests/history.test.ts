@@ -207,4 +207,22 @@ describe("step history", () => {
 		await ws.write("notes.txt", "short\n");
 		expect(readFileSync(file, "utf8")).toBe("short\n");
 	});
+
+	test("undo leaves a file it couldn't keep first, and package names can't be options", async () => {
+		const root = join(dir, "too-large");
+		mkdirSync(root);
+		const file = join(root, "data.bin");
+		writeFileSync(file, "small\n");
+		const copies = new Checkpoints(join(dir, "copies-4"));
+		const kept = copies.capture([file]);
+		truncateSync(file, MAX_FILE + 1);
+		const back = copies.restore([kept]);
+		expect(back.restored).toEqual([]);
+		expect(readFileSync(file).length).toBe(MAX_FILE + 1);
+		const { environmentTool } = await import("../packages/engine/src/tools/environment.ts");
+		const ws = new LocalWorkspace(root);
+		await expect(environmentTool.run({ action: "add", packages: ["python", "--tls-no-verify"] }, { workspace: ws, output: () => undefined } as never)).rejects.toThrow("isn't a package name");
+		expect((await environmentTool.run({ action: "list" }, { workspace: ws, output: () => undefined, tools: join(dir, "no-tools") } as never)).content).toContain("no environment yet");
+		expect(existsSync(join(dir, "no-tools"))).toBe(false);
+	});
 });

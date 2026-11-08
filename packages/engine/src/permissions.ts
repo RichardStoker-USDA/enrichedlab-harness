@@ -248,7 +248,9 @@ function commandKeys(command: string): { keys: string[]; names: string[] } | und
 export function pushes(command: string): boolean {
 	const plain = command.replace(/\\\r?\n/g, "").replace(/\$(?=['"])/g, "").replace(/['"\\]/g, "");
 	if (/(^|[;&|\n(`]\s*|\/)git(\s+\S+)*\s+push\b/.test(plain)) return true;
-	const hidden = /[$`]|\b(eval|alias|source|function)\b|^\s*\.\s|[;&|]\s*\.\s|\(\s*\)/.test(command);
+	// Single quotes hold text literally ($'..' aside, whose $ stays outside them), so a $ inside them hides nothing.
+	const unquoted = command.replace(/'[^']*'/g, "''");
+	const hidden = /[$`]|\b(eval|alias|source|function)\b|^\s*\.\s|[;&|]\s*\.\s|\(\s*\)/.test(unquoted);
 	return hidden && /\bgit\b|\bpush\b/.test(plain);
 }
 
@@ -476,7 +478,9 @@ export function scripted(command: string): boolean {
 	const start = String.raw`(^|[;&|(\s])(\S*/)?`;
 	const interpreters = "sh|bash|zsh|dash|ksh|mksh|fish|python[\\d.]*|node|deno|bun|perl|ruby|php|lua|Rscript|R|julia|pwsh|powershell|tclsh|osascript";
 	const code = new RegExp(String.raw`${start}(${interpreters})\s+(\S+\s+)*(-[a-zA-Z]*[ceE]|--command|--eval|--expr|-r)(\s|=|$)`);
-	return code.test(command) || new RegExp(String.raw`${start}(awk|gawk|mawk|nawk|xargs|parallel)(\s|$)`).test(command);
+	// Judged with quotes and escapes taken out: '-c' and "python3" are what the shell passes on.
+	const plain = command.replace(/['"\\]/g, "");
+	return code.test(plain) || new RegExp(String.raw`${start}(awk|gawk|mawk|nawk|xargs|parallel)(\s|$)`).test(plain);
 }
 
 /** Shells: handed a script, a startup file or -c, they run what their words don't show. */

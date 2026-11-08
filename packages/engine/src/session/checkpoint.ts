@@ -59,7 +59,12 @@ export class Checkpoints {
 				if (file.real && physical(file.path) !== file.real) continue;
 				// Acts where the path leads: through a link to a file that didn't exist, the file made there goes, not the link.
 				const at = file.real ?? file.path;
-				if (!kept.has(at)) for (const now of this.capture([at])) kept.set(at, now);
+				if (!kept.has(at)) {
+					const now = this.capture([at]);
+					// Too large to keep (or not a plain file): writing over it would lose it, so it stays as it is.
+					if (!now.length) continue;
+					kept.set(at, now[0]!);
+				}
 				if (file.existed && file.blob) {
 					mkdirSync(dirname(at), { recursive: true });
 					// Never through a link at the end: the path was checked to lead here.

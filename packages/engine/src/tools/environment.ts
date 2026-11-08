@@ -6,7 +6,7 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
-import { pixi } from "../apps/environments.ts";
+import { pixi, pixiPresent } from "../apps/environments.ts";
 import { type Tool, ToolError } from "./types.ts";
 import { contained } from "./workspace.ts";
 
@@ -86,9 +86,12 @@ export const environmentTool: Tool<{ action: Action; packages?: string[]; pypi?:
 		if (args.folder && !ctx.workspace.inside(args.folder)) throw new ToolError("The folder must be inside the project.");
 		const root = ctx.workspace.resolve(args.folder ?? ".");
 		const packages = (args.packages ?? []).map((p) => p.trim()).filter(Boolean);
-		for (const p of packages) if (!/^[A-Za-z0-9_.\-]+(\[[A-Za-z0-9_,.\-]+\])?\s*([=<>!~]=?\s*[A-Za-z0-9_.*+!\-]+(\s*,\s*[=<>!~]=?\s*[A-Za-z0-9_.*+!\-]+)*)?$/.test(p)) throw new ToolError(`“${p}” isn't a package name with an optional version.`);
+		for (const p of packages) if (!/^[A-Za-z0-9][A-Za-z0-9_.\-]*(\[[A-Za-z0-9_,.\-]+\])?\s*([=<>!~]=?\s*[A-Za-z0-9_.*+!\-]+(\s*,\s*[=<>!~]=?\s*[A-Za-z0-9_.*+!\-]+)*)?$/.test(p)) throw new ToolError(`“${p}” isn't a package name with an optional version.`);
 		if ((args.action === "add" || args.action === "remove") && !packages.length) throw new ToolError(`Name the packages to ${args.action}.`);
 		const tools = ctx.tools ?? join(tmpdir(), "el-tools");
+		// Listing reads what's there: it never downloads pixi or makes an environment.
+		if (args.action === "list" && !existsSync(join(root, "pixi.toml"))) return { ok: true, content: "This project has no environment yet. Add packages to make one." };
+		if (args.action === "list" && !pixiPresent(tools)) return { ok: true, content: `pixi isn't on this computer yet, so this is what pixi.toml asks for (nothing is built):\n${readFileSync(join(root, "pixi.toml"), "utf8")}` };
 		const program = await pixi(tools, (line) => ctx.output(`${line}\n`));
 		const caches = join(tools, "pixi-cache");
 		const env: Record<string, string> = { PIXI_NO_PATH_UPDATE: "1", PIXI_CACHE_DIR: caches, PIXI_HOME: caches };
@@ -106,13 +109,13 @@ export const environmentTool: Tool<{ action: Action; packages?: string[]; pypi?:
 			case "list":
 				break;
 			case "add":
-				await run(program, ["add", ...(args.pypi ? ["--pypi"] : []), ...manifestPath, ...packages], root, env, log);
+				await run(program, ["add", ...(args.pypi ? ["--pypi"] : []), ...manifestPath, "--", ...packages], root, env, log);
 				break;
 			case "remove":
-				await run(program, ["remove", ...(args.pypi ? ["--pypi"] : []), ...manifestPath, ...packages], root, env, log);
+				await run(program, ["remove", ...(args.pypi ? ["--pypi"] : []), ...manifestPath, "--", ...packages], root, env, log);
 				break;
 			case "update":
-				await run(program, ["update", ...manifestPath, ...packages], root, env, log);
+				await run(program, ["update", ...manifestPath, "--", ...packages], root, env, log);
 				break;
 			case "sync":
 				await run(program, ["install", ...manifestPath], root, env, log);

@@ -8,9 +8,9 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { LabConfig } from "../packages/engine/src/config.ts";
-import { allowKey, allowKeys, canonical, decide, folderAccess, identity } from "../packages/engine/src/permissions.ts";
+import { allowKey, allowKeys, canonical, decide, folderAccess, identity, pushes, scripted } from "../packages/engine/src/permissions.ts";
 import { manifest } from "../packages/engine/src/tools/environment.ts";
-import { isReadOnlyCommand } from "../packages/engine/src/tools/shell.ts";
+import { commandWords, isReadOnlyCommand } from "../packages/engine/src/tools/shell.ts";
 import type { Tool } from "../packages/engine/src/tools/types.ts";
 import { activated, LocalWorkspace } from "../packages/engine/src/tools/workspace.ts";
 import { type SandboxApi, SandboxWorkspace } from "../packages/engine/src/sites/sandbox_workspace.ts";
@@ -326,6 +326,30 @@ describe("permissions", () => {
 		expect(decide(shell, { command: "rm notes.md" }, sealed, granted, new Set(), undefined, undefined, false).action).toBe("ask");
 		// B9: a grant to change saved without the folder's identity asks again.
 		expect(folderAccess({ folders: { [home]: { access: "change", at: "" } } } as unknown as LabConfig, join(home, "a.txt"))).toBeUndefined();
+	});
+
+	test("review round 5: contained-only environments, writes that moved outside, quoted interpreter flags, fenced words, quoted $", async () => {
+		// The project's own programs come first only for contained commands.
+		const project = realpathSync(scratch("env-contained"));
+		writeFileSync(join(project, "pixi.toml"), manifest("p"));
+		mkdirSync(join(project, ".pixi", "envs", "default", "conda-meta"), { recursive: true });
+		const contained = new LocalWorkspace(project, "workspace");
+		const said = async (unsandboxed: boolean) => (await contained.exec("printf %s \"$CONDA_PREFIX\"", { timeoutMs: 20_000, signal: AbortSignal.timeout(20_000), unsandboxed })).output;
+		expect(await said(false)).toBe(join(project, ".pixi", "envs", "default"));
+		expect(await said(true)).toBe("");
+		// A write whose path now leads outside (a link moved) is refused unless the outside path was approved.
+		const outsideDir = realpathSync(scratch("env-outside"));
+		symlinkSync(outsideDir, join(project, "moved"));
+		await expect(contained.write("moved/x.txt", "x")).rejects.toThrow("leads outside the project");
+		expect(existsSync(join(outsideDir, "x.txt"))).toBe(false);
+		await contained.write("moved/x.txt", "x", { outside: true });
+		expect(readFileSync(join(outsideDir, "x.txt"), "utf8")).toBe("x");
+		// Quoted interpreter flags are still code; every word of a fenced line is checked.
+		expect(scripted("python3 '-c' 'open(1)'")).toBe(true);
+		expect(commandWords("printf x > output.txt")).toEqual(["printf", "x", "output.txt"]);
+		// A $ inside single quotes isn't expansion: a git read stays a git read.
+		expect(pushes("git log --format='$%s'")).toBe(false);
+		expect(pushes("git $'push' origin HEAD")).toBe(true);
 	});
 
 	test("a path through a link and then .. is judged where the system takes it", () => {

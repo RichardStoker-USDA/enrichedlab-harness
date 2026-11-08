@@ -29,7 +29,8 @@ export interface Workspace {
 	inside(path: string): boolean;
 	display(path: string): string;
 	read(path: string): Promise<Buffer>;
-	write(path: string, data: string | Buffer): Promise<void>;
+	/** `outside`: the call was approved for a path outside the project; otherwise the write must still land inside it. */
+	write(path: string, data: string | Buffer, options?: { outside?: boolean }): Promise<void>;
 	stat(path: string): Promise<{ type: Entry["type"]; size: number } | undefined>;
 	list(path: string): Promise<Entry[]>;
 	/** `fence`: paths the command names, which must lead inside the project, links followed, or it doesn't run (lab sandboxes). */
@@ -263,16 +264,20 @@ export class LocalWorkspace implements Workspace {
 	 * Written where the path leads, links followed once here, never following a link at the end, and checked again
 	 * after opening: a link changed meanwhile can't send the bytes somewhere else.
 	 */
-	async write(path: string, data: string | Buffer): Promise<void> {
+	async write(path: string, data: string | Buffer, options: { outside?: boolean } = {}): Promise<void> {
 		const full = this.open(path);
+		const leadsOut = () => !options.outside && !this.inside(path);
+		// Judged where it leads now, before and after making its folder: a link changed since the decision isn't followed.
+		if (leadsOut()) throw new Error(`${this.display(full)} now leads outside the project (a link may have moved); nothing was written.`);
 		await mkdir(dirname(full), { recursive: true });
+		if (leadsOut()) throw new Error(`${this.display(full)} now leads outside the project (a link may have moved); nothing was written.`);
 		const real = physical(full);
 		const existed = lstatSync(real, { throwIfNoEntry: false }) !== undefined;
 		const fd = openSync(real, constants.O_WRONLY | constants.O_CREAT | constants.O_NOFOLLOW, 0o666);
 		try {
 			const opened = fstatSync(fd);
 			const there = lstatSync(real, { throwIfNoEntry: false });
-			if (physical(full) !== real || !there || there.ino !== opened.ino || there.dev !== opened.dev) {
+			if (physical(full) !== real || !there || there.ino !== opened.ino || there.dev !== opened.dev || leadsOut()) {
 				if (!existed && opened.size === 0) rmSync(real, { force: true });
 				throw new Error(`${this.display(full)} changed while it was being written (a link may have moved); nothing was written.`);
 			}
@@ -313,8 +318,9 @@ export class LocalWorkspace implements Workspace {
 		return new Promise((done) => {
 			const child = spawn(file, args, {
 				cwd: this.root,
-				// Inside the project's own package environment when it has one (tools/environment.ts).
-				env: { ...activated(this.root, env), LAB_AGENT: "1", PAGER: "cat", GIT_PAGER: "cat", TERM: "dumb", NO_COLOR: "1" },
+				// Inside the project's own package environment when it has one (tools/environment.ts), for contained
+				// commands only: its programs are the project's, so they never run uncontained in place of the system's.
+				env: { ...(this.sandboxed && !options.unsandboxed ? activated(this.root, env) : env), LAB_AGENT: "1", PAGER: "cat", GIT_PAGER: "cat", TERM: "dumb", NO_COLOR: "1" },
 				stdio: ["ignore", "pipe", "pipe"],
 				windowsHide: true,
 				detached: process.platform !== "win32",

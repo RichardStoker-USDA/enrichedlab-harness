@@ -149,7 +149,7 @@ export class SandboxWorkspace implements Workspace {
 		return Buffer.concat(pieces);
 	}
 
-	async write(path: string, data: string | Buffer): Promise<void> {
+	async write(path: string, data: string | Buffer, _options?: { outside?: boolean }): Promise<void> {
 		const full = this.resolve(path);
 		const bytes = typeof data === "string" ? Buffer.from(data, "utf8") : data;
 		const dir = shq(posix.dirname(full));

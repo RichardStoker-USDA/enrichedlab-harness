@@ -95,7 +95,7 @@ export const writeTool: Tool = {
 		const content = str(args, "content");
 		const ws = ctx.workspace;
 		const before = (await ws.stat(path)) ? (await ws.read(path)).toString("utf8") : "";
-		await ws.write(path, content);
+		await ws.write(path, content, { outside: ctx.outside });
 		const { diff, added, removed } = unifiedDiff(before, content, ws.display(path));
 		const lines = content.split("\n").length;
 		return { ok: true, content: `Wrote ${ws.display(path)} (${lines} lines).`, view: { result: before ? `+${added} -${removed}` : `${lines} lines, new`, diff } };
@@ -162,7 +162,7 @@ export const editTool: Tool = {
 			text = edit.all === true ? text.split(oldText).join(newText) : text.replace(oldText, () => newText);
 		});
 		if (text === before) return { ok: true, content: "No change: the new text equals the old.", view: { result: "no change" } };
-		await ws.write(path, crlf ? text.replace(/\n/g, "\r\n") : text);
+		await ws.write(path, crlf ? text.replace(/\n/g, "\r\n") : text, { outside: ctx.outside });
 		const { diff, added, removed } = unifiedDiff(before, text, ws.display(path));
 		return { ok: true, content: `Edited ${ws.display(path)}.\n${diff}`, view: { result: `+${added} -${removed}`, diff } };
 	},
