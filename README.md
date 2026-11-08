@@ -53,9 +53,10 @@ Updates are signed and install themselves the same way: the app offers them, `el
   its git repository along. A lab that keeps its data inside pins its sessions there.
 - **Contained by default.** On macOS and Linux the agent's commands can write to the project and private temp folders.
   On Linux, existing regular `.git` files and directories stay read only, an existing `.git` symbolic link refuses
-  the command, and normal completion moves new entries aside after all background children end. Commands can't read
-  your credential folders and have no network unless you allow it; anything that would run outside that
-  asks first, unless its exact command is in `allowCommands` or you chose Allow Everything. An `allowCommands` entry
+  the command, and normal completion moves new entries aside after all background children end. If a crash or cleanup
+  error leaves an entry behind, the next contained shell command in that project waits for a successful cleanup pass.
+  Commands can't read your credential folders and have no network unless you allow it; anything that would run
+  outside that asks first, unless its exact command is in `allowCommands` or you chose Allow Everything. An `allowCommands` entry
   is one literal POSIX argv run without a shell, selected from the person's launch `PATH` rather than the project's
   package environment; it is off on Windows. On Windows commands can write only to the
   project and temp folders, can read your credential folders, and ask before they run

@@ -236,6 +236,10 @@ export function everyPowerShellCommand(line: string): { commands: AnyCommand[]; 
 		finishWord();
 		if (!words.length) return;
 		if (words.includes("--%")) throw new Error("PowerShell's stop-parsing token hides the command arguments.");
+		const executable = words[0]!.replace(/^.*[\\/]/, "");
+		if (/^(pwsh|powershell)(\.exe)?$/i.test(executable) && words.slice(1).some((item) => /^[-/]e/i.test(item))) {
+			throw new Error("An encoded or abbreviated PowerShell option hides the nested command.");
+		}
 		commands.push({ words, patterns, assigns: [] });
 		words = [];
 		patterns = [];
@@ -254,20 +258,16 @@ export function everyPowerShellCommand(line: string): { commands: AnyCommand[]; 
 			}
 			if (quote === "double") {
 				if (character === "`") {
-					if (i + 1 >= line.length) return undefined;
-					if (line[i + 1] === "\r" && line[i + 2] === "\n") i += 2;
-					else if (line[i + 1] === "\n") i++;
-					else add(line[++i]!, true);
+					// PowerShell 7 has braced Unicode escapes and other context-sensitive escape forms. The
+					// constrained reader does not interpret any of them.
+					return undefined;
 				} else if (character === '"') quote = undefined;
 				else if (character === "$") return undefined;
 				else add(character, true);
 				continue;
 			}
 			if (character === "`") {
-				if (i + 1 >= line.length) return undefined;
-				if (line[i + 1] === "\r" && line[i + 2] === "\n") i += 2;
-				else if (line[i + 1] === "\n") i++;
-				else add(line[++i]!, true);
+				return undefined;
 			} else if (character === "'") {
 				active = true;
 				quote = "single";
@@ -275,8 +275,13 @@ export function everyPowerShellCommand(line: string): { commands: AnyCommand[]; 
 				active = true;
 				quote = "double";
 			} else if (character === "#") {
-				finishCommand();
-				while (i + 1 < line.length && line[i + 1] !== "\n") i++;
+				// In PowerShell, # starts a line comment at a token boundary. Inside an unquoted token it
+				// is literal, so `x#; git push` still contains a second executable command.
+				if (active) add(character, false);
+				else {
+					finishCommand();
+					while (i + 1 < line.length && line[i + 1] !== "\n") i++;
+				}
 			} else if (/\s/.test(character)) {
 				finishWord();
 				if (character === "\n") finishCommand();
@@ -287,7 +292,7 @@ export function everyPowerShellCommand(line: string): { commands: AnyCommand[]; 
 				// At the start of a command this is PowerShell's call operator. Else it separates/backgrounds commands.
 				if (active || words.length) finishCommand();
 				if (line[i + 1] === "&") i++;
-			} else if ("$@{}()".includes(character)) return undefined;
+			} else if ("$@{}()<>,+!%[]".includes(character)) return undefined;
 			else add(character, false);
 		}
 		if (quote) return undefined;

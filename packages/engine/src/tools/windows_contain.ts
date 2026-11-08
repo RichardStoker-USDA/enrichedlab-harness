@@ -4,8 +4,8 @@
 // project and temp folders only. Reads and the network stay open, so Windows commands still ask before they run.
 // The command runs in a job object that ends it if this helper ends.
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { isAbsolute, join, sep } from "node:path";
 
 const WRITE_RESTRICTED = 0x8;
 const DISABLE_MAX_PRIVILEGE = 0x1;
@@ -20,6 +20,47 @@ const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000;
 const JOB_EXTENDED_LIMIT_INFORMATION = 9;
 
 const wide = (text: string) => Buffer.from(`${text}\0`, "utf16le");
+
+const atOrBelow = (path: string, root: string) => {
+	const target = path.toLowerCase();
+	const base = root.toLowerCase();
+	return target === base || target.startsWith(`${base}${sep}`);
+};
+
+function installedProgram(path: string, base: string, excluded: string[] = []): string | undefined {
+	try {
+		if (!isAbsolute(path) || !statSync(path).isFile()) return undefined;
+		const program = realpathSync.native(path);
+		const install = realpathSync.native(base);
+		if (!atOrBelow(program, install)) return undefined;
+		for (const path of excluded) if (atOrBelow(program, realpathSync.native(path))) return undefined;
+		return program;
+	} catch {
+		return undefined;
+	}
+}
+
+/** PowerShell from an OS install location, never PATH or a program inside the project. */
+export function systemPowerShell(project?: string | string[], env: NodeJS.ProcessEnv = process.env): { file: string; name: string } | undefined {
+	const excluded = project === undefined ? [] : Array.isArray(project) ? project : [project];
+	const programFiles = env.ProgramFiles ?? env.PROGRAMFILES;
+	if (programFiles) {
+		const file = installedProgram(join(programFiles, "PowerShell", "7", "pwsh.exe"), programFiles, excluded);
+		if (file) return { file, name: "PowerShell 7" };
+	}
+	const systemRoot = env.SystemRoot ?? env.SYSTEMROOT;
+	if (systemRoot) {
+		const file = installedProgram(join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"), systemRoot, excluded);
+		if (file) return { file, name: "Windows PowerShell" };
+	}
+	return undefined;
+}
+
+/** cmd.exe from the Windows installation, used only to probe and test the restricted token. */
+export function systemCommand(env: NodeJS.ProcessEnv = process.env): string | undefined {
+	const systemRoot = env.SystemRoot ?? env.SYSTEMROOT;
+	return systemRoot ? installedProgram(join(systemRoot, "System32", "cmd.exe"), systemRoot) : undefined;
+}
 
 /** Quote one argument for a Windows command line (the rules CommandLineToArgvW reads back). */
 export function quoteArg(arg: string): string {
@@ -66,7 +107,9 @@ export function grantWrites(home: string, sid: string, folders: string[]): void 
 		"$rule = New-Object System.Security.AccessControl.FileSystemAccessRule($sid, 'Modify', 'ContainerInherit,ObjectInherit', 'None', 'Allow')",
 		`foreach ($p in @(${todo.map(quote).join(",")})) { $d = Get-Item -LiteralPath $p; $acl = $d.GetAccessControl('Access'); $acl.AddAccessRule($rule); $d.SetAccessControl($acl) }`,
 	].join("; ");
-	const run = Bun.spawnSync(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script], { stdout: "ignore", stderr: "pipe" });
+	const powershell = systemPowerShell(folders);
+	if (!powershell) throw new Error("Couldn't find PowerShell in an OS installation folder, so sandbox write access was not changed.");
+	const run = Bun.spawnSync([powershell.file, "-NoProfile", "-NonInteractive", "-Command", script], { stdout: "ignore", stderr: "pipe" });
 	if (run.exitCode !== 0) throw new Error(`Couldn't let the sandbox write in ${todo.join(", ")}: ${run.stderr.toString().trim().slice(0, 400)}`);
 	for (const f of todo) done.add(f.toLowerCase());
 	writeFileSync(record, JSON.stringify([...done]));
@@ -74,6 +117,15 @@ export function grantWrites(home: string, sid: string, folders: string[]): void 
 
 /** Run `argv` under the restricted token with this process's stdio; resolves to its exit code. */
 export async function runContained(home: string, writable: string[], argv: string[]): Promise<number> {
+	if (!argv[0] || !isAbsolute(argv[0])) throw new Error("Windows containment requires an absolute executable path.");
+	let executable: string;
+	try {
+		executable = realpathSync.native(argv[0]);
+		if (!statSync(executable).isFile()) throw new Error("not a file");
+	} catch {
+		throw new Error(`Windows containment could not open the executable ${argv[0]}.`);
+	}
+	argv = [executable, ...argv.slice(1)];
 	const { dlopen, FFIType, ptr, read } = await import("bun:ffi");
 	const { p, u32, i32 } = { p: FFIType.ptr, u32: FFIType.u32, i32: FFIType.i32 };
 	const k32 = dlopen("kernel32.dll", {
@@ -147,7 +199,8 @@ export async function runContained(home: string, writable: string[], argv: strin
 	}
 	const info = new Uint8Array(24);
 	const line = wide(commandLine(argv));
-	if (!adv.CreateProcessAsUserW(Number(newToken[0]), null, ptr(line), null, null, 1, CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT, null, null, ptr(startup), ptr(info))) {
+	const application = wide(executable);
+	if (!adv.CreateProcessAsUserW(Number(newToken[0]), ptr(application), ptr(line), null, null, 1, CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT, null, null, ptr(startup), ptr(info))) {
 		fail(`Starting ${argv[0]}`);
 	}
 	const process_ = Number(read.u64(ptr(info), 0));

@@ -18,7 +18,7 @@ for each operating system.
 | | macOS | Linux | Windows |
 | --- | --- | --- | --- |
 | Facility | Seatbelt (`sandbox-exec`) | bubblewrap, when user namespaces work | a write-restricted copy of the person's token |
-| Writes | project and a private temp folder, except any `.git` component below the project root | project and a private temp folder; regular `.git` entries stay read only, `.git` links refuse launch, new entries are moved aside on normal completion | project and temp folders |
+| Writes | project and a private temp folder, except any `.git` component below the project root | project and a private temp folder; regular `.git` entries stay read only, `.git` links refuse launch, and new entries are moved aside before another contained shell command may run | project and temp folders |
 | Credential folders (`~/.ssh`, `~/.aws`, key stores, browser profiles) | hidden | hidden | readable |
 | Network | off unless allowed | off unless allowed | open |
 | Commands inside the project | run | run | ask first |
@@ -83,7 +83,9 @@ The engine's own work stays inside the same line:
   repository above it whose `.git` sits in its top folder, or an EnrichedLab worktree inside `.git`), so a `.git`
   file or `core.worktree` pointing elsewhere grants nothing. Where this computer can't contain it (Windows, Linux
   without bubblewrap) it doesn't run, so turn snapshots, commits and worktrees are off there. On Linux its temporary
-  indexes and bundle folders are bound into bubblewrap even though bubblewrap has a private `/tmp`. Its only fetch
+  indexes and bundle folders are bound into bubblewrap even though bubblewrap has a private `/tmp`. Credential and
+  engine-data masks are mounted after every project-derived bind. A bind whose physical target is inside one of those
+  hidden folders is refused, including a target reached through a link or a case alias. Its only fetch
   reads a bundle file
   over the file transport, a test pins the git subcommands it uses (none merges or prints file content), and its
   own folder work (making the worktrees folder and removing files on undo) never follows a link. The expected scratch
@@ -105,22 +107,27 @@ The engine's own work stays inside the same line:
 - On Linux, contained commands can write the project. Before launch, an anchored scan finds existing `.git`
   directories and pointer files, including case variants, and bubblewrap binds them read only. The scan refuses any
   `.git` symbolic link, including a dangling one, because bubblewrap cannot protect the link entry and its target as
-  one object. A scan error or its 50,000-entry or 64-level limit refuses the command. When the foreground command
+  one object. A scan error or its 50,000-entry or 64-level limit refuses the command. Before starting the command, the
+  engine records the project identity and the identities of those existing entries in its own `run` folder. If that
+  record cannot be written, the command does not start. When the foreground command
   exits, the engine makes a bounded cleanup pass without changing modes while background children may still run.
   After every child ends, the final anchored pass does not reuse the launch scan's entry or depth limits. It
   temporarily adds owner access to a directory the command made inaccessible, moves new `.git` entries to
   `.git.enrichedlab-blocked-<id>` in the same
   held parent folder, then restores the directory's mode. It reports every move in command output; nothing is deleted
   or overwritten. Cleanup never follows a link. A lifecycle pipe keeps final cleanup attached to background children
-  even when they redirect output; the command result waits for them to end. An unexpected final filesystem error is
-  reported as exit 125 instead of success. Bubblewrap's parent-death rule still ends orphaned jobs when their
+  even when they redirect output; the command result waits for them to end. A successful final pass removes the
+  cleanup record. An unexpected final filesystem error is reported as exit 125 instead of success and leaves the
+  record in place. Bubblewrap's parent-death rule still ends orphaned jobs when their
   launching command exits.
   There is a remaining window: while a command runs, new metadata exists and Git inside that command can use it.
   Quarantine does not undo work done during that window or block explicit later use of a moved
   `.git.enrichedlab-blocked-<id>` path. If the engine crashes, runs out of a host resource, or the host filesystem
-  stops cleanup, a new entry can
-  remain at its original name and a later launch treats that regular entry as existing metadata and binds it read
-  only. Commit target checks still apply. Landlock and bubblewrap grant access by existing paths or inodes, and
+  stops cleanup, a new entry can remain at its original name. Before any later contained shell command in that project,
+  including a read-only one, the engine uses the saved identities to retry the final anchored pass. It moves only new
+  or replaced entries. A failed retry or an invalid record blocks the command and leaves the record for another retry;
+  it does not accept remaining metadata as an old entry. Commit target checks still apply. Landlock and bubblewrap
+  grant access by existing paths or inodes, and
   seccomp cannot safely inspect pathname strings, so none can deny every future entry named `.git` inside an otherwise
   writable project. Lab file tools apply the same `.git` check as local file tools; the accepted lab write-mode
   metadata limit remains.
@@ -148,7 +155,10 @@ Accepted residuals, each with its reason:
 
 - Pushes the line doesn't show. In `full` mode and for commands the person approves outside containment, only pushes
   the command line shows are caught (`git push`, `send-pack`, `http-push`, `svn dcommit`, `p4 submit`,
-  `send-email`, however quoted, wrapped or encoded). A script or program that pushes on its own isn't. "Pushes ask"
+  `send-email`, including the supported quoting, wrapping and POSIX escape forms). Unsupported PowerShell syntax asks
+  every time, as a push when its raw text contains a publishing word and as hidden otherwise. Nested encoded
+  PowerShell commands ask as hidden instead of running in `full` mode. A script or program that pushes on its own
+  isn't. "Pushes ask"
   means pushes the line shows.
 - The lab fence by Landlock ABI. ABI 3 covers file contents, names, existence and truncation; refusing TCP needs ABI
   4, device ioctls ABI 5, and signals and abstract sockets to processes outside the fence ABI 6. Below those, a fenced
@@ -207,15 +217,18 @@ event), so it outlasts a restart. A command is remembered per program it runs (`
 mvdan/sh's bash parser (compiled to WebAssembly, through `sh-syntax`), which gives each command the words it receives
 once quotes and escapes are done (`$'\x67it'` is `git`, `$'git\0x'` is `git`, a quote after `#` is a comment). A
 word is text only when nothing expands or substitutes in it: no variable, substitution, brace list or `~user`
-(`tools/shell_syntax.ts`). On Windows, the publishing gate reads literal PowerShell native-command words, where a
-backslash in `C:\Tools\Git\git.exe` stays a backslash. Variables, expressions, splatting, script blocks and
-PowerShell's stop-parsing token fail closed and ask in every mode. A glob word (`*`, `?`, `[..]`) is judged by the
-names it matches: on this computer they are listed at decision time and each must be inside the project, links
+(`tools/shell_syntax.ts`). On Windows, the publishing gate reads a constrained set of literal PowerShell
+native-command words, where a backslash in `C:\Tools\Git\git.exe` stays a backslash. Variables and expression
+syntax outside that literal subset, splatting, script blocks, block comments, backtick escapes, the stop-parsing token
+and nested encoded PowerShell commands fail closed and ask in every mode. Bracket expressions are outside that
+Windows subset. A supported glob word (`*` or `?`, plus `[..]` on POSIX shells) is judged by the names it matches: on
+this computer they are listed at decision time and each must be inside the project, links
 followed; in a fenced lab sandbox each
 is checked just before the command runs. A glob part that starts with a dot (`.?`, `.*`) could reach `..`, so it
 asks. On macOS and Linux commands run in the system's `/bin/bash`, whatever `$SHELL` says, without `BASH_ENV`, `ENV`,
 `ZDOTDIR`, shell options, trace or prompt hooks, `CDPATH` or functions passed in, so what runs is the line that was
-read. Windows runs PowerShell without a profile. git counts
+read. Windows runs PowerShell without a profile, by an absolute path under `%ProgramFiles%\PowerShell\7` or
+`%SystemRoot%\System32\WindowsPowerShell\v1.0`, never from `PATH` or from inside the project. git counts
 as read-only only when the repository's own settings make no read command run a program (`core.fsmonitor`, diff
 and filter drivers, signature checks); the person's global settings are their own. A version check
 (`--version`, `-V`) counts only for a program found on PATH. A program named by its full path is remembered by that
@@ -227,8 +240,9 @@ what follows it (`sudo`, `ssh`, `env`, `timeout`, `xargs`, `eval`, `source`), or
 change which program runs or what it loads. That is judged broadly: a toolchain's own prefix (`PHP*`, `PYTHON*`,
 `GIT_*`, `LD_*`, `DYLD_*`, `NODE*`), or any part of the name that says path, folder, library, config, startup or
 command (`PATH`, `DIR`, `LIB`, `INI`, `RC`, `CONFIG`, `OPTS`, `PRELOAD`, `CMD`). Data variables in front
-(`SEED=42 python3 run.py`) share the program's answer. A push the line shows asks every time, however it's quoted, encoded or
-globbed (`git 'push'`, `$'\x67it' $'\x70ush'`, `/usr/bin/g[i]t p[u]sh`, `env ./g[[:lower:]]t push`, a continued line), anywhere in the line,
+(`SEED=42 python3 run.py`) share the program's answer. A push the line shows asks every time through the supported
+quoting, POSIX escapes and globs (`git 'push'`, `$'\x67it' $'\x70ush'`, `/usr/bin/g[i]t p[u]sh`,
+`env ./g[[:lower:]]t push`, a continued line), anywhere in the line,
 including code handed to `eval` or a shell (directly or through `env`, `env -S`, `timeout`, `nice`, `xargs` and the
 like), a word that is itself a command line (a pager, an editor, `--compress-program`) and here-documents, and so does a line where git or push sits beside a function, alias or sourced file. A line that
 could push unseen asks every time too, in every mode, and its answer is never remembered (a file or variable it
@@ -236,8 +250,10 @@ reads can change without the line changing): a program named by expansion or a g
 a wrapper given an expanded word (`command "$CMD" push`, `xargs "$P"`), git settings handed to `env`,
 git given an expanded word, a word after git that isn't one of git's own commands (an alias, from settings a file
 edit can change), a git setting that runs a program (`-c alias.*`, `-c core.sshCommand=...`, `GIT_*` set in front or
-exported), code for `eval` or a shell that expands or arrives on its input (`curl x | env bash`), or a line that
-doesn't parse. A lab's own command tools pass the same publishing check. File edits share one answer; each other kind of change (a
+exported), code for `eval` or a shell that expands or arrives on its input (`curl x | env bash`), nested encoded
+PowerShell, or a line that doesn't parse. If unreadable PowerShell still contains a publishing word, it is
+classified as a push; otherwise it is hidden. A lab's own command tools pass the same publishing check. File edits
+share one answer; each other kind of change (a
 click or typing in the browser, a new app, a memory or skill, a filled PDF, a sandbox download) has its own, and asks
 in every mode until allowed. Session answers hold where they were given: a move to a lab or back, or a "Try Again"
 session, starts them over. Folder answers apply to what a change lands on, by the folder's real path (symlinks

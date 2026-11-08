@@ -17,7 +17,8 @@ How EnrichedLab handles git on a person's computer and in a lab sandbox, and how
   File tools reject `.git` paths. With the local sandbox on, macOS shell commands also reject them. Linux shell
   commands can write the worktree. Existing regular `.git` entries are bound read only, existing `.git` symbolic
   links refuse launch, and normal completion moves new entries aside after all background children end. A new
-  `.git` exists until cleanup, and an engine crash can prevent cleanup; see [security.md](security.md).
+  `.git` exists until cleanup. Before launch the engine records what existed, so a crash or failed cleanup leaves the
+  project blocked from contained shell commands until an anchored quarantine pass succeeds; see [security.md](security.md).
   `git_commit` stages all changes and commits
   through an isolated staging repository, then rechecks the recorded repository, worktree admin directory, branch
   and old commit before advancing only that branch. Its staging scratch is not in the temp folder agent commands can

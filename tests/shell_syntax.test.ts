@@ -5,14 +5,14 @@ import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { chmodSync, closeSync, constants, existsSync, linkSync, lstatSync, mkdirSync, readdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { LabConfig } from "../packages/engine/src/config.ts";
 import { allowKeys, decide, HIDDEN_REASON, PUSH_REASON } from "../packages/engine/src/permissions.ts";
 import { restoreSnapshot, snapshot } from "../packages/engine/src/git.ts";
 import { holdGitEntries, mkdirPhysical, openPhysical, removeEmptyTreePhysical, unlinkPhysical } from "../packages/engine/src/tools/anchored.ts";
 import { allowedCommand, isReadOnlyCommand } from "../packages/engine/src/tools/shell.ts";
 import type { Tool } from "../packages/engine/src/tools/types.ts";
-import { containedTempEnvironment, engineEnvironment, engineTemp, LocalWorkspace, projectGitPaths, projectGitPattern, safeTemp, sandboxer, trustedGit } from "../packages/engine/src/tools/workspace.ts";
+import { contained, containedTempEnvironment, engineEnvironment, engineTemp, gitQuarantineMarker, LocalWorkspace, privateBindPath, projectGitPaths, projectGitPattern, recoverGitQuarantine, safeTemp, sandboxer, trustedGit } from "../packages/engine/src/tools/workspace.ts";
 import { everyCommand, everyPowerShellCommand, plainCommands } from "../packages/engine/src/tools/shell_syntax.ts";
 import { FENCE_PY } from "../packages/engine/src/sites/sandbox_fence.ts";
 import { bashPattern, type SandboxApi, SandboxWorkspace } from "../packages/engine/src/sites/sandbox_workspace.ts";
@@ -32,7 +32,11 @@ describe("shell syntax", () => {
 	test("PowerShell keeps native Windows paths intact and fails closed on dynamic command words", () => {
 		expect(everyPowerShellCommand(String.raw`C:\Tools\Git\cmd\git.exe push origin main`)?.commands[0]?.words).toEqual([String.raw`C:\Tools\Git\cmd\git.exe`, "push", "origin", "main"]);
 		expect(everyPowerShellCommand(String.raw`& 'C:\Program Files\Git\bin\Git.exe' push origin main`)?.commands[0]?.words).toEqual([String.raw`C:\Program Files\Git\bin\Git.exe`, "push", "origin", "main"]);
+		expect(everyPowerShellCommand("Write-Output x#; git push")?.commands.map((command) => command.words)).toEqual([["Write-Output", "x#"], ["git", "push"]]);
 		expect(everyPowerShellCommand(String.raw`& $program push origin main`)).toBeUndefined();
+		for (const command of ["<##> git push", '& "`u{0067}it" push', "& 'g'+'it' push", "powershell.exe -EncodedCommand Z2l0IHB1c2g="]) {
+			expect([command, everyPowerShellCommand(command)]).toEqual([command, undefined]);
+		}
 	});
 
 	test("anything more than text has no plain reading", () => {
@@ -452,8 +456,19 @@ describe("round 6: containment is the boundary", () => {
 	});
 
 	test.skipIf(process.platform !== "win32")("Windows Git names and backslash paths cannot hide a push", () => {
-		for (const command of ["Git push origin main", String.raw`C:\Tools\Git\cmd\git.exe push origin main`, String.raw`'C:\Program Files\Git\bin\Git.exe' push origin main`, String.raw`& 'C:\Program Files\Git\bin\Git.exe' push origin main`]) {
-			expect(allowKeys(shell, { command }).keys[0]).toBe("shell!push");
+		const root = realpathSync(mkdtempSync(join(tmpdir(), "el-windows-publish-")));
+		const workspace = new LocalWorkspace(root, "off");
+		const full = { permissions: { mode: "full", allowCommands: [] } } as unknown as LabConfig;
+		try {
+			for (const command of ["Git push origin main", String.raw`C:\Tools\Git\cmd\git.exe push origin main`, String.raw`'C:\Program Files\Git\bin\Git.exe' push origin main`, String.raw`& 'C:\Program Files\Git\bin\Git.exe' push origin main`, "Write-Output x#; git push", "<##> git push", '& "`u{0067}it" push']) {
+				expect(allowKeys(shell, { command }).keys[0]).toBe("shell!push");
+				expect(decide(shell, { command }, workspace, full, new Set()).action).toBe("ask");
+			}
+			const encoded = "powershell.exe -EncodedCommand Z2l0IHB1c2g=";
+			expect(allowKeys(shell, { command: encoded }).keys[0]).toBe("shell!hidden");
+			expect(decide(shell, { command: encoded }, workspace, full, new Set()).action).toBe("ask");
+		} finally {
+			rmSync(root, { recursive: true, force: true });
 		}
 	});
 
@@ -727,8 +742,81 @@ describe("round 6: containment is the boundary", () => {
 		}
 	});
 
+	test.skipIf(process.platform !== "linux")("Linux bind checks follow links and case variants into hidden credential folders", () => {
+		const base = realpathSync(mkdtempSync(join(tmpdir(), "el-private-bind-")));
+		try {
+			const home = join(base, "home");
+			const project = join(base, "project");
+			mkdirSync(join(home, ".ssh"), { recursive: true });
+			mkdirSync(join(home, ".SSH"));
+			mkdirSync(project);
+			writeFileSync(join(home, ".ssh", "key"), "secret");
+			symlinkSync(join(home, ".ssh"), join(project, "linked"));
+			expect(privateBindPath(join(project, "linked", "key"), home)).toBe(true);
+			expect(privateBindPath(join(home, ".SSH"), home)).toBe(true);
+			expect(privateBindPath(home, home)).toBe(false);
+		} finally {
+			rmSync(base, { recursive: true, force: true });
+		}
+	});
+
+	test.skipIf(process.platform !== "linux" || sandboxer() !== "bubblewrap")("bubblewrap refuses private binds and applies credential masks after project binds", () => {
+		const base = realpathSync(mkdtempSync(join(tmpdir(), "el-private-mount-")));
+		const savedHome = process.env.EL_HOME;
+		try {
+			const state = join(base, "state");
+			const credentials = join(state, "credentials");
+			const project = join(base, "project");
+			mkdirSync(credentials, { recursive: true });
+			mkdirSync(join(project, ".git"), { recursive: true });
+			symlinkSync(credentials, join(project, ".git", "info"));
+			process.env.EL_HOME = state;
+			expect(() => contained("/bin/true", [], { writable: [], readable: [credentials], network: "none" })).toThrow("inside a hidden credential");
+			expect(() => contained("/bin/true", [], { writable: [project], protect: [join(project, ".git", "info")], network: "none", exact: true })).toThrow("inside a hidden credential");
+			const launch = contained("/bin/true", [], { writable: [base], network: "none" });
+			const bind = launch.args.findIndex((item, index) => item === base && launch.args[index - 1] === "--bind");
+			const mask = launch.args.findIndex((item) => item === credentials);
+			expect(bind).toBeGreaterThan(0);
+			expect(mask).toBeGreaterThan(bind);
+		} finally {
+			if (savedHome === undefined) delete process.env.EL_HOME;
+			else process.env.EL_HOME = savedHome;
+			rmSync(base, { recursive: true, force: true });
+		}
+	});
+
+	test.skipIf(process.platform !== "linux")("Linux retries a persisted .git quarantine before another launch and keeps invalid journals", () => {
+		const base = realpathSync(mkdtempSync(join(tmpdir(), "el-git-recovery-")));
+		const root = join(base, "project");
+		const home = join(base, "state");
+		mkdirSync(join(root, "existing", ".git"), { recursive: true });
+		try {
+			const held = holdGitEntries(root);
+			const marker = gitQuarantineMarker(root, home);
+			mkdirSync(dirname(marker), { recursive: true });
+			writeFileSync(marker, JSON.stringify({ version: 1, project: root, baseline: held.baseline }));
+			held.release();
+			mkdirSync(join(root, "left", ".git"), { recursive: true });
+			writeFileSync(join(root, "left", ".git", "config"), "keep");
+			const moved = recoverGitQuarantine(root, home);
+			expect(moved.map((entry) => entry.from)).toEqual(["left/.git"]);
+			expect(existsSync(marker)).toBe(false);
+			expect(existsSync(join(root, "existing", ".git"))).toBe(true);
+			expect(readFileSync(join(root, moved[0]!.to, "config"), "utf8")).toBe("keep");
+			writeFileSync(marker, "not json");
+			expect(() => recoverGitQuarantine(root, home)).toThrow("No contained command ran");
+			expect(existsSync(marker)).toBe(true);
+		} finally {
+			rmSync(base, { recursive: true, force: true });
+		}
+	});
+
 	test.skipIf(process.platform !== "linux" || sandboxer() !== "bubblewrap")("Linux commands write results, protect existing .git, and quarantine new metadata after foreground and background work", async () => {
-		const root = realpathSync(mkdtempSync(join(tmpdir(), "el-linux-metadata-")));
+		const base = realpathSync(mkdtempSync(join(tmpdir(), "el-linux-metadata-")));
+		const root = join(base, "project");
+		const savedHome = process.env.EL_HOME;
+		mkdirSync(root);
+		process.env.EL_HOME = join(base, "state");
 		try {
 			mkdirSync(join(root, ".git"));
 			writeFileSync(join(root, ".git", "config"), "existing\n");
@@ -772,7 +860,9 @@ describe("round 6: containment is the boundary", () => {
 			} catch {
 				// The setup may not have reached its mode changes.
 			}
-			rmSync(root, { recursive: true, force: true });
+			if (savedHome === undefined) delete process.env.EL_HOME;
+			else process.env.EL_HOME = savedHome;
+			rmSync(base, { recursive: true, force: true });
 		}
 	}, 15_000);
 

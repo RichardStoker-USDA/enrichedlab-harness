@@ -121,14 +121,27 @@ export function holdFolder(path: string): number {
 	return linuxWalk(path, parts(path), false);
 }
 
-/** Hold a Linux project through launch and cleanup. Every walk and rename is relative to held, no-follow folders. */
-export function holdGitEntries(path: string, maxEntries = 50_000, maxDepth = 64): {
+export interface GitEntryBaseline {
+	root: string;
+	entries: [relative: string, identity: string][];
+}
+
+export interface HeldGitEntries {
 	paths: string[];
+	baseline: GitEntryBaseline;
 	quarantine(final?: boolean): { moved: { from: string; to: string }[]; error?: string };
 	release(): void;
-} {
+}
+
+/**
+ * Hold a Linux project through launch and cleanup. Every walk and rename is relative to held, no-follow folders.
+ * A saved baseline is used only to finish a pass left pending by an earlier engine process.
+ */
+export function holdGitEntries(path: string, maxEntries = 50_000, maxDepth = 64, saved?: GitEntryBaseline): HeldGitEntries {
 	if (process.platform !== "linux") throw new Error("Git quarantine is for Linux.");
 	const root = holdFolder(path);
+	const rootStat = fstatSync(root, { bigint: true });
+	const rootIdentity = `${rootStat.dev}:${rootStat.ino}`;
 	let released = false;
 	const release = () => {
 		if (!released) lib().close(root);
@@ -198,19 +211,24 @@ export function holdGitEntries(path: string, maxEntries = 50_000, maxDepth = 64)
 			lib().close(fd);
 		}
 	};
-	const initial = new Map<string, string>();
+	const initial = new Map<string, string>(saved?.entries ?? []);
 	try {
-		walk((dir, name, relative) => {
-			const entry = identity(dir, name);
-			if (entry.symlink) throw new Error(`${relative} is a symbolic link. Linux commands cannot run until the .git link is replaced with Git's regular directory or pointer-file layout.`);
-			initial.set(relative, entry.id);
-		});
+		if (saved) {
+			if (saved.root !== rootIdentity) throw new Error("The project folder changed identity while .git cleanup was pending.");
+		} else {
+			walk((dir, name, relative) => {
+				const entry = identity(dir, name);
+				if (entry.symlink) throw new Error(`${relative} is a symbolic link. Linux commands cannot run until the .git link is replaced with Git's regular directory or pointer-file layout.`);
+				initial.set(relative, entry.id);
+			});
+		}
 	} catch (error) {
 		release();
 		throw error;
 	}
 	return {
 		paths: [...initial.keys()].map((relative) => join(path, relative)),
+		baseline: { root: rootIdentity, entries: [...initial] },
 		release,
 		quarantine(final = true) {
 			const moved: { from: string; to: string }[] = [];
