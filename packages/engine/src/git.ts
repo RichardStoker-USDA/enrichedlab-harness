@@ -6,7 +6,7 @@ import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve, sep } from "node:path";
+import { isAbsolute, join, resolve, sep } from "node:path";
 import { contained, trustedGit } from "./tools/workspace.ts";
 import { SECRET_NAME } from "./util.ts";
 
@@ -249,7 +249,9 @@ export function packForSend(repo: string, bundle: string): Pack {
  */
 export function fetchBundle(repo: string, bundle: string, source: string, branch: string, base: string, home = base): string[] {
 	const temp = `refs/enrichedlab/fetch/${randomBytes(4).toString("hex")}`;
-	git(repo, ["fetch", "-q", bundle, `${source}:${temp}`]);
+	// The bundle is a file EnrichedLab downloaded: only the file transport, never a network or helper transport.
+	if (!isAbsolute(bundle) || !existsSync(bundle)) throw new Error(`${bundle} isn't a bundle file.`);
+	git(repo, ["fetch", "-q", "--no-recurse-submodules", bundle, `${source}:${temp}`], { GIT_ALLOW_PROTOCOL: "file" });
 	try {
 		const tip = home === base ? git(repo, ["rev-parse", temp]) : rebuild(repo, base, home, temp);
 		git(repo, ["update-ref", `refs/heads/${branch}`, tip]);

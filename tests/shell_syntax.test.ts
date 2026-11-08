@@ -385,6 +385,8 @@ describe("round 5: one boundary", () => {
 		expect(calls.map((c) => c.sub).filter((s) => !reviewed.has(s))).toEqual([]);
 		for (const c of calls.filter((x) => x.sub === "diff")) expect(c.rest).toContain('"--name-only"');
 		for (const c of calls.filter((x) => x.sub === "show")) expect(c.rest).toContain('"-s"');
+		// fetch reads only a bundle file: no network or helper transport (ext::, a remote from project config).
+		for (const m of source.matchAll(/git\([a-zA-Z.]+, \["fetch"[^\n]*/g)) expect(m[0]).toContain('GIT_ALLOW_PROTOCOL: "file"');
 		for (const c of calls.filter((x) => x.sub === "log")) expect(c.rest).not.toMatch(/"-p"|"--patch"|"--stat"|textconv/);
 		// Every process git.ts starts goes through its contained helper.
 		expect((source.match(/execFileSync\(/g) ?? []).length).toBe(4);
