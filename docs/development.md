@@ -73,7 +73,11 @@ window's size. Build the window first
 The native macOS app builds with `swift build` in `apps/macos` (tests: `swift test`, which also start a real engine
 from source in a scratch home). `bun scripts/dev_lab.ts --mac --shots <folder>` runs the debug build against the same
 stand-in lab and captures each native scene in light and dark (`--scene mac_files` for one); it captures only the app's
-own windows. `bun scripts/build_mac_app.ts --adhoc` builds `dist/mac/EnrichedLab.app` (universal, with the universal
+own windows. The `mac_plot_divider` and `mac_dashboard_divider` scenes open a 60,000-point plot or a dashboard and
+drag the workbench's divider in small steps; a scene fails when the app ends before it's ready. They guard the window
+crash of November 7 (a window minimum computed from live column widths during layout). It showed only in an optimized
+build, so check window sizing with one: `swift build -c release -Xswiftc -DDEBUG` keeps the scene hooks, and
+`EL_MAC_BINARY=apps/macos/.build/release/EnrichedLab` runs the scenes on it. `bun scripts/build_mac_app.ts --adhoc` builds `dist/mac/EnrichedLab.app` (universal, with the universal
 `el` inside) for a local check; the release signs it with the Developer ID.
 
 A development run of the desktop app (`apps/desktop`, unpackaged) takes these for screenshots and tests:

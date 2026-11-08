@@ -12,6 +12,8 @@ public struct RootView: View {
 	@State private var sidebarAsideForWorkbench = false
 	/// The window is widening to make room: its in-between widths don't move the sidebar.
 	@State private var widening = false
+	/// The window's smallest width, kept by MinimumKeeper.
+	@State private var minimum: CGFloat = 720
 
 	public init() {}
 
@@ -31,17 +33,11 @@ public struct RootView: View {
 	}
 
 	/// The workbench shows once the window has room for it; once showing, it stays (dragging a divider wider can't
-	/// hide it), and the window's minimum keeps that room.
+	/// hide it), and the columns' minimums keep that room.
 	private func updateRoom() {
 		let showing = workbenchOpen && app.workbenchRoom
 		let room = !widening && (showing || width == 0 || width >= roomy - 1 || columns == .detailOnly)
 		if app.workbenchRoom != room { app.workbenchRoom = room }
-	}
-
-	/// With the workbench showing, the window can't be narrowed past what its columns need.
-	private var smallestWidth: CGFloat {
-		guard workbenchOpen, app.workbenchRoom else { return 720 }
-		return max(720, min(roomy, width > 0 ? width : roomy))
 	}
 
 	private func asideSidebar() {
@@ -105,7 +101,8 @@ public struct RootView: View {
 			.overlay(alignment: .bottom) { ToastView() }
 			.overlay(alignment: .top) { ConnectionBanner() }
 		}
-		.frame(minWidth: smallestWidth, minHeight: 480)
+		.frame(minWidth: minimum, minHeight: 480)
+		.background(MinimumKeeper(workbenchShows: workbenchOpen && app.workbenchRoom, sidebarShows: columns != .detailOnly, window: window, minimum: $minimum))
 		.background(WindowReader(window: $window))
 		// The window's own width: the split view can't report a width below its columns' minimums.
 		.onReceive(NotificationCenter.default.publisher(for: NSWindow.didResizeNotification)) { note in
@@ -184,6 +181,35 @@ public struct RootView: View {
 		if let detail = confirmation.detail { lines.append(detail) }
 		for fact in confirmation.facts { lines.append("\(fact.label): \(fact.text)") }
 		return lines.joined(separator: "\n\n")
+	}
+}
+
+/// Keeps the window's smallest width at what the sidebar, the run sheet and the workbench need side by side. The
+/// columns' widths change during layout, so the minimum is set a moment after they settle, outside any layout pass and
+/// never mid-drag of the window's edge: a minimum written from inside layout fed back into it and crashed the window
+/// (November 7, a plot and a dashboard open while the window was resized). It never exceeds the window's current
+/// width, so setting it never resizes the window.
+private struct MinimumKeeper: View {
+	@Environment(AppModel.self) private var app
+	var workbenchShows: Bool
+	var sidebarShows: Bool
+	var window: NSWindow?
+	@Binding var minimum: CGFloat
+
+	private var wanted: CGFloat {
+		guard workbenchShows else { return 720 }
+		return max(720, ((sidebarShows ? app.sidebarWidth : 0) + AppModel.runSheetWidth + app.workbenchWidth).rounded(.up))
+	}
+
+	var body: some View {
+		Color.clear.task(id: wanted) {
+			let wanted = wanted
+			try? await Task.sleep(for: .milliseconds(150))
+			while window?.inLiveResize == true, !Task.isCancelled { try? await Task.sleep(for: .milliseconds(100)) }
+			guard !Task.isCancelled else { return }
+			let next = min(wanted, max(720, (window?.contentLayoutRect.width ?? wanted).rounded(.down)))
+			if abs(next - minimum) >= 2 { minimum = next }
+		}
 	}
 }
 

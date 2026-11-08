@@ -15,6 +15,8 @@ import SwiftUI
 /// EL_SCENE_AFTER    milliseconds to wait before saying the scene is ready
 /// EL_SCENE_PROMPT   start a new session in the newest project with this task, as the New Session view does
 /// EL_SCENE_UNTIL    streaming (a long tool call is arriving), question (it asks), or done (allowed, then finished)
+/// EL_SCENE_OPEN     a file in the session's folder to open as a view (a dashboard, say)
+/// EL_SCENE_DRAG     window or divider: drag the window's edge, or the workbench's divider, in small steps as a person would
 @MainActor
 enum Automation {
 	static var active: Bool { ProcessInfo.processInfo.environment["EL_SCENE"] != nil }
@@ -41,9 +43,21 @@ enum Automation {
 			case "terminal": session.workbench.newTerminal()
 			case "browser": session.workbench.show(.browser, title: "Browser")
 			case "desktop": if let site = session.place.site { session.workbench.show(.desktop(site: site.name), title: "\(session.place.title) desktop") }
-			case "first": if let view = session.canvases.first { session.showView(view.id) }
+			case "first":
+				// The session's views arrive after it opens.
+				for _ in 0 ..< 50 where session.canvases.isEmpty { try? await Task.sleep(for: .milliseconds(100)) }
+				if let view = session.canvases.first { session.showView(view.id) }
 			default: break
 			}
+		}
+		if let path = env["EL_SCENE_OPEN"], let session = app.session {
+			await session.openFile(path.hasPrefix("/") ? path : "\(session.summary.cwd)/\(path)")
+		}
+		if let how = env["EL_SCENE_DRAG"], let window = mainWindow {
+			// The page loads and lays out first, as it would before a person reaches for the edge.
+			try? await Task.sleep(for: .milliseconds(1500))
+			let steps = await drag(how, window: window, app: app)
+			print("scene: dragged the \(how) through \(steps) steps, ending \(Int(window.contentLayoutRect.width)) wide (smallest \(Int(window.contentMinSize.width)))")
 		}
 		if let size = env["EL_SCENE_RESIZE"]?.split(separator: "x").compactMap({ Double($0) }), size.count == 2, let window = mainWindow {
 			try? await Task.sleep(for: .milliseconds(800))
@@ -62,6 +76,42 @@ enum Automation {
 		}
 		print("scene: ready")
 		fflush(stdout)
+	}
+
+	/// Wider to the screen's edge and back to the window's smallest width, 6 points at a time with a display cycle
+	/// between, or the workbench's divider 500 points left and back: what a person's drag does.
+	private static func drag(_ how: String, window: NSWindow, app: AppModel) async -> Int {
+		var steps = 0
+		func turn() async {
+			steps += 1
+			try? await Task.sleep(for: .milliseconds(12))
+		}
+		if how == "divider" {
+			// The innermost split view holds the run sheet and the workbench.
+			guard let split = splitViews(in: window.contentView).last(where: { $0.arrangedSubviews.count >= 2 }) else { return 0 }
+			let index = split.arrangedSubviews.count - 2
+			// The workbench's left edge (the run sheet can reach under it, so its own right edge isn't the divider).
+			let start = split.arrangedSubviews[index + 1].frame.minX
+			let widths = { split.arrangedSubviews.map { Int($0.frame.width) } }
+			print("scene: divider \(index) of \(widths()) at \(Int(start)), workbench open \(app.session?.workbench.isOpen ?? false), room \(app.workbenchRoom)")
+			for x in stride(from: start, through: max(300, start - 500), by: -6) { split.setPosition(x, ofDividerAt: index); await turn() }
+			print("scene: divider moved: \(widths()), workbench open \(app.session?.workbench.isOpen ?? false), room \(app.workbenchRoom)")
+			for x in stride(from: max(300, start - 500), through: start, by: 6) { split.setPosition(x, ofDividerAt: index); await turn() }
+			print("scene: divider back: \(widths()), workbench open \(app.session?.workbench.isOpen ?? false), room \(app.workbenchRoom)")
+			return steps
+		}
+		let screen = window.screen?.visibleFrame.width ?? 1600
+		let height = window.contentLayoutRect.height
+		let from = window.contentLayoutRect.width
+		for width in stride(from: from, through: screen - 20, by: 6) { window.setContentSize(NSSize(width: width, height: height)); await turn() }
+		for width in stride(from: screen - 20, through: window.contentMinSize.width, by: -6) { window.setContentSize(NSSize(width: width, height: height)); await turn() }
+		return steps
+	}
+
+	private static func splitViews(in view: NSView?) -> [NSSplitView] {
+		guard let view else { return [] }
+		let own: [NSSplitView] = (view as? NSSplitView).map { [$0] } ?? []
+		return own + view.subviews.flatMap { splitViews(in: $0) }
 	}
 
 	private static var mainWindow: NSWindow? {

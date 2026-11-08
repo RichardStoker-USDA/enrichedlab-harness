@@ -262,6 +262,19 @@ writeFileSync(
 );
 mkdirSync(join(project, "src"), { recursive: true });
 writeFileSync(join(project, "README.md"), "# Soil moisture analysis\n\nScripts for the 2026 field season.\n");
+// 60,000 rows for a scatter plot, the size that crashed the window on November 7.
+writeFileSync(
+	join(project, "scored.csv"),
+	`predicted_prob,usage_pct,risk_tier\n${Array.from({ length: 60_000 }, (_, i) => `${((i * 7919) % 10_000) / 10_000},${((i * 104_729) % 1000) / 10},${["low", "medium", "high"][i % 3]}`).join("\n")}\n`,
+);
+// A dashboard that lays itself out again at every width, as a Shiny or Plotly page does.
+writeFileSync(
+	join(project, "dashboard.html"),
+	`<!doctype html><meta charset="utf-8"><title>Field dashboard</title>
+<style>body{font:14px system-ui;margin:0;padding:16px}main{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}section{border:1px solid #ccc;border-radius:8px;padding:12px;min-height:140px}canvas{width:100%;height:160px}</style>
+<h1>Soil moisture, 2026</h1><main>${Array.from({ length: 6 }, (_, i) => `<section><h2>Plot ${i + 1}</h2><canvas></canvas></section>`).join("")}</main>
+<script>const draw=()=>document.querySelectorAll("canvas").forEach((c,k)=>{const r=c.getBoundingClientRect();c.width=r.width*devicePixelRatio;c.height=r.height*devicePixelRatio;const g=c.getContext("2d");g.scale(devicePixelRatio,devicePixelRatio);g.beginPath();for(let x=0;x<r.width;x+=4)g.lineTo(x,r.height/2+Math.sin((x+k*40)/30)*r.height/3);g.stroke();});new ResizeObserver(draw).observe(document.body);draw();</script>`,
+);
 writeFileSync(join(project, "src", "analysis.py"), "import pandas as pd\n\n\ndef load(path):\n    return pd.read_csv(path)\n");
 writeFileSync(join(project, "plots.csv"), "plot,moisture\nP1,0.31\nP2,0.27\n");
 const git = (...a: string[]) => Bun.spawnSync(["git", "-c", "user.name=Pat", "-c", "user.email=pat@example.invalid", ...a], { cwd: project });
@@ -356,6 +369,11 @@ interface MacScene {
 	size?: string;
 	/** A size applied after the pane opens: narrowing a window with the workbench open. */
 	resize?: string;
+	/** A file in the session's folder opened as a view, and a drag of the window's edge or the workbench divider. */
+	open?: string;
+	drag?: "window" | "divider";
+	/** Open the 60,000-point scatter plot view first. */
+	plot?: boolean;
 	/** A task started from the window in a new session, run until it streams, asks, or is done. */
 	prompt?: string;
 	until?: "streaming" | "question" | "done";
@@ -373,6 +391,10 @@ const MAC_SCENES: MacScene[] = [
 	{ name: "mac_desktop", session: "lab", pane: "desktop", after: 4000 },
 	{ name: "mac_narrow", session: "lab", pane: "desktop", size: "900x700", after: 3000 },
 	{ name: "mac_narrowed", session: "lab", pane: "desktop", resize: "900x700", after: 3000 },
+	{ name: "mac_dashboard_window", session: "local", open: "dashboard.html", drag: "window", after: 800 },
+	{ name: "mac_dashboard_divider", session: "local", open: "dashboard.html", drag: "divider", after: 800 },
+	{ name: "mac_plot_window", session: "local", plot: true, pane: "first", drag: "window", after: 800 },
+	{ name: "mac_plot_divider", session: "local", plot: true, pane: "first", drag: "divider", after: 800 },
 	{ name: "mac_live_streaming", prompt: "Write the big page", until: "streaming", after: 300 },
 	{ name: "mac_live_question", prompt: "Write the big page", until: "question", after: 800 },
 	{ name: "mac_live_done", prompt: "Write the big page", until: "done", after: 800 },
@@ -382,7 +404,8 @@ const MAC_SCENES: MacScene[] = [
 ];
 
 async function macScenes(client: EngineClient, engineVersion: string, sessions: { local: string; lab: string }): Promise<void> {
-	const binary = join(root, "apps/macos/.build/debug/EnrichedLab");
+	// EL_MAC_BINARY: another build, such as an optimized one built with -Xswiftc -DDEBUG to keep the scene hooks.
+	const binary = process.env.EL_MAC_BINARY ?? join(root, "apps/macos/.build/debug/EnrichedLab");
 	if (!statSync(binary, { throwIfNoEntry: false })) throw new Error("Build the app first: cd apps/macos && swift build");
 	const out = shotsAt ?? join(root, "dist", "shots");
 	mkdirSync(out, { recursive: true });
@@ -391,6 +414,7 @@ async function macScenes(client: EngineClient, engineVersion: string, sessions: 
 		for (const scene of MAC_SCENES) {
 			if (only && scene.name !== only) continue;
 			const sessionId = scene.session ? sessions[scene.session] : undefined;
+			if (scene.plot && sessionId) await client.call("view.open", { sessionId, path: join(project, "scored.csv"), plot: { x: "predicted_prob", y: "usage_pct", color: "risk_tier", type: "scatter" } });
 			const proc = Bun.spawn([binary], {
 				env: {
 					...env,
@@ -402,6 +426,8 @@ async function macScenes(client: EngineClient, engineVersion: string, sessions: 
 					...(sessionId ? { EL_SCENE_SESSION: sessionId } : {}),
 					...(scene.pane ? { EL_SCENE_PANE: scene.pane } : {}),
 					...(scene.resize ? { EL_SCENE_RESIZE: scene.resize } : {}),
+					...(scene.open ? { EL_SCENE_OPEN: scene.open } : {}),
+					...(scene.drag ? { EL_SCENE_DRAG: scene.drag } : {}),
 					...(scene.prompt ? { EL_SCENE_PROMPT: scene.prompt, EL_SCENE_UNTIL: scene.until ?? "done" } : {}),
 					...(scene.settings ? { EL_SCENE_SETTINGS: scene.settings } : {}),
 					...(scene.advanced ? { EL_SCENE_ADVANCED: "1" } : {}),
@@ -426,10 +452,11 @@ async function macScenes(client: EngineClient, engineVersion: string, sessions: 
 					if (ready) break;
 				}
 			})();
-			await Promise.race([reading, Bun.sleep(scene.prompt ? 120_000 : 60_000)]);
+			await Promise.race([reading, Bun.sleep(scene.prompt || scene.drag ? 180_000 : 60_000)]);
 			if (!ready) {
 				failed = true;
-				console.log(`${scene.name} (${theme}): FAILED: the app never said it was ready`);
+				const code = proc.exitCode ?? proc.signalCode;
+				console.log(`${scene.name} (${theme}): FAILED: ${code !== null ? `the app ended (${code}) before it was ready` : "the app never said it was ready"}`);
 				proc.kill();
 				continue;
 			}
