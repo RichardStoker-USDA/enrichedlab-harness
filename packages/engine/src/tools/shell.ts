@@ -58,6 +58,8 @@ export function tokenize(command: string): Token[] | undefined {
 			continue;
 		}
 		if (c === "`" || c === "$") return undefined; // single-quoted text was handled above
+		// A comment at the start of a word: its quotes aren't quotes, so a line holding one can't be judged here.
+		if (!quote && c === "#" && !started) return undefined;
 		// Unquoted ( ) { } run code: PowerShell subexpressions and script blocks, POSIX subshells and groups.
 		if (!quote && "(){}".includes(c)) return undefined;
 		if (quote === '"') {

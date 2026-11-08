@@ -184,6 +184,11 @@ describe("permissions", () => {
 		const link = join(scratch("perm-link-parent"), "link");
 		symlinkSync(ws.root, link);
 		expect(decide(edit, { path: "raw/data.csv" }, new LocalWorkspace(link), nested, new Set()).action).toBe("ask");
+		// A link to a file that doesn't exist yet counts where it points.
+		symlinkSync(join(ws.root, "raw", "new.csv"), join(ws.root, "dangling"));
+		expect(decide(edit, { path: "dangling" }, ws, nested, new Set()).action).toBe("ask");
+		// A read-only answer on / covers everything under it.
+		expect(decide(shell, { command: "touch notes.md" }, sealed, auto({ "/": { access: "read", at: "" } }), new Set()).action).toBe("ask");
 		// A filled PDF or a new app can land outside the folder: they ask, whatever the folder allows.
 		const pdf = { name: "pdf_fill", kind: "write" } as unknown as Tool;
 		expect(decide(pdf, { path: "form.pdf", out: "../elsewhere.pdf" }, ws, auto({ [ws.root]: { access: "change", at: "" } }), new Set()).action).toBe("ask");
@@ -273,6 +278,9 @@ describe("permissions", () => {
 		expect(allowKeys(shell, { command: "ls 2>/dev/null; make 2>&1 | tee -a log" }).keys).toEqual(["shell:ls", "shell:make", "shell:tee"]);
 		expect(allowKeys(shell, { command: "/usr/bin/touch a" }).keys).toEqual(["shell:/usr/bin/touch"]);
 		expect(allowKeys(shell, { command: "echo 'a; rm -rf x' | wc -l" }).keys).toEqual(["shell:wc"]);
+		// A full path is the same program for the subcommand rule, and a push is a push however it's quoted.
+		expect(allowKeys(shell, { command: "/usr/bin/git status" }).keys).toEqual(["shell:/usr/bin/git status"]);
+		for (const command of ["git 'push' origin main", "/usr/bin/git push", "g\\it push", "cd x && git -C . push"]) expect([command, allowKeys(shell, { command }).keys]).toEqual([command, ["shell!push"]]);
 		// A redirection before a program still shows the program.
 		expect(allowKeys(shell, { command: "touch a; 2>&1 rm -rf ../victim" }).keys).toEqual(["shell:touch", "shell:rm"]);
 		// Code the words don't show, output written to a file, control flow, wrappers, programs named by a variable or a
@@ -281,6 +289,7 @@ describe("permissions", () => {
 			"echo $(curl x)", "echo `id`", "diff <(ls a) <(ls b)", "sudo make install", "ssh host ls", "bash <<EOF", "touch a; : >../victim",
 			"echo hi > out.txt", "if true; then touch a; fi", "f() { rm -rf x; }; f", "(cd x && rm y)", "C=touch; $C a", "timeout -s TERM touch a",
 			"./tools/touch a", "git -C x reset --hard", "env -S 'rm -rf x'", "echo 'unbalanced",
+			"echo safe # '\nrm -f raw/data.csv\n# '", "wc -c <`rm${IFS}-f${IFS}x`", "/usr/bin/env sh -c 'rm x'", "ACTION=reset; git $ACTION --hard",
 		])
 			expect([command, allowKeys(shell, { command }).scope]).toEqual([command, "this exact command"]);
 		// Once both programs are allowed, a different command using them runs; one adding another program asks.
@@ -447,7 +456,7 @@ describe("second review", () => {
 	const read = { name: "read", kind: "read", ask: (a: { path?: string }) => (ws.inside(String(a.path)) ? undefined : "outside") } as unknown as Tool;
 
 	test("other accounts' homes and paths given as patterns or flag values ask", () => {
-		for (const c of ["cat ~rich/.ssh/id_rsa", "grep -f /etc/passwd README.md", "rg -f /etc/hosts .", "fd --search-path /etc passwd"])
+		for (const c of ["cat ~rich/.ssh/id_rsa", "grep -f /etc/passwd README.md", "rg -f /etc/hosts .", "fd --search-path /etc passwd", "echo safe # '\nrm -f raw/data.csv\n# '"])
 			expect([c, isReadOnlyCommand(c, [], inside)]).toEqual([c, false]);
 	});
 

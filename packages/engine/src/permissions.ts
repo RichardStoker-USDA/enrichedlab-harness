@@ -9,7 +9,7 @@
 // - full: never asks, except pushing to a remote and lab tools the lab hasn't reviewed.
 // "Allow for this session" is remembered per program (python, git commit), per host, per tool, and kept in the log.
 
-import { realpathSync } from "node:fs";
+import { lstatSync, readlinkSync, realpathSync } from "node:fs";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import type { FolderAccess, LabConfig, PermissionMode } from "./config.ts";
 import { isReadOnlyCommand, pathsInside } from "./tools/shell.ts";
@@ -41,13 +41,19 @@ export function modeOf(mode: string | undefined): PermissionMode {
  * /Project and /project on a case-insensitive disk, are one folder). A path that doesn't exist yet takes its nearest
  * existing parent's.
  */
-export function canonical(path: string): string {
+export function canonical(path: string, depth = 0): string {
 	let at = resolve(path);
 	const rest: string[] = [];
 	for (;;) {
 		try {
 			return join(realpathSync.native(at), ...rest.reverse());
 		} catch {
+			// A link to somewhere that doesn't exist yet: a write through it lands where it points.
+			try {
+				if (depth < 40 && lstatSync(at).isSymbolicLink()) return join(canonical(resolve(dirname(at), readlinkSync(at)), depth + 1), ...rest.reverse());
+			} catch {
+				// Not there at all: its parent decides.
+			}
 			const up = dirname(at);
 			if (up === at) return resolve(path);
 			rest.push(basename(at));
@@ -56,13 +62,18 @@ export function canonical(path: string): string {
 	}
 }
 
+/** True when `path` is `folder` or inside it ("/" holds everything). */
+function within(path: string, folder: string): boolean {
+	return path === folder || path.startsWith(folder.endsWith(sep) ? folder : folder + sep);
+}
+
 /** What the person let EnrichedLab do at `path`: the nearest folder they answered for decides. */
 export function folderAccess(config: LabConfig, path: string): FolderAccess | undefined {
 	const target = canonical(path);
 	let best: { folder: string; access: FolderAccess } | undefined;
 	for (const [saved, grant] of Object.entries(config.folders ?? {})) {
 		const folder = canonical(saved);
-		const inside = target === folder || target.startsWith(folder.endsWith(sep) ? folder : folder + sep);
+		const inside = within(target, folder);
 		if (inside && (!best || folder.length > best.folder.length)) best = { folder, access: grant.access };
 	}
 	return best?.access;
@@ -73,7 +84,7 @@ function readOnlyWithin(config: LabConfig, root: string): boolean {
 	const base = canonical(root);
 	return Object.entries(config.folders ?? {}).some(([saved, grant]) => {
 		const folder = canonical(saved);
-		return grant.access === "read" && (folder === base || folder.startsWith(base.endsWith(sep) ? base : base + sep) || base.startsWith(folder + sep));
+		return grant.access === "read" && (within(folder, base) || within(base, folder));
 	});
 }
 
@@ -128,6 +139,7 @@ function simpleCommands(line: string): string[][] | undefined {
 			else word += c;
 			continue;
 		}
+		if (c === "#" && !word && !quoted) return undefined;
 		if (c === "'" || c === '"') {
 			quote = c;
 			quoted = true;
@@ -152,6 +164,8 @@ function simpleCommands(line: string): string[][] | undefined {
 			let target = "";
 			while (line[i + 1] === " ") i++;
 			while (i + 1 < line.length && !" \t;|&<>()\n".includes(line[i + 1]!)) target += line[++i];
+			// A target that expands or quotes runs or hides something before the file opens.
+			if (/[`$'"\\#]/.test(target)) return undefined;
 			const copy = /&$/.test(op) && /^(\d+|-)$/.test(target);
 			const writes = op.includes(">") && !copy && target !== "/dev/null";
 			if (writes || (!copy && !target)) return undefined;
@@ -174,12 +188,14 @@ function commandKeys(command: string): { keys: string[]; names: string[] } | und
 		while (words.length && /^[A-Za-z_]\w*=/.test(words[0]!)) words.shift();
 		const first = words[0];
 		if (!first) continue;
-		// A program named by a variable, a pattern or a relative path depends on more than the words: exact.
-		if (EXACT.has(first) || /[$*?[\]{}~]/.test(first) || (first.includes("/") && !first.startsWith("/"))) return undefined;
+		// A program named by a variable, a pattern or a relative path depends on more than the words: exact. A full path
+		// is the same program as its name for these rules (/usr/bin/env, /usr/bin/git).
+		const name = first.replace(/^.*\//, "");
+		if (EXACT.has(name) || /[$*?[\]{}~]/.test(first) || (first.includes("/") && !first.startsWith("/"))) return undefined;
 		if (QUIET.has(first)) continue;
-		if (SUBCOMMANDS.has(first) && words[1]) {
-			// Options before the action (git -C dir reset) would hide which action it is.
-			if (words[1].startsWith("-")) return undefined;
+		if (SUBCOMMANDS.has(name) && words[1]) {
+			// Options before the action (git -C dir reset), or an action that expands, would hide which action it is.
+			if (!/^[A-Za-z0-9][\w.:-]*$/.test(words[1])) return undefined;
 			keys.add(`shell:${first} ${words[1]}`);
 			names.add(`${first} ${words[1]}`);
 		} else {
@@ -199,8 +215,10 @@ function list(items: string[]): string {
 export function allowKeys(tool: Tool, args: Record<string, unknown>): { keys: string[]; scope: string } {
 	if (tool.kind === "exec") {
 		const command = String(args.command ?? "").trim();
-		// Pushing publishes work: it asks every time, whatever was allowed before.
-		if (/(^|[;&|\n]\s*)git\s+(\S+\s+)*push\b/.test(command)) return { keys: ["shell!push"], scope: "pushing" };
+		// Pushing publishes work: it asks every time, whatever was allowed before. Judged on the words with quotes and
+		// escapes taken out, so git 'push' and g\it push are pushes too.
+		const plain = command.replace(/['"\\]/g, "");
+		if (/(^|[;&|\n(`]\s*|\/)git(\s+\S+)*\s+push\b/.test(plain)) return { keys: ["shell!push"], scope: "pushing" };
 		const found = commandKeys(command);
 		if (!found) return { keys: [`shell=${command}`], scope: "this exact command" };
 		return { keys: found.keys, scope: `${list(found.names.map((n) => `“${n}”`))} commands` };
