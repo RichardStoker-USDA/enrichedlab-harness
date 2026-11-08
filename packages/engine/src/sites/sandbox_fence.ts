@@ -13,7 +13,7 @@ export const FENCE_PYTHONS = ["/usr/bin/python3", "/usr/local/bin/python3"];
 
 /**
  * The Landlock program. `probe <nonce>`: fences a child to one folder and checks that it can't truncate, write,
- * remove, rename into or link in another; prints "el-fence ok <nonce>" when all of that holds. `run <root> <command>`:
+ * remove, rename into or link in another; prints "el-fence ok <nonce> abi <n> py <interpreter>" when all of that holds. `run <root> <command>`:
  * checks that <root> is the folder it was started in, fences, and runs the command with /bin/bash.
  */
 export const FENCE_PY = String.raw`
@@ -157,7 +157,6 @@ else:
         sys.exit(125)
 `;
 
-/** Runs the probe with the system's python3 when it is root-owned and writable only by root; else says "no". */
 /** The interpreter starts without loader variables, so nothing runs in it before the fence is set. */
 const CLEAN = "env -u LD_PRELOAD -u LD_AUDIT -u LD_LIBRARY_PATH -u PYTHONHOME -u PYTHONPATH";
 

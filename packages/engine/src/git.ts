@@ -17,7 +17,7 @@ const writableFor = new Map<string, string[]>();
  * git on the project's own repository. Its settings and attributes are project content (an agent can write them),
  * and some make git run a program (filter and diff drivers, fsmonitor, hooks), so the engine's git runs contained
  * like the agent's commands: it may write the repository and nothing else, with no network. Hooks and fsmonitor are
- * off as well. Where this computer has no facility, it runs as before with those two turned off.
+ * off as well. Where this computer has no facility, every configured filter and diff driver is turned off instead.
  */
 function git(cwd: string, args: string[], env?: Record<string, string>): string {
 	const program = trustedGit() ?? "git";
