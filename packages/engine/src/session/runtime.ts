@@ -680,8 +680,13 @@ export class SessionRuntime {
 	/** Put back the files this session changed since the person's last message (or the last undo). */
 	async undo(): Promise<{ ok: boolean; files: string[]; detail: string }> {
 		if (this.running) return { ok: false, files: [], detail: "Wait for the current turn to finish, or cancel it." };
-		// With step history: back to the start of the last turn, shell changes included, here or at a lab.
-		const start = this.events.findLast((e) => e.t === "checkpoint" && e.callId === "turn" && e.history) as Ev<"checkpoint"> | undefined;
+		// With step history: back to the start of the last turn, shell changes included, here or at a lab. Only that
+		// turn's own start counts: a turn whose history couldn't be kept never falls back to an earlier turn's.
+		const lastUser = this.events.findLastIndex((e) => e.t === "user");
+		const turnStart = this.events.findLast((e) => e.t === "checkpoint" && e.callId === "turn") as Ev<"checkpoint"> | undefined;
+		const own = turnStart && this.events.indexOf(turnStart) > lastUser ? turnStart : undefined;
+		if (own && !own.history && own.lab) return { ok: false, files: [], detail: "This turn was kept only as a whole-sandbox checkpoint. Go Back the Whole Sandbox, from a step's menu, puts every folder there back." };
+		const start = own?.history ? own : undefined;
 		const after = start ? this.events.slice(this.events.indexOf(start)) : [];
 		if (start && !after.some((e) => e.t === "undo" || e.t === "rewind")) {
 			// Moved since: the files are where it was then, and nothing here is touched.
@@ -708,6 +713,8 @@ export class SessionRuntime {
 		for (let i = this.events.length - 1; i >= 0; i--) {
 			const e = this.events[i]!;
 			if (e.t === "undo" || e.t === "user") break;
+			// Moved since these copies were kept: their paths are where it was then, and nothing there is touched.
+			if (e.t === "place") return { ok: false, files: [], detail: "The session moved since your last message; its history is where it was then." };
 			if (e.t === "checkpoint") changes.unshift(e.files);
 		}
 		// A git snapshot taken before the turn covers everything, shell changes included; otherwise the per-file copies.

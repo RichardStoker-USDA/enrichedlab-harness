@@ -179,4 +179,21 @@ describe("approvals", () => {
 		expect(undone.detail).toContain("moved");
 		expect(readFileSync(join(root, "notes.txt"), "utf8")).toBe("the person's later work\n");
 	});
+
+	test("undo never falls back to an earlier turn when this turn's history couldn't be kept", async () => {
+		const root = join(dir, "p5");
+		mkdirSync(root);
+		const full = { ...DEFAULT_CONFIG, permissions: { ...DEFAULT_CONFIG.permissions, mode: "full" as const } };
+		const { log } = SessionLog.create(join(dir, "logs"), root, model.ref, "You help.");
+		const { runtime: session } = runtime(log, root, () => full, () => "allow");
+		await turn(session, "write: first.txt");
+		// The history store breaks before the second turn: its start isn't kept.
+		(session as unknown as { historyOff: boolean }).historyOff = true;
+		await turn(session, "write: second.txt");
+		const undone = await session.undo();
+		// The per-file copies of this turn put back only this turn's file.
+		expect(undone.files).toEqual(["second.txt"]);
+		expect(existsSync(join(root, "first.txt"))).toBe(true);
+		expect(existsSync(join(root, "second.txt"))).toBe(false);
+	});
 });
