@@ -45,7 +45,8 @@ public enum Theme {
 	/// Series in plots, in order: UC Davis primary and secondary colors that stay apart from each other and readable
 	/// as marks on white or on black.
 	public static let series: [Color] = [
-		pair(0x022851, 0xFFBF00), pair(0xFFBF00, 0x00B2E3), pair(0x008EAA, 0x6CCA98),
+		// Gold as a mark on white needs depth for 3:1: a darker gold in light.
+		pair(0x022851, 0xFFBF00), pair(0xA87A00, 0x00B2E3), pair(0x008EAA, 0x6CCA98),
 		pair(0x266041, 0xFFD24C), pair(0xC10230, 0xF18A00), pair(0x4F7094, 0xB3C1D1),
 	]
 

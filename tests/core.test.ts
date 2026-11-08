@@ -4,11 +4,11 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import type { SessionEvent } from "../packages/protocol/src/index.ts";
 import { budget, cutPoint, derive, elisionCandidates, SUMMARY_PREFIX } from "../packages/engine/src/session/context.ts";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { LabConfig } from "../packages/engine/src/config.ts";
-import { allowKey, allowKeys, decide } from "../packages/engine/src/permissions.ts";
+import { allowKey, allowKeys, canonical, decide, folderAccess, identity } from "../packages/engine/src/permissions.ts";
 import { isReadOnlyCommand } from "../packages/engine/src/tools/shell.ts";
 import type { Tool } from "../packages/engine/src/tools/types.ts";
 import { LocalWorkspace } from "../packages/engine/src/tools/workspace.ts";
@@ -144,6 +144,8 @@ describe("shell", () => {
 
 describe("permissions", () => {
 	const ws = new LocalWorkspace(scratch("perm"));
+	// Grants are saved by real path (folder.access), as the engine saves them.
+	const home = realpathSync(ws.root);
 	const config = { permissions: { mode: "ask", allowCommands: [] } } as unknown as LabConfig;
 	const shell = { name: "shell", kind: "exec" } as unknown as Tool;
 	const fetchT = { name: "fetch", kind: "net" } as unknown as Tool;
@@ -164,17 +166,17 @@ describe("permissions", () => {
 		const auto = (folders?: Record<string, { access: string; at: string }>) => ({ permissions: { mode: "auto", allowCommands: [] }, folders }) as unknown as LabConfig;
 		// Not asked yet: the question offers the folder.
 		expect(decide(edit, { path: "a.ts" }, ws, auto(), new Set())).toMatchObject({ action: "ask", folder: ws.root });
-		expect(decide(edit, { path: "a.ts" }, ws, auto({ [ws.root]: { access: "change", at: "" } }), new Set()).action).toBe("run");
+		expect(decide(edit, { path: "a.ts" }, ws, auto({ [home]: { access: "change", at: "" } }), new Set()).action).toBe("run");
 		// A parent folder's answer covers the folders inside it.
-		expect(decide(edit, { path: "a.ts" }, ws, auto({ [dirname(ws.root)]: { access: "change", at: "" } }), new Set()).action).toBe("run");
-		const readOnly = decide(edit, { path: "a.ts" }, ws, auto({ [ws.root]: { access: "read", at: "" } }), new Set());
+		expect(decide(edit, { path: "a.ts" }, ws, auto({ [dirname(home)]: { access: "change", at: "" } }), new Set()).action).toBe("run");
+		const readOnly = decide(edit, { path: "a.ts" }, ws, auto({ [home]: { access: "read", at: "" } }), new Set());
 		expect(readOnly).toMatchObject({ action: "ask", reason: "It changes a file in a folder you set to read only." });
 		expect("folder" in readOnly).toBe(false);
 		// A signed-in browser can't be taken back: it asks whatever the folder allows.
-		expect(decide(click, { ref: "e3" }, ws, auto({ [ws.root]: { access: "change", at: "" } }), new Set()).action).toBe("ask");
+		expect(decide(click, { ref: "e3" }, ws, auto({ [home]: { access: "change", at: "" } }), new Set()).action).toBe("ask");
 		// What the write lands on decides: a read-only folder inside a folder that may change stays read only.
 		mkdirSync(join(ws.root, "raw"), { recursive: true });
-		const nested = auto({ [ws.root]: { access: "change", at: "" }, [join(ws.root, "raw")]: { access: "read", at: "" } });
+		const nested = auto({ [home]: { access: "change", at: "" }, [join(home, "raw")]: { access: "read", at: "" } });
 		expect(decide(edit, { path: "raw/data.csv" }, ws, nested, new Set()).action).toBe("ask");
 		expect(decide(edit, { path: "notes.md" }, ws, nested, new Set()).action).toBe("run");
 		// Contained commands can't be told apart there, so they ask too.
@@ -191,9 +193,9 @@ describe("permissions", () => {
 		expect(decide(shell, { command: "touch notes.md" }, sealed, auto({ "/": { access: "read", at: "" } }), new Set()).action).toBe("ask");
 		// A filled PDF or a new app can land outside the folder: they ask, whatever the folder allows.
 		const pdf = { name: "pdf_fill", kind: "write" } as unknown as Tool;
-		expect(decide(pdf, { path: "form.pdf", out: "../elsewhere.pdf" }, ws, auto({ [ws.root]: { access: "change", at: "" } }), new Set()).action).toBe("ask");
+		expect(decide(pdf, { path: "form.pdf", out: "../elsewhere.pdf" }, ws, auto({ [home]: { access: "change", at: "" } }), new Set()).action).toBe("ask");
 		// "edits", the older name, reads as auto.
-		const edits = { permissions: { mode: "edits", allowCommands: [] }, folders: { [ws.root]: { access: "change", at: "" } } } as unknown as LabConfig;
+		const edits = { permissions: { mode: "edits", allowCommands: [] }, folders: { [home]: { access: "change", at: "" } } } as unknown as LabConfig;
 		expect(decide(edit, { path: "a.ts" }, ws, edits, new Set()).action).toBe("run");
 	});
 
@@ -216,6 +218,52 @@ describe("permissions", () => {
 		const auto = { permissions: { mode: "auto", allowCommands: [] } } as unknown as LabConfig;
 		expect(decide(shell, { command: "rm -rf /sandbox/data/raw" }, lab, auto, new Set()).action).toBe("run");
 		expect(decide(shell, { command: "rm -rf /sandbox/data/raw" }, new SandboxWorkspace(api, "/sandbox/work/project-1"), auto, new Set()).action).toBe("ask");
+	});
+
+	test("in a lab's sandbox, code handed to an interpreter or a quoted script asks: its paths aren't in its words", () => {
+		const api = { title: "Field Lab", run: async () => ({ exitCode: 0, stdout: "", stderr: "" }) } as unknown as SandboxApi;
+		const lab = new SandboxWorkspace(api, "/sandbox/work/project-1");
+		const auto = { permissions: { mode: "auto", allowCommands: [] } } as unknown as LabConfig;
+		for (const command of ["sh -c 'rm /sandbox/work/other/user-work.txt'", "python3 -c 'import shutil; shutil.rmtree(chr(47)+\"sandbox\")'", "cat list.txt | xargs rm", "awk 'BEGIN{system(\"rm -rf ../other\")}'", "rm 'a b/../../other/x'"]) {
+			expect([command, decide(shell, { command }, lab, auto, new Set()).action]).toEqual([command, "ask"]);
+		}
+		expect(decide(shell, { command: "rm notes.txt && python3 run.py" }, lab, auto, new Set()).action).toBe("run");
+	});
+
+	test("auto asks as ask does when the folder's history can't be kept", () => {
+		const edit = { name: "edit", kind: "write" } as unknown as Tool;
+		const auto = { permissions: { mode: "auto", allowCommands: [] }, folders: { [home]: { access: "change", at: "" } } } as unknown as LabConfig;
+		expect(decide(edit, { path: "a.ts" }, ws, auto, new Set()).action).toBe("run");
+		expect(decide(edit, { path: "a.ts" }, ws, auto, new Set(), undefined, undefined, false).action).toBe("ask");
+	});
+
+	test("a grant to change holds only while its path leads to the folder answered for", () => {
+		const parent = realpathSync(scratch("grant"));
+		const sub = join(parent, "sub");
+		mkdirSync(sub);
+		const elsewhere = realpathSync(scratch("elsewhere"));
+		const granted = { permissions: { mode: "auto", allowCommands: [] }, folders: { [sub]: { access: "change", at: "", id: identity(sub) } } } as unknown as LabConfig;
+		expect(folderAccess(granted, join(sub, "a.txt"))).toBe("change");
+		// sub replaced by a link to "/": the grant doesn't follow it anywhere.
+		rmSync(sub, { recursive: true });
+		symlinkSync("/", sub);
+		expect(folderAccess(granted, join(elsewhere, "a.txt"))).toBeUndefined();
+		expect(folderAccess(granted, join(sub, "a.txt"))).toBeUndefined();
+		// Another folder moved into its place isn't the one answered for either.
+		rmSync(sub);
+		mkdirSync(sub);
+		expect(folderAccess(granted, join(sub, "a.txt"))).toBeUndefined();
+	});
+
+	test("a path through a link and then .. is judged where the system takes it", () => {
+		const root = realpathSync(scratch("walk"));
+		const deep = join(realpathSync(scratch("deep")), "one", "two");
+		mkdirSync(deep, { recursive: true });
+		symlinkSync(deep, join(root, "link"));
+		const local = new LocalWorkspace(root);
+		expect(local.inside("link/../x")).toBe(false);
+		expect(local.inside("sub/../x")).toBe(true);
+		expect(canonical(`${root}/link/../x`)).toBe(join(dirname(deep), "x"));
 	});
 
 	test("in a lab's sandbox, commands and file edits in the project run; work comes home as a branch to merge", () => {
@@ -280,6 +328,12 @@ describe("permissions", () => {
 		expect(allowKeys(shell, { command: "ls 2>/dev/null; make 2>&1 | tee -a log" }).keys).toEqual(["shell:ls", "shell:make", "shell:tee"]);
 		expect(allowKeys(shell, { command: "/usr/bin/touch a" }).keys).toEqual(["shell:/usr/bin/touch"]);
 		expect(allowKeys(shell, { command: "echo 'a; rm -rf x' | wc -l" }).keys).toEqual(["shell:wc"]);
+		// A variable that changes which program runs, or what it loads, is remembered exactly; others pass data.
+		for (const command of ["PATH=./bin touch scratch", "LD_PRELOAD=./x.so touch a", "NODE_OPTIONS=--require=./x.js node a.js", "CC=./cc make", "GIT_SSH_COMMAND=./x git fetch", "PYTHONPATH=. python3 a.py", "PATH=./bin; touch a"]) {
+			expect([command, allowKeys(shell, { command }).scope]).toEqual([command, "this exact command"]);
+		}
+		expect(allowKeys(shell, { command: "SEED=42 OMP_NUM_THREADS=8 python3 run.py" }).keys).toEqual(["shell:python3"]);
+		expect(allowKeys(shell, { command: "git \\\npush origin main" }).keys).toEqual(["shell!push"]);
 		// A full path is the same program for the subcommand rule, and a push is a push however it's quoted.
 		expect(allowKeys(shell, { command: "/usr/bin/git status" }).keys).toEqual(["shell:/usr/bin/git status"]);
 		for (const command of ["git 'push' origin main", "/usr/bin/git push", "g\\it push", "cd x && git -C . push"]) expect([command, allowKeys(shell, { command }).keys]).toEqual([command, ["shell!push"]]);

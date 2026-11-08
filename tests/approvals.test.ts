@@ -3,7 +3,7 @@
 // for every later session; auto mode asks once per folder, then file changes there run.
 
 import { afterAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { PermissionDecision, PermissionRequest } from "../packages/protocol/src/index.ts";
@@ -104,6 +104,15 @@ describe("approvals", () => {
 		// A program not covered asks.
 		await turn(again.runtime, "shell: mkdir d && rmdir d");
 		expect(again.asked.map((r) => r.scope)).toEqual(["“mkdir” and “rmdir” commands"]);
+		// Answers hold where they were given: after a move to another place they're asked again, and on reopening too.
+		const other = join(dir, "p1-moved");
+		mkdirSync(other);
+		again.runtime.moveTo(new LocalWorkspace(other, "off"), { place: "local", label: "p1-moved", root: other });
+		await turn(again.runtime, "shell: touch e.txt && rm e.txt");
+		expect(again.asked).toHaveLength(2);
+		const reopened = runtime(new SessionLog(join(dir, "logs"), log.id), other, () => ask, () => "deny");
+		await turn(reopened.runtime, "shell: touch f.txt && rm f.txt");
+		expect(reopened.asked).toHaveLength(1);
 	});
 
 	test("auto mode asks once per folder; allowing the folder saves it, and file changes there then run", async () => {
@@ -118,7 +127,7 @@ describe("approvals", () => {
 		expect(session.asked[0]!.folder).toBe(root);
 		expect(granted).toEqual([root]);
 		// The engine saves the grant to config (folder.access); then the next change runs without asking.
-		config = { ...config, folders: { [root]: { access: "change", at: new Date().toISOString() } } };
+		config = { ...config, folders: { [realpathSync(root)]: { access: "change", at: new Date().toISOString() } } };
 		await turn(session.runtime, "write: more.txt");
 		expect(session.asked).toHaveLength(1);
 		// A session's own "ask" mode still asks there.

@@ -77,7 +77,7 @@ export interface LabConfig {
 	/** sandbox "workspace" (the default): local commands run contained (macOS Seatbelt, Linux bubblewrap) and don't ask. */
 	permissions: { mode: PermissionMode; allowCommands: string[]; sandbox?: SandboxMode };
 	/** Folders the person added, by absolute path, with what they let EnrichedLab do there (asked once, when added). */
-	folders?: Record<string, { access: FolderAccess; at: string }>;
+	folders?: Record<string, { access: FolderAccess; at: string; id?: string }>;
 	/** Look for model servers on this computer; `ports` replaces the default list (11434, 1234, 8080, 8000, 30000). */
 	discovery: { local: boolean; ports?: number[] };
 	instructions: { global: string[] };

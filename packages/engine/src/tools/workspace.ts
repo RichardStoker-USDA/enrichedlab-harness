@@ -2,7 +2,7 @@
 // without changing its tools. The local workspace acts in the project folder with the person's own rights.
 
 import { spawn } from "node:child_process";
-import { existsSync, readlinkSync, realpathSync } from "node:fs";
+import { existsSync, lstatSync, readlinkSync, realpathSync } from "node:fs";
 import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -239,7 +239,8 @@ export class LocalWorkspace implements Workspace {
 		// "~name/…" is another account's home to the shell; never inside a project.
 		if (/^~[^/\\]/.test(path)) return false;
 		this.realRoot ??= real(this.root);
-		const rel = relative(this.realRoot, real(this.resolve(path)));
+		const expanded = path === "~" ? homedir() : path.startsWith("~/") ? join(homedir(), path.slice(2)) : path;
+		const rel = relative(this.realRoot, physical(isAbsolute(expanded) ? expanded : `${this.root}${sep}${expanded}`));
 		return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
 	}
 	private realRoot?: string;
@@ -362,4 +363,31 @@ export class LocalWorkspace implements Workspace {
 			});
 		});
 	}
+}
+
+/**
+ * A path the way the system walks it: one part at a time, following each link before the next "..", so "link/.."
+ * means the link target's parent, not the link's folder. Parts that don't exist yet are joined as written.
+ */
+export function physical(path: string, depth = 0): string {
+	const parts = path.split(/[/\\]+/).filter((p) => p && p !== ".");
+	let at = isAbsolute(path) ? (path.match(/^[A-Za-z]:/)?.[0] ?? "") + sep : process.cwd();
+	for (let i = 0; i < parts.length; i++) {
+		const part = parts[i]!;
+		if (part === "..") {
+			at = dirname(at);
+			continue;
+		}
+		const next = join(at, part);
+		let link: string | undefined;
+		try {
+			if (depth < 40 && lstatSync(next).isSymbolicLink()) link = readlinkSync(next);
+		} catch {
+			// Not there yet: the rest is joined as written.
+			return join(next, ...parts.slice(i + 1));
+		}
+		// Joined as text, not with join(): join would settle a ".." before the walk can follow the link before it.
+		at = link === undefined ? next : physical(isAbsolute(link) ? link : `${at}${sep}${link}`, depth + 1);
+	}
+	return at;
 }

@@ -31,7 +31,9 @@ beside its model (`permissions.mode` in config.json, `session.permissions` over 
 | Ask When It Can't Be Undone (`auto`, the default) | also file changes in a folder the person let it change | commands outside the containment, new hosts, changes outside the folder, signed-in browser actions, memory and skills |
 | Allow Everything (`full`) | everything | pushes and unreviewed lab tools |
 
-`auto` rests on history: what runs without asking is what the session's history can take back. The first time a
+`auto` rests on history: what runs without asking is what the session's history can take back
+([history.md](history.md)), so when a folder's history can't be kept (its store fails), the session asks as `ask`
+does. The first time a
 session starts in a folder, the window asks once whether EnrichedLab may change files there or only read them
 (`folder.access`, kept in config.json under `folders`; Settings lists them). Listing the folder at that moment brings up
 any macOS privacy prompt then, not mid-task. A question about a change in a folder nobody answered for offers "Allow
@@ -42,16 +44,27 @@ event), so it outlasts a restart. A command is remembered per program it runs (`
 `python3 a.py | grep x` and `python3 b.py | grep y` share an answer. A program named by its full path is remembered
 by that path. A line is remembered exactly when its words don't show everything it runs: substitutions, process
 substitution, here-documents, subshells, groups and functions, control flow, a program named by a variable or a
-relative path, options before a subcommand (`git -C dir reset`), output written to a file, or a program that runs
-what follows it (`sudo`, `ssh`, `env`, `timeout`, `xargs`). File edits share one answer; each other kind of change (a
+relative path, options before a subcommand (`git -C dir reset`), output written to a file, a program that runs
+what follows it (`sudo`, `ssh`, `env`, `timeout`, `xargs`), or a variable set in front that changes which program
+runs or what it loads (`PATH`, `LD_*`, `DYLD_*`, `NODE_OPTIONS`, `PYTHON*`, `GIT_*`, `CC`, names ending in `PATH`,
+`OPTS`, `FLAGS` or `LIBS`, and the like). Other variables in front (`SEED=42 python3 run.py`) pass data and share the
+program's answer. File edits share one answer; each other kind of change (a
 click or typing in the browser, a new app, a memory or skill, a filled PDF, a sandbox download) has its own, and asks
-in every mode until allowed. Folder answers apply to what a change lands on, by the folder's real path (symlinks
-followed, the disk's own letter case), so a read-only folder inside one that may change stays read only. A session
+in every mode until allowed. Session answers hold where they were given: a move to a lab or back, or a "Try Again"
+session, starts them over. Folder answers apply to what a change lands on, by the folder's real path (symlinks
+followed one part at a time, so `link/..` is where the system takes it, and the disk's own letter case), so a
+read-only folder inside one that may change stays read only. An answer to allow changes is saved with the folder's
+identity on disk; if a part of its path later becomes a link, or another folder takes its place, the answer no
+longer applies there and the question comes back. A session
 keeps the mode it started with; a subagent asks as much as the session that started it. A session's own worktree
 runs file edits. In a lab's sandbox, commands and file
 edits inside the project run without asking: the sandbox is a separate machine with no network, and its work comes
-home as a branch the person merges. Commands that change lab data outside the project ask, unless the lab
-checkpoints the whole sandbox disk (`endpoints.checkpoints`) and the session is in `auto`. An answer about a path
+home as a branch the person merges. There the paths a command names are the fence, so a command whose paths aren't
+in its words asks: code handed to an interpreter (`sh -c`, `python3 -c`, `Rscript -e`), an awk program, arguments
+read from input (`xargs`, `parallel`), or a quoted word holding a script or a list. A program or script file the
+agent wrote still runs; it can reach the sandbox's other projects, which the project's history doesn't cover.
+Commands that change lab data outside the project ask, unless the lab checkpoints the whole sandbox disk
+(`endpoints.checkpoints`) and the session is in `auto`. An answer about a path
 outside the project covers that path. Pushes and unreviewed lab tools ask every time, in every mode.
 
 A lab sandbox is one Linux container per person at that lab, and the sessions moved there share it: a command in one

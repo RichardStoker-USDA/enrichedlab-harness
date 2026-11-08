@@ -46,12 +46,10 @@ struct TranscriptView: View {
 			}
 			if pinned, new.gap > 0.5, new.height != old.height { position.scrollTo(edge: .bottom) }
 		}
-		// Sending a message follows again, wherever the reader was.
-		.onChange(of: session.turnStarted) { _, started in
-			if started != nil {
-				pinned = true
-				position.scrollTo(edge: .bottom)
-			}
+		// Sending a message follows again, wherever the reader was. (A reconnect reloading the session doesn't.)
+		.onChange(of: session.sentAt) {
+			pinned = true
+			position.scrollTo(edge: .bottom)
 		}
 		.onChange(of: session.pending.count) { follow() }
 		.overlay(alignment: .bottomTrailing) {

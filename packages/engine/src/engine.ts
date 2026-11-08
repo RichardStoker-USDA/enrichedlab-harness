@@ -25,7 +25,7 @@ import { AppHost, type AppSession } from "./apps/host.ts";
 import { CanvasStore } from "./canvas.ts";
 import { applyBundles, listBundles } from "./bundles.ts";
 import { DEFAULT_CONFIG, type LabConfig, loadConfig, type PermissionMode, type ProviderConfig, saveConfig } from "./config.ts";
-import { canonical, folderAccess, modeOf } from "./permissions.ts";
+import { canonical, folderAccess, identity, modeOf } from "./permissions.ts";
 import { McpManager } from "./mcp.ts";
 import { ModelRegistry } from "./models/registry.ts";
 import { LocalModels } from "./models/local_service.ts";
@@ -452,7 +452,7 @@ export class Engine {
 		const at = runtime.events.findIndex((e) => e.id === before);
 		// Tool output kept beside the log comes along; per-file copies stay with the original (history covers the folder).
 		if (existsSync(runtime.log.outputsDir)) cpSync(runtime.log.outputsDir, fork.log.outputsDir, { recursive: true });
-		for (const e of runtime.events.slice(0, at)) if (e.t !== "header" && e.t !== "title" && e.t !== "permissions") fork.append(e.t === "checkpoint" ? { ...e, files: [] } : e);
+		for (const e of runtime.events.slice(0, at)) if (e.t !== "header" && e.t !== "title" && e.t !== "permissions" && e.t !== "allow") fork.append(e.t === "checkpoint" ? { ...e, files: [] } : e);
 		fork.append({ t: "title", id: newId("e"), at: new Date().toISOString(), title: `Retry: ${runtime.summary().title}`.slice(0, 120) });
 		return fork;
 	}
@@ -463,7 +463,10 @@ export class Engine {
 		// One entry per folder on disk: an older entry under another spelling of the same folder goes.
 		const folders = Object.fromEntries(Object.entries(this.config.folders ?? {}).filter(([saved]) => canonical(saved) !== folder));
 		if (access === "none") delete folders[folder];
-		else folders[folder] = { access, at: new Date().toISOString() };
+		else {
+			const id = identity(folder);
+			folders[folder] = { access, at: new Date().toISOString(), ...(id ? { id } : {}) };
+		}
 		saveConfig(this.paths, { folders });
 		this.reloadConfig();
 	}

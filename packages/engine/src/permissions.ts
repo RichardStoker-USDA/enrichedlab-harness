@@ -9,13 +9,13 @@
 // - full: never asks, except pushing to a remote and lab tools the lab hasn't reviewed.
 // "Allow for this session" is remembered per program (python, git commit), per host, per tool, and kept in the log.
 
-import { lstatSync, readlinkSync, realpathSync } from "node:fs";
-import { basename, dirname, join, resolve, sep } from "node:path";
+import { lstatSync, readlinkSync, realpathSync, statSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import type { FolderAccess, LabConfig, PermissionMode } from "./config.ts";
 import { isReadOnlyCommand, pathsInside } from "./tools/shell.ts";
 import type { Tool } from "./tools/types.ts";
 import { isOpenPort } from "./sites/port_proxy.ts";
-import { FULL_CONTAINMENT } from "./tools/workspace.ts";
+import { FULL_CONTAINMENT, physical } from "./tools/workspace.ts";
 import type { Workspace } from "./tools/workspace.ts";
 
 export type Verdict =
@@ -42,7 +42,7 @@ export function modeOf(mode: string | undefined): PermissionMode {
  * existing parent's.
  */
 export function canonical(path: string, depth = 0): string {
-	let at = resolve(path);
+	let at = physical(isAbsolute(path) ? path : `${process.cwd()}${sep}${path}`);
 	const rest: string[] = [];
 	for (;;) {
 		try {
@@ -68,13 +68,33 @@ function within(path: string, folder: string): boolean {
 }
 
 /** What the person let EnrichedLab do at `path`: the nearest folder they answered for decides. */
+/** A folder's identity on disk (device and inode), so a grant can tell its folder from another one put in its place. */
+export function identity(path: string): string | undefined {
+	const s = statSync(path, { bigint: true, throwIfNoEntry: false });
+	return s ? `${s.dev}:${s.ino}` : undefined;
+}
+
+/**
+ * The folders a grant covers now. A grant to change is saved by its real path and identity when answered; it holds only
+ * while that path still leads to that folder, so a part of it replaced by a link (to "/", say) or another folder moved
+ * into its place drops it. A read-only grant only ever asks more, so it covers both its path and where that leads.
+ */
+function grantFolders(saved: string, grant: { access: FolderAccess; id?: string }): string[] {
+	const now = canonical(saved);
+	if (grant.access === "read") return now === saved ? [saved] : [saved, now];
+	if (now !== saved || (grant.id && identity(saved) !== grant.id)) return [];
+	return [saved];
+}
+
 export function folderAccess(config: LabConfig, path: string): FolderAccess | undefined {
 	const target = canonical(path);
 	let best: { folder: string; access: FolderAccess } | undefined;
 	for (const [saved, grant] of Object.entries(config.folders ?? {})) {
-		const folder = canonical(saved);
-		const inside = within(target, folder);
-		if (inside && (!best || folder.length > best.folder.length)) best = { folder, access: grant.access };
+		for (const folder of grantFolders(saved, grant)) {
+			if (!within(target, folder)) continue;
+			// The closest folder answers; at the same folder, read only wins.
+			if (!best || folder.length > best.folder.length || (folder.length === best.folder.length && grant.access === "read")) best = { folder, access: grant.access };
+		}
 	}
 	return best?.access;
 }
@@ -82,10 +102,7 @@ export function folderAccess(config: LabConfig, path: string): FolderAccess | un
 /** A folder inside `root` (or `root` itself) set to read only: contained commands there can't be told apart, so they ask. */
 function readOnlyWithin(config: LabConfig, root: string): boolean {
 	const base = canonical(root);
-	return Object.entries(config.folders ?? {}).some(([saved, grant]) => {
-		const folder = canonical(saved);
-		return grant.access === "read" && (within(folder, base) || within(base, folder));
-	});
+	return Object.entries(config.folders ?? {}).some(([saved, grant]) => grant.access === "read" && grantFolders(saved, grant).some((folder) => within(folder, base) || within(base, folder)));
 }
 
 /** Tools whose first argument names the action: keyed by both words, so "git status" doesn't allow "git push". */
@@ -107,7 +124,16 @@ const EXACT = new Set([
 	"if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done", "case", "esac", "in", "function", "select", "coproc",
 	"{", "}", "!", "[[", "]]", "time", "exec", "eval", "source", ".", "alias", "sudo", "doas", "su", "ssh", "osascript", "xargs",
 	"env", "watch", "timeout", "nohup", "nice", "command", "builtin", "open", "start", "cmd", "Invoke-Expression", "iex",
+	"export", "declare", "typeset", "local", "readonly", "set", "unset", "hash", "enable", "trap", "shopt", "setopt", "emulate",
 ]);
+
+/**
+ * Variables that change which program runs or what code it loads (PATH=./bin, LD_PRELOAD, NODE_OPTIONS, CC, GIT_*):
+ * set in front of a command, it's remembered exactly. Others (SEED=42, OMP_NUM_THREADS=8) only pass data to the
+ * program the answer named.
+ */
+const LOADS =
+	/^(ENV|BASH_ENV|IFS|HOME|SHELL|SHELLOPTS|BASHOPTS|PS4|PROMPT_COMMAND|ZDOTDIR|TMPDIR|EDITOR|VISUAL|PAGER|BROWSER|CC|CXX|CPP|LD|AR|AS|FC|MAKE|PYTHON\w*|PERL5\w*|RUBY\w*)$|^(LD|DYLD|GIT|BASH|NODE|NPM|JAVA|_JAVA|R|CONDA|PIXI|UV|PIP|CARGO|RUSTUP|GO|LUA|JULIA|DOTNET|DOCKER|KUBE|SSH|GPG|XDG|MAKE)_|(PATH|OPTS?|OPTIONS|FLAGS|LIBS?|HOME|ROOT|PRELOAD|LIBRARIES|STARTUP|PROFILE|PROFILE_USER|ENVIRON|ENVIRON_USER|CONFIG|COMMAND|CMD|RC|USERBASE|PREFIX)$/;
 
 /**
  * The simple commands of a shell line, as their words, quote-aware. Undefined when the line holds anything whose effect
@@ -185,7 +211,7 @@ function commandKeys(command: string): { keys: string[]; names: string[] } | und
 	const names = new Set<string>();
 	for (const all of commands) {
 		const words = [...all];
-		while (words.length && /^[A-Za-z_]\w*=/.test(words[0]!)) words.shift();
+		for (; words.length && /^[A-Za-z_]\w*=/.test(words[0]!); words.shift()) if (LOADS.test(words[0]!.slice(0, words[0]!.indexOf("=")))) return undefined;
 		const first = words[0];
 		if (!first) continue;
 		// A program named by a variable, a pattern or a relative path depends on more than the words: exact. A full path
@@ -217,7 +243,7 @@ export function allowKeys(tool: Tool, args: Record<string, unknown>): { keys: st
 		const command = String(args.command ?? "").trim();
 		// Pushing publishes work: it asks every time, whatever was allowed before. Judged on the words with quotes and
 		// escapes taken out, so git 'push' and g\it push are pushes too.
-		const plain = command.replace(/['"\\]/g, "");
+		const plain = command.replace(/\\\r?\n/g, "").replace(/['"\\]/g, "");
 		if (/(^|[;&|\n(`]\s*|\/)git(\s+\S+)*\s+push\b/.test(plain)) return { keys: ["shell!push"], scope: "pushing" };
 		const found = commandKeys(command);
 		if (!found) return { keys: [`shell=${command}`], scope: "this exact command" };
@@ -313,8 +339,10 @@ const IN_SANDBOX = new Set(["read", "sandbox", "exec"]);
  * `discovery`: the lab where Discovery mode applies to this session now (docs/research.md). `mode`: the session's
  * own mode, when the person set one for it; otherwise the configured one.
  */
-export function decide(tool: Tool, args: Record<string, unknown>, workspace: Workspace, config: LabConfig, allowed: Set<string>, discovery?: string, sessionMode?: PermissionMode): Verdict {
-	const mode = modeOf(sessionMode ?? config.permissions.mode);
+export function decide(tool: Tool, args: Record<string, unknown>, workspace: Workspace, config: LabConfig, allowed: Set<string>, discovery?: string, sessionMode?: PermissionMode, recoverable = true): Verdict {
+	const chosen = modeOf(sessionMode ?? config.permissions.mode);
+	// auto rests on history: without it (the store failed), it asks as ask does.
+	const mode = chosen === "auto" && !recoverable ? "ask" : chosen;
 	const extra = tool.ask?.(args, { workspace });
 	const { keys, scope } = allowKeys(tool, args);
 	const ask = (reason: string, folder?: string): Verdict => ({ action: "ask", reason, keys, scope, ...(folder ? { folder } : {}) });
@@ -371,8 +399,12 @@ export function decide(tool: Tool, args: Record<string, unknown>, workspace: Wor
 			// Contained by the OS: writes stay in the project and temp folders, no network. Runs without asking unless it
 			// names a path outside the project or expands variables (the sandbox can still read most of the disk).
 			// Windows contains writes only, so there it still asks. A folder set to read only asks for everything.
-			const contained = workspace.sandboxed && FULL_CONTAINMENT.has(workspace.sandboxed) && args.unsandboxed !== true;
-			if (contained && !(local && readOnlyWithin(config, workspace.root)) && pathsInside(command, (path) => workspace.inside(path), workspace.kind === "sandbox" || process.platform !== "win32")) return { action: "run" };
+			// In a lab's sandbox the paths a command names are the only fence, so a command whose paths can't be read
+			// from its words (a script handed to an interpreter, arguments read from input) asks unless the whole
+			// sandbox can be taken back.
+			const lab = workspace.kind === "sandbox" && workspace.checkpointed !== "filesystem";
+			const contained = workspace.sandboxed && FULL_CONTAINMENT.has(workspace.sandboxed) && args.unsandboxed !== true && !(lab && scripted(command));
+			if (contained && !(local && readOnlyWithin(config, workspace.root)) && pathsInside(command, (path) => workspace.inside(path), workspace.kind === "sandbox" || process.platform !== "win32", lab)) return { action: "run" };
 			if (isReadOnlyCommand(command, config.permissions.allowCommands, (path) => workspace.inside(path))) return { action: "run" };
 			// In a lab's sandbox whose whole disk is checkpointed, any command can be taken back.
 			if (mode === "auto" && workspace.kind === "sandbox" && workspace.checkpointed === "filesystem" && args.unsandboxed !== true) return { action: "run" };
@@ -396,6 +428,17 @@ const WRITES: Record<string, string> = {
 };
 
 /** True when the session works in a worktree EnrichedLab made for it. */
+/**
+ * A command whose paths aren't in its words: code handed to an interpreter (sh -c, python -c, node -e, Rscript -e),
+ * an awk program, or arguments read from input (xargs, parallel).
+ */
+export function scripted(command: string): boolean {
+	const start = String.raw`(^|[;&|(\s])(\S*/)?`;
+	const interpreters = "sh|bash|zsh|dash|ksh|mksh|fish|python[\\d.]*|node|deno|bun|perl|ruby|php|lua|Rscript|R|julia|pwsh|powershell|tclsh|osascript";
+	const code = new RegExp(String.raw`${start}(${interpreters})\s+(\S+\s+)*(-[a-zA-Z]*[ceE]|--command|--eval|--expr|-r)(\s|=|$)`);
+	return code.test(command) || new RegExp(String.raw`${start}(awk|gawk|mawk|nawk|xargs|parallel)(\s|$)`).test(command);
+}
+
 function ownWorktree(workspace: Workspace): boolean {
 	return /[/\\]\.git[/\\]enrichedlab-worktrees[/\\]/.test(workspace.root);
 }

@@ -149,7 +149,11 @@ public final class SessionModel {
 
 	// MARK: Actions
 
+	/// When the person last sent a message from this window: the run sheet follows from there.
+	public private(set) var sentAt: Date?
+
 	public func send(_ text: String, images: [Part]? = nil) async -> Bool {
+		sentAt = Date()
 		do {
 			try await app.connection.prompt(id, text: text, images: images)
 			return true

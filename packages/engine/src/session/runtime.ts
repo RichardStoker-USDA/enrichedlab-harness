@@ -123,7 +123,11 @@ export class SessionRuntime {
 		this.id = log.id;
 		this.events = log.read();
 		// "Allow for this session" answers outlast a restart: they're in the log.
-		for (const e of this.events) if (e.t === "allow") for (const key of e.keys) this.allowed.add(key);
+		// They hold where they were given: a move to another place starts the answers over.
+		for (const e of this.events) {
+			if (e.t === "place") this.allowed.clear();
+			else if (e.t === "allow") for (const key of e.keys) this.allowed.add(key);
+		}
 		this.meta = log.meta() ?? {
 			id: log.id,
 			cwd: workspace.root,
@@ -276,6 +280,7 @@ export class SessionRuntime {
 	moveTo(workspace: Workspace, move: Omit<Ev<"place">, "t" | "id" | "at">): void {
 		if (this.running) throw new Error("Wait for the current turn to finish, or cancel it.");
 		this.current = workspace;
+		this.allowed.clear();
 		this.append({ t: "place", id: newId("e"), at: now(), ...move });
 		this.touch({ place: move.place });
 	}
@@ -956,7 +961,7 @@ export class SessionRuntime {
 			return { ok: false, content: `The arguments were not valid JSON (${errorText(error)}). Send the call again with valid JSON.`, decision: "refused", tool };
 		}
 		let decision: Ev<"tool">["decision"] = "auto";
-		const verdict = decide(tool, args, this.workspace, this.deps.config(), this.allowed, this.discovering, this.permissionMode);
+		const verdict = decide(tool, args, this.workspace, this.deps.config(), this.allowed, this.discovering, this.permissionMode, !this.historyOff);
 		// A read-only subagent is read-only whatever the person's permission mode or sandbox would allow.
 		if (this.agentMode === "read" && !readOnlyCall(tool, args, this.workspace, this.deps.config().permissions.allowCommands)) {
 			return { ok: false, content: "Refused: this subagent works read-only. Say in your answer what should change.", decision: "refused", tool, args };

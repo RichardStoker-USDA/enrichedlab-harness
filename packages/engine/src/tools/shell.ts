@@ -183,13 +183,16 @@ export function isReadOnlyCommand(command: string, extra: string[] = [], inside?
 }
 
 /** True when the command can be parsed and every word shaped like a path is inside the project. */
-export function pathsInside(command: string, inside: (path: string) => boolean, posix = process.platform !== "win32"): boolean {
+export function pathsInside(command: string, inside: (path: string) => boolean, posix = process.platform !== "win32", strict = false): boolean {
 	// Only POSIX shell words are read; a Windows shell's command asks.
 	if (!posix) return false;
 	const tokens = tokenize(command.trim());
 	if (!tokens) return false;
 	return tokens.every((t) => {
 		if (t.text === undefined) return true;
+		// Where named paths are the only fence, a quoted word holding several words and a path or shell syntax is code
+		// or a list, not one path: it can't be judged.
+		if (strict && /\s/.test(t.text) && /[/;|&$`(){}<>]|\.\./.test(t.text)) return false;
 		const value = t.text.startsWith("-") && t.text.includes("=") ? t.text.slice(t.text.indexOf("=") + 1) : t.text;
 		return !(looksLikePath(value) || value.includes("/")) || inside(value);
 	});
