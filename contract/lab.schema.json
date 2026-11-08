@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/RichardStoker-USDA/enrichedlab-harness/contract/lab.schema.json",
+  "$id": "https://enrichedlab.org/contract/2026-11/lab.schema.json",
   "title": "Lab descriptor: GET /.well-known/enrichedlab-lab",
   "type": "object",
   "required": ["contract", "name", "title", "endpoints", "sign_in"],

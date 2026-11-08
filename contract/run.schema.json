@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/RichardStoker-USDA/enrichedlab-harness/contract/run.schema.json",
+  "$id": "https://enrichedlab.org/contract/2026-11/run.schema.json",
   "title": "A run at the lab: /v1/runs (proposed); a run is the lab's session, so its id is the session's",
   "$defs": {
     "create": {

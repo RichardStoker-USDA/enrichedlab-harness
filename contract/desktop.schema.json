@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/RichardStoker-USDA/enrichedlab-harness/contract/desktop.schema.json",
+  "$id": "https://enrichedlab.org/contract/2026-11/desktop.schema.json",
   "title": "Desktop sandbox: POST /v1/containers/{id}/desktop and its answer",
   "$defs": {
     "point": { "type": "array", "prefixItems": [{ "type": "integer", "minimum": 0 }, { "type": "integer", "minimum": 0 }], "minItems": 2, "maxItems": 2 },
