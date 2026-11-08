@@ -375,6 +375,10 @@ interface MacScene {
 	drag?: "window" | "divider";
 	/** Open the 60,000-point scatter plot view first. */
 	plot?: boolean;
+	/** A message sent in the opened session; the scene waits for its question. */
+	send?: string;
+	/** Ask about the project folder, as a first session there does, and capture the question. */
+	folder?: boolean;
 	/** A task started from the window in a new session, run until it streams, asks, or is done. */
 	prompt?: string;
 	until?: "streaming" | "question" | "done";
@@ -396,6 +400,8 @@ const MAC_SCENES: MacScene[] = [
 	{ name: "mac_dashboard_divider", session: "local", open: "field_dashboard.html", drag: "divider", after: 800 },
 	{ name: "mac_plot_window", session: "local", plot: true, pane: "first", drag: "window", after: 800 },
 	{ name: "mac_plot_divider", session: "local", plot: true, pane: "first", drag: "divider", after: 800 },
+	{ name: "mac_question_folder", session: "local", send: "Write the big page", after: 800 },
+	{ name: "mac_folder_question", folder: true, after: 800 },
 	{ name: "mac_live_streaming", prompt: "Write the big page", until: "streaming", after: 300 },
 	{ name: "mac_live_question", prompt: "Write the big page", until: "question", after: 800 },
 	{ name: "mac_live_done", prompt: "Write the big page", until: "done", after: 800 },
@@ -429,6 +435,8 @@ async function macScenes(client: EngineClient, engineVersion: string, sessions: 
 					...(scene.resize ? { EL_SCENE_RESIZE: scene.resize } : {}),
 					...(scene.open ? { EL_SCENE_OPEN: scene.open } : {}),
 					...(scene.drag ? { EL_SCENE_DRAG: scene.drag } : {}),
+					...(scene.send ? { EL_SCENE_SEND: scene.send } : {}),
+					...(scene.folder ? { EL_SCENE_FOLDER: project } : {}),
 					...(scene.prompt ? { EL_SCENE_PROMPT: scene.prompt, EL_SCENE_UNTIL: scene.until ?? "done" } : {}),
 					...(scene.settings ? { EL_SCENE_SETTINGS: scene.settings } : {}),
 					...(scene.advanced ? { EL_SCENE_ADVANCED: "1" } : {}),
@@ -463,7 +471,8 @@ async function macScenes(client: EngineClient, engineVersion: string, sessions: 
 			}
 			// Only this app's own windows: never the whole screen.
 			const settings = windows.find((w) => /settings|general|models|labs|updates/i.test(w.name));
-			const target = scene.settings ? settings : windows.find((w) => w !== settings);
+			// The folder question is a sheet: its own window, listed after the main one.
+			const target = scene.settings ? settings : scene.folder ? windows.at(-1) : windows.find((w) => w !== settings);
 			if (target) Bun.spawnSync(["screencapture", "-x", "-o", `-l${target.id}`, join(out, `${scene.name}-${theme}.png`)]);
 			proc.kill();
 			await proc.exited;

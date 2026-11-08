@@ -243,7 +243,8 @@ export function permissionView(t: Theme, request: PermissionRequest, waiting = 0
 			lines.push(`${INDENT}    ${style(truncateToWidth(line, width - 8))}`);
 		}
 		if (detail.length > 14) lines.push(`${INDENT}    ${t.faint(`… ${detail.length - 14} more lines`)}`);
-		const session = request.once ? "" : `   ${t.bold("a")} ${t.muted("allow for this session")}`;
+		const folder = request.folder?.split(/[\\/]/).filter(Boolean).at(-1);
+		const session = folder ? `   ${t.bold("a")} ${t.muted(`allow changes in “${folder}” from now on`)}` : request.once ? "" : `   ${t.bold("a")} ${t.muted(`allow ${request.scope ?? "this kind of step"} this session`)}`;
 		lines.push(`${INDENT}  ${t.bold("y")} ${t.muted("allow once")}${session}   ${t.bold("n")} ${t.muted("decline")}${waiting ? t.faint(`   ${waiting} more waiting`) : ""}`);
 		return lines;
 	});

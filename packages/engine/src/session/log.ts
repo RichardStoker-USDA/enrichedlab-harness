@@ -22,6 +22,8 @@ export interface SessionMeta {
 	place?: string;
 	/** The lab where Discovery mode is on. */
 	discovery?: string;
+	/** How much the session asks, when the person set it for this session. */
+	permissions?: "ask" | "auto" | "full";
 }
 
 export class SessionLog {

@@ -54,6 +54,8 @@ struct Composer: View {
 				PlaceMenu(session: session)
 				Divider().frame(height: 14)
 				ModelMenu(session: session)
+				Divider().frame(height: 14)
+				ApprovalsMenu(session: session)
 				Spacer(minLength: 6)
 				if advanced, let status = session.status { ContextGauge(context: status.context, rate: status.rate) }
 				Button {
@@ -264,6 +266,42 @@ struct PlaceMenu: View {
 	private func label(_ place: Place) -> String {
 		if let site = place.site, !site.signedIn { return "\(place.title) — sign in" }
 		return place.isLocal ? place.title : "\(place.title) sandbox"
+	}
+}
+
+/// How much the session asks before it acts: before changes, only for what history can't take back, or never.
+struct ApprovalsMenu: View {
+	@Environment(AppModel.self) private var app
+	var session: SessionModel
+
+	var body: some View {
+		let current = session.permissionMode
+		Menu {
+			Section("Asks Before It Acts") {
+				ForEach(PermissionMode.allCases, id: \.self) { mode in
+					Button {
+						Task { await session.setPermissions(mode == app.ui.permissionMode ? nil : mode) }
+					} label: {
+						if mode == current { Image(systemName: "checkmark") }
+						Text(mode.title)
+						Text(mode.detail)
+					}
+				}
+			}
+			Divider()
+			Text("New sessions start with “\(app.ui.permissionMode.title)”. Change it in Settings.")
+		} label: {
+			HStack(spacing: 5) {
+				Image(systemName: current == .full ? "bolt.shield" : current == .auto ? "checkmark.shield" : "hand.raised")
+				Text(current.short).lineLimit(1)
+			}
+		}
+		.menuStyle(.button)
+		.buttonStyle(.borderless)
+		.tint(.primary)
+		.fixedSize()
+		.help("\(current.title): \(current.detail)")
+		.accessibilityLabel("Approvals: \(current.title)")
 	}
 }
 

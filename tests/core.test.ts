@@ -6,9 +6,9 @@ import type { SessionEvent } from "../packages/protocol/src/index.ts";
 import { budget, cutPoint, derive, elisionCandidates, SUMMARY_PREFIX } from "../packages/engine/src/session/context.ts";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { LabConfig } from "../packages/engine/src/config.ts";
-import { allowKey, decide } from "../packages/engine/src/permissions.ts";
+import { allowKey, allowKeys, decide } from "../packages/engine/src/permissions.ts";
 import { isReadOnlyCommand } from "../packages/engine/src/tools/shell.ts";
 import type { Tool } from "../packages/engine/src/tools/types.ts";
 import { LocalWorkspace } from "../packages/engine/src/tools/workspace.ts";
@@ -148,17 +148,52 @@ describe("permissions", () => {
 	const shell = { name: "shell", kind: "exec" } as unknown as Tool;
 	const fetchT = { name: "fetch", kind: "net" } as unknown as Tool;
 
-	test("a file edit allowed for the session doesn't allow browser actions; edits mode runs file edits only", () => {
+	test("a file edit allowed for the session doesn't allow browser actions", () => {
 		const edit = { name: "edit", kind: "write" } as unknown as Tool;
 		const click = { name: "browser_click", kind: "write" } as unknown as Tool;
 		expect(allowKey(edit, { path: "a.ts" })).toBe("write");
 		expect(allowKey(click, { ref: "e3" })).toBe("write:browser_click");
 		const allowed = new Set(["write"]);
 		expect(decide(edit, { path: "a.ts" }, ws, config, allowed).action).toBe("run");
-		expect(decide(click, { ref: "e3" }, ws, config, allowed)).toMatchObject({ action: "ask", reason: "It clicks in the browser, where you may be signed in." });
-		const edits = { permissions: { mode: "edits", allowCommands: [] } } as unknown as LabConfig;
+		expect(decide(click, { ref: "e3" }, ws, config, allowed)).toMatchObject({ action: "ask", reason: "It clicks in the browser, where you may be signed in.", scope: "clicks in the browser" });
+	});
+
+	test("auto mode changes files without asking only in a folder the person let EnrichedLab change", () => {
+		const edit = { name: "edit", kind: "write" } as unknown as Tool;
+		const click = { name: "browser_click", kind: "write" } as unknown as Tool;
+		const auto = (folders?: Record<string, { access: string; at: string }>) => ({ permissions: { mode: "auto", allowCommands: [] }, folders }) as unknown as LabConfig;
+		// Not asked yet: the question offers the folder.
+		expect(decide(edit, { path: "a.ts" }, ws, auto(), new Set())).toMatchObject({ action: "ask", folder: ws.root });
+		expect(decide(edit, { path: "a.ts" }, ws, auto({ [ws.root]: { access: "change", at: "" } }), new Set()).action).toBe("run");
+		// A parent folder's answer covers the folders inside it.
+		expect(decide(edit, { path: "a.ts" }, ws, auto({ [dirname(ws.root)]: { access: "change", at: "" } }), new Set()).action).toBe("run");
+		const readOnly = decide(edit, { path: "a.ts" }, ws, auto({ [ws.root]: { access: "read", at: "" } }), new Set());
+		expect(readOnly).toMatchObject({ action: "ask", reason: "It changes a file, and you set this folder to read only." });
+		expect("folder" in readOnly).toBe(false);
+		// A signed-in browser can't be taken back: it asks whatever the folder allows.
+		expect(decide(click, { ref: "e3" }, ws, auto({ [ws.root]: { access: "change", at: "" } }), new Set()).action).toBe("ask");
+		// "edits", the older name, reads as auto.
+		const edits = { permissions: { mode: "edits", allowCommands: [] }, folders: { [ws.root]: { access: "change", at: "" } } } as unknown as LabConfig;
 		expect(decide(edit, { path: "a.ts" }, ws, edits, new Set()).action).toBe("run");
-		expect(decide(click, { ref: "e3" }, ws, edits, new Set()).action).toBe("ask");
+	});
+
+	test("full mode runs everything but a push and an unreviewed lab tool; a session's own mode wins", () => {
+		const plain = new LocalWorkspace(scratch("perm-full"), "off");
+		const full = { permissions: { mode: "full", allowCommands: [] } } as unknown as LabConfig;
+		const unreviewed = { name: "field_new", kind: "site-write", site: "field", unreviewed: true } as unknown as Tool;
+		expect(decide(shell, { command: "rm -rf build && curl https://example.org" }, plain, full, new Set()).action).toBe("run");
+		expect(decide(shell, { command: "git push origin main" }, plain, full, new Set())).toMatchObject({ action: "ask", keys: ["shell!push"] });
+		expect(decide(unreviewed, {}, plain, full, new Set()).action).toBe("ask");
+		expect(decide(shell, { command: "rm -rf build" }, plain, config, new Set(), undefined, "full").action).toBe("run");
+		expect(decide(shell, { command: "rm -rf build" }, plain, full, new Set(), undefined, "ask").action).toBe("ask");
+	});
+
+	test("a lab sandbox whose whole disk is checkpointed runs any command in auto mode", () => {
+		const api = { title: "Field Lab", run: async () => ({ exitCode: 0, stdout: "", stderr: "" }) } as unknown as SandboxApi;
+		const lab = Object.assign(new SandboxWorkspace(api, "/sandbox/work/project-1"), { checkpointed: "filesystem" as const });
+		const auto = { permissions: { mode: "auto", allowCommands: [] } } as unknown as LabConfig;
+		expect(decide(shell, { command: "rm -rf /sandbox/data/raw" }, lab, auto, new Set()).action).toBe("run");
+		expect(decide(shell, { command: "rm -rf /sandbox/data/raw" }, new SandboxWorkspace(api, "/sandbox/work/project-1"), auto, new Set()).action).toBe("ask");
 	});
 
 	test("in a lab's sandbox, commands and file edits in the project run; work comes home as a branch to merge", () => {
@@ -210,16 +245,23 @@ describe("permissions", () => {
 		const write = { name: "write", kind: "write", ask: (a: Record<string, unknown>) => (String(a.path).startsWith("/") ? "It writes outside the project." : undefined) } as unknown as Tool;
 		const first = decide(write, { path: "/tmp/one.txt" }, ws, config, new Set());
 		expect(first.action).toBe("ask");
-		const allowed = new Set([(first as { key: string }).key]);
+		const allowed = new Set(first.action === "ask" ? first.keys : []);
 		expect(decide(write, { path: "/tmp/one.txt" }, ws, config, allowed).action).toBe("run");
 		expect(decide(write, { path: "/Users/someone/.zshrc" }, ws, config, allowed).action).toBe("ask");
 	});
 
-	test("allowing an interpreter for the session allows only that exact command", () => {
-		expect(allowKey(shell, { command: "python3 run.py" })).toBe("shell=python3 run.py");
+	test("an answer for the session covers each program a command runs, and says so", () => {
+		expect(allowKeys(shell, { command: "python3 run.py" })).toEqual({ keys: ["shell:python3"], scope: "“python3” commands" });
 		expect(allowKey(shell, { command: "git commit -m x" })).toBe("shell:git commit");
 		expect(allowKey(shell, { command: "pytest -q" })).toBe("shell:pytest");
-		expect(allowKey(shell, { command: "make && rm -rf x" })).toBe("shell=make && rm -rf x");
+		expect(allowKeys(shell, { command: "cd app && FOO=1 timeout 60 python3 a.py | grep -v x" })).toEqual({ keys: ["shell:python3", "shell:grep"], scope: "“python3” and “grep” commands" });
+		// Code the words don't show, and programs that hand the line to something else, are remembered exactly.
+		for (const command of ["echo $(curl x)", "sudo make install", "ssh host ls", "bash <<EOF"]) expect(allowKeys(shell, { command }).scope).toBe("this exact command");
+		// Once both programs are allowed, a different command using them runs; one adding another program asks.
+		const plain = new LocalWorkspace(scratch("perm-keys"), "off");
+		const allowed = new Set(["shell:python3", "shell:grep"]);
+		expect(decide(shell, { command: "python3 other.py | grep y" }, plain, config, allowed).action).toBe("run");
+		expect(decide(shell, { command: "python3 other.py | rm y" }, plain, config, allowed)).toMatchObject({ action: "ask", keys: ["shell:python3", "shell:rm"] });
 	});
 
 	test("fetch asks once per host and names local addresses", () => {
@@ -386,8 +428,8 @@ describe("second review", () => {
 	test("an outside read allowed for the session isn't asked again", () => {
 		const first = decide(read, { path: "/etc/hosts" }, ws, config, new Set());
 		expect(first.action).toBe("ask");
-		const key = first.action === "ask" ? first.key : "";
-		expect(decide(read, { path: "/etc/hosts" }, ws, config, new Set([key])).action).toBe("run");
+		const keys = first.action === "ask" ? first.keys : [];
+		expect(decide(read, { path: "/etc/hosts" }, ws, config, new Set(keys)).action).toBe("run");
 	});
 
 	test.if(posix)("a sandboxed command still asks when it names a path outside the project", () => {

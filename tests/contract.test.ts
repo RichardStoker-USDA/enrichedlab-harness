@@ -328,7 +328,7 @@ describe("lab contract", () => {
 		const [tool] = toTools("devlab", client as never, [{ name: "query_plots", inputSchema: { type: "object" }, annotations: { readOnlyHint: true }, _meta: { "org.enrichedlab/tier": "unvalidated" } }] as never, "site");
 		expect(tool!.unreviewed).toBe(true);
 		const verdict = decide(tool!, {}, { kind: "local", inside: () => true } as never, { permissions: { mode: "full", allowCommands: [] } } as never, new Set([`tool:${tool!.name}`]));
-		expect(verdict).toMatchObject({ action: "ask", key: `unreviewed!${tool!.name}` });
+		expect(verdict).toMatchObject({ action: "ask", keys: [`unreviewed!${tool!.name}`] });
 		const result = await tool!.run({}, { signal: AbortSignal.timeout(5_000) } as never);
 		expect(result.view?.files).toEqual([{ uri: `${base}/v1/files/f1/content`, name: "plots.csv", mime: "text/csv", bytes: 18, sha256: sha }]);
 		expect(result.content).toContain(`sha256 ${sha}`);

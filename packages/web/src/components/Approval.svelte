@@ -25,6 +25,7 @@
 		if (at && at !== document.body && !root?.contains(at)) return;
 		const k = e.key.toLowerCase();
 		if (k === "y") void lab.answer(request.requestId, "allow");
+		else if (k === "a" && request.folder) void lab.answer(request.requestId, "allow_folder");
 		else if (k === "a" && !request.once) void lab.answer(request.requestId, "allow_session");
 		else if (k === "n") void lab.answer(request.requestId, "deny");
 		else return;
@@ -48,10 +49,13 @@
 	{/if}
 	<div class="actions">
 		<button class="secondary" onclick={() => lab.answer(request.requestId, "deny")}>Decline <kbd>N</kbd></button>
-		{#if !request.once}
-			<button class="secondary" onclick={() => lab.answer(request.requestId, "allow_session")}>Allow for this session <kbd>A</kbd></button>
+		{#if request.folder}
+			<!-- From now on, in every session: file changes in this folder run without asking, each kept in history. -->
+			<button class="secondary" title={`From now on, in every session: file changes in ${request.folder} run without asking. Each one is kept in history.`} onclick={() => lab.answer(request.requestId, "allow_folder")}>Allow changes in “{request.folder.split(/[\\/]/).filter(Boolean).at(-1)}” <kbd>A</kbd></button>
+		{:else if !request.once}
+			<button class="secondary" title={`For the rest of this session, ${request.scope ?? "this kind of step"} run without asking.`} onclick={() => lab.answer(request.requestId, "allow_session")}>Allow {request.scope ?? "this kind of step"} this session <kbd>A</kbd></button>
 		{/if}
-		<button class="primary" onclick={() => lab.answer(request.requestId, "allow")}>Allow <kbd>Y</kbd></button>
+		<button class="primary" onclick={() => lab.answer(request.requestId, "allow")}>Allow once <kbd>Y</kbd></button>
 	</div>
 </section>
 

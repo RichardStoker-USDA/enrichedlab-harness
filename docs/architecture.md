@@ -149,13 +149,14 @@ figure apps with export, reproducible data analysis in R or Python, Office files
 research at a lab. They're embedded in `el`, written to `<home>/skills/builtin-<version>/` on first use, and listed
 like any skill; a personal or project skill with the same name replaces one.
 
-**Permissions.** Reads inside the project run. Writes, edits and shell commands ask. A shell command runs without
-asking only when a quote-aware check finds every part read-only (no variables, substitutions, subshells, background
-jobs, writing redirections or environment prefixes; no command that runs another program) and every path argument
-inside the project after following symlinks. Anything outside the project asks, and `fetch` asks once per host.
-"Allow for this session" covers a command's program and subcommand (`git commit`), or the exact command for
-interpreters and compound lines. A site tool runs when the site marks it read-only and asks otherwise. Sandbox
-commands run, since the sandbox is isolated. The person answers from whichever surface they are looking at; the
+**Permissions.** Three modes decide what asks: `ask`, `auto` (the default: asks only for what history can't take
+back) and `full` ([security.md](security.md#how-much-it-asks)). Reads inside the project run. A shell command runs
+without asking when it runs contained and names only paths inside the project, or when a quote-aware check finds every
+part read-only (no variables, substitutions, subshells, background jobs, writing redirections or environment
+prefixes; no command that runs another program) with every path inside the project after following symlinks.
+Anything outside the project asks, and `fetch` asks once per host. "Allow for this session" covers each program a
+command runs (`python3`, `git commit`), is kept in the session log, and the button says what it covers. A site tool
+runs when the site marks it read-only and asks otherwise. Sandbox commands run, since the sandbox is isolated. The person answers from whichever surface they are looking at; the
 first answer wins. `el run` refuses what would ask, unless started with `--allow`.
 
 **Windows that act.** A surface can say in `hello` what it can do for the engine. The desktop windows say "browser":

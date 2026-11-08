@@ -90,6 +90,8 @@ public struct SessionSummary: Codable, Sendable, Hashable, Identifiable {
 	public var parent: String?
 	public var place: String?
 	public var discovery: String?
+	/// How much this session asks, when the person set it for this session.
+	public var permissions: String?
 
 	public init(id: String, cwd: String, title: String, created: String, updated: String, model: String, turns: Int, running: Bool, site: String? = nil, parent: String? = nil, place: String? = nil, discovery: String? = nil) {
 		self.id = id
@@ -231,6 +233,10 @@ public struct PermissionRequest: Codable, Sendable, Hashable, Identifiable {
 	public var once: Bool?
 	/// For a subagent's question: the session it works for.
 	public var lead: String?
+	/// What "allow for this session" covers, in words: "“python3” commands", "requests to example.org".
+	public var scope: String?
+	/// A folder the person hasn't let EnrichedLab change yet: offer allowFolder.
+	public var folder: String?
 
 	public var id: String { requestId }
 }
@@ -238,7 +244,47 @@ public struct PermissionRequest: Codable, Sendable, Hashable, Identifiable {
 public enum PermissionDecision: String, Codable, Sendable {
 	case allow
 	case allowSession = "allow_session"
+	/// Let EnrichedLab change files in the request's folder from now on, in every session.
+	case allowFolder = "allow_folder"
 	case deny
+}
+
+/// How much a session asks: before changes, only for what history can't take back, or never.
+public enum PermissionMode: String, Codable, Sendable, CaseIterable {
+	case ask
+	case auto
+	case full
+
+	public var title: String {
+		switch self {
+		case .ask: "Ask Before Changes"
+		case .auto: "Ask When It Can't Be Undone"
+		case .full: "Allow Everything"
+		}
+	}
+
+	/// The short name beside the composer's other menus.
+	public var short: String {
+		switch self {
+		case .ask: "Ask"
+		case .auto: "Auto"
+		case .full: "Allow All"
+		}
+	}
+
+	public var detail: String {
+		switch self {
+		case .ask: "Asks before each file change and each command that can change things. You can let a kind of step run for the rest of the session."
+		case .auto: "File changes in a folder you let it change, and commands contained to that folder, run without asking: every step is kept in history, so you can go back. It asks before commands outside the containment, requests to new sites, and anything it can't take back."
+		case .full: "Never asks, except before pushing to a remote and before lab tools the lab hasn't reviewed. Every step is still kept in history."
+		}
+	}
+}
+
+/// What EnrichedLab may do in a folder the person added.
+public enum FolderAccess: String, Codable, Sendable {
+	case change
+	case read
 }
 
 public struct PlotSpec: Codable, Sendable, Hashable {
@@ -452,11 +498,16 @@ public struct UiPrefs: Codable, Sendable, Hashable {
 	/// auto, light, dark
 	public var theme: String
 	public var showReasoning: Bool
+	/// How much new sessions ask: ask, auto or full.
+	public var permissions: String?
 
-	public init(theme: String = "auto", showReasoning: Bool = true) {
+	public init(theme: String = "auto", showReasoning: Bool = true, permissions: String? = nil) {
 		self.theme = theme
 		self.showReasoning = showReasoning
+		self.permissions = permissions
 	}
+
+	public var permissionMode: PermissionMode { permissions.flatMap(PermissionMode.init(rawValue:)) ?? .auto }
 }
 
 // MARK: The browser in a lab's sandbox

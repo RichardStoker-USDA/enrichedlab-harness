@@ -1,22 +1,50 @@
 // Which tool calls run, which ask, and how an answer is remembered for the rest of a session. This guards against a
-// model steered by text it read; it is not an OS sandbox. What runs without asking only reads inside the project:
-// anything that reads outside it, writes, runs a program or reaches a new host asks first.
+// model steered by text it read; the OS containment (Seatbelt, bubblewrap, a lab's sandbox) is what holds commands in.
+//
+// Three modes (docs/security.md, "How much it asks"):
+// - ask:  asks before file changes and commands that can change things.
+// - auto: asks only for what the session's history can't take back: commands that run outside the containment,
+//         requests to a new host, changes outside the folder, signed-in browser actions, publishing. File changes in a
+//         folder the person let EnrichedLab change, and contained commands, run; every step is kept in history.
+// - full: never asks, except pushing to a remote and lab tools the lab hasn't reviewed.
+// "Allow for this session" is remembered per program (python, git commit), per host, per tool, and kept in the log.
 
-import type { LabConfig } from "./config.ts";
+import { basename, sep } from "node:path";
+import type { FolderAccess, LabConfig, PermissionMode } from "./config.ts";
 import { isReadOnlyCommand, pathsInside } from "./tools/shell.ts";
 import type { Tool } from "./tools/types.ts";
 import { isOpenPort } from "./sites/port_proxy.ts";
 import { FULL_CONTAINMENT } from "./tools/workspace.ts";
 import type { Workspace } from "./tools/workspace.ts";
 
-export type Verdict = { action: "run" } | { action: "ask"; reason: string; key: string };
+export type Verdict =
+	| { action: "run" }
+	| {
+			action: "ask";
+			reason: string;
+			/** What an "allow for this session" answer remembers; every key must be allowed for the call to run. */
+			keys: string[];
+			/** What those keys cover, in words for the button: "python and grep commands", "requests to example.org". */
+			scope: string;
+			/** Set when the call changes files in a folder the person hasn't let EnrichedLab change: the folder to offer. */
+			folder?: string;
+	  };
 
-/** Programs that run whatever they are given: allowing one for the session allows only that exact command. */
-const RUNS_ANYTHING = new Set([
-	"python", "python3", "node", "bun", "deno", "ruby", "perl", "php", "bash", "sh", "zsh", "fish", "pwsh", "powershell",
-	"env", "xargs", "sudo", "doas", "eval", "exec", "nohup", "time", "timeout", "watch", "ssh", "osascript", "open", "start",
-	"cmd", "Invoke-Expression", "iex",
-]);
+/** "edits", the old name for auto, reads as auto. */
+export function modeOf(mode: string | undefined): PermissionMode {
+	return mode === "full" ? "full" : mode === "ask" ? "ask" : "auto";
+}
+
+/** What the person let EnrichedLab do in the folder holding `path`: the nearest granted folder decides. */
+export function folderAccess(config: LabConfig, path: string): FolderAccess | undefined {
+	let best: { folder: string; access: FolderAccess } | undefined;
+	for (const [folder, grant] of Object.entries(config.folders ?? {})) {
+		const inside = path === folder || path.startsWith(folder.endsWith(sep) ? folder : folder + sep);
+		if (inside && (!best || folder.length > best.folder.length)) best = { folder, access: grant.access };
+	}
+	return best?.access;
+}
+
 /** Tools whose first argument names the action: keyed by both words, so "git status" doesn't allow "git push". */
 const SUBCOMMANDS = new Set([
 	"git", "npm", "pnpm", "yarn", "npx", "bunx", "cargo", "go", "pixi", "uv", "pip", "pip3", "docker", "podman", "kubectl", "helm",
@@ -26,22 +54,76 @@ const SUBCOMMANDS = new Set([
 /** Tools that change files in the project. Other writes (browser actions, apps, memory, PDF forms) are each their own. */
 const FILE_EDITS = new Set(["write", "edit"]);
 
-/** The key an "allow for this session" answer is stored under. */
-export function allowKey(tool: Tool, args: Record<string, unknown>): string {
+/** Shell words that only move around or say something: they don't need their own answer. */
+const QUIET = new Set(["cd", "pushd", "popd", "true", "false", ":", "echo", "printf", "pwd", "test", "["]);
+/** Wrappers whose next word is the program that runs. */
+const WRAPPERS = new Set(["time", "timeout", "nohup", "nice", "command", "builtin"]);
+
+/** The programs a shell command runs: one entry per simple command, keyed as an answer remembers it. */
+function commandKeys(command: string): { keys: string[]; names: string[] } | undefined {
+	// Substitutions and here-documents run code the words don't show: such a command is remembered exactly.
+	if (/\$\(|`|<\(|>\(|<<|\beval\b/.test(command)) return undefined;
+	const keys = new Set<string>();
+	const names = new Set<string>();
+	for (const part of command.split(/&&|\|\||[;|\n&]/)) {
+		const words = part.trim().split(/\s+/).filter(Boolean);
+		while (words.length && /^\w+=/.test(words[0]!)) words.shift();
+		while (words.length && WRAPPERS.has(words[0]!)) {
+			words.shift();
+			while (words.length && (words[0]!.startsWith("-") || /^\d+[smh]?$/.test(words[0]!))) words.shift();
+		}
+		const first = (words[0] ?? "").replace(/^.*\//, "");
+		if (!first || QUIET.has(first) || /^[<>0-9]/.test(first)) continue;
+		// These hand the rest of the line to something else (another computer, an admin, AppleScript): exact only.
+		if (["sudo", "doas", "ssh", "osascript", "exec", "xargs", "env", "watch", "open", "start", "cmd", "Invoke-Expression", "iex"].includes(first)) return undefined;
+		if (SUBCOMMANDS.has(first) && words[1] && !words[1].startsWith("-")) {
+			keys.add(`shell:${first} ${words[1]}`);
+			names.add(`${first} ${words[1]}`);
+		} else {
+			keys.add(`shell:${first}`);
+			names.add(first);
+		}
+	}
+	return keys.size ? { keys: [...keys], names: [...names] } : undefined;
+}
+
+/** "a", "a and b", "a, b and c". */
+function list(items: string[]): string {
+	return items.length <= 1 ? (items[0] ?? "") : `${items.slice(0, -1).join(", ")} and ${items.at(-1)}`;
+}
+
+/** What an "allow for this session" answer remembers for this call, and what that covers in words. */
+export function allowKeys(tool: Tool, args: Record<string, unknown>): { keys: string[]; scope: string } {
 	if (tool.kind === "exec") {
 		const command = String(args.command ?? "").trim();
-		const words = command.split(/\s+/);
-		const first = words[0] ?? "";
 		// Pushing publishes work: it asks every time, whatever was allowed before.
-		if (/(^|[;&|\n]\s*)git\s+(\S+\s+)*push\b/.test(command)) return "shell!push";
-		if (/[;&|<>`$\n]/.test(command) || RUNS_ANYTHING.has(first) || /^\w+=/.test(first)) return `shell=${command}`;
-		if (SUBCOMMANDS.has(first) && words[1] && !words[1].startsWith("-")) return `shell:${first} ${words[1]}`;
-		return `shell:${first}`;
+		if (/(^|[;&|\n]\s*)git\s+(\S+\s+)*push\b/.test(command)) return { keys: ["shell!push"], scope: "pushing" };
+		const found = commandKeys(command);
+		if (!found) return { keys: [`shell=${command}`], scope: "this exact command" };
+		return { keys: found.keys, scope: `${list(found.names.map((n) => `“${n}”`))} commands` };
 	}
-	if (tool.kind === "write") return FILE_EDITS.has(tool.name) ? "write" : `write:${tool.name}`;
-	if (tool.kind === "net") return `net:${tool.host?.(args) ?? host(args)}`;
-	return `tool:${tool.name}`;
+	if (tool.kind === "write") return FILE_EDITS.has(tool.name) ? { keys: ["write"], scope: "file changes" } : { keys: [`write:${tool.name}`], scope: SCOPES[tool.name] ?? tool.name };
+	if (tool.kind === "net") {
+		const name = tool.host?.(args) ?? host(args);
+		return { keys: [`net:${name}`], scope: `requests to ${name}` };
+	}
+	return { keys: [`tool:${tool.name}`], scope: tool.name };
 }
+
+/** The one key for a call, for callers that keep a single key (kept for the web window's older answers). */
+export function allowKey(tool: Tool, args: Record<string, unknown>): string {
+	return allowKeys(tool, args).keys.join(" ");
+}
+
+/** What a session answer covers for writes that aren't file edits. */
+const SCOPES: Record<string, string> = {
+	browser_click: "clicks in the browser",
+	browser_type: "typing in the browser",
+	app_create: "new apps",
+	remember: "notes to memory",
+	skill_create: "new skills",
+	pdf_fill: "filling PDF forms",
+};
 
 function host(args: Record<string, unknown>): string {
 	try {
@@ -106,56 +188,78 @@ export const PUSH_REASON = "It pushes to a remote.";
 /** Built-in tools that, in a lab's sandbox, act only there: reading, file edits and commands. */
 const IN_SANDBOX = new Set(["read", "sandbox", "exec"]);
 
-/** `discovery`: the lab where Discovery mode applies to this session now (docs/research.md). */
-export function decide(tool: Tool, args: Record<string, unknown>, workspace: Workspace, config: LabConfig, allowed: Set<string>, discovery?: string): Verdict {
-	const mode = config.permissions.mode;
+/** Writes that aren't file edits but stay in the project, where history can take them back. */
+const PROJECT_WRITES = new Set(["app_create", "pdf_fill"]);
+
+/**
+ * `discovery`: the lab where Discovery mode applies to this session now (docs/research.md). `mode`: the session's
+ * own mode, when the person set one for it; otherwise the configured one.
+ */
+export function decide(tool: Tool, args: Record<string, unknown>, workspace: Workspace, config: LabConfig, allowed: Set<string>, discovery?: string, sessionMode?: PermissionMode): Verdict {
+	const mode = modeOf(sessionMode ?? config.permissions.mode);
 	const extra = tool.ask?.(args, { workspace });
-	const key = allowKey(tool, args);
+	const { keys, scope } = allowKeys(tool, args);
+	const ask = (reason: string, folder?: string): Verdict => ({ action: "ask", reason, keys, scope, ...(folder ? { folder } : {}) });
 	// Pushing publishes work, and an unreviewed lab tool hasn't been checked by anyone: both ask in every mode, every time.
-	if (key === "shell!push") return { action: "ask", reason: PUSH_REASON, key };
-	if (tool.unreviewed) return { action: "ask", reason: "The lab hasn't reviewed this tool yet, so it asks every time.", key: `unreviewed!${tool.name}` };
+	if (keys[0] === "shell!push") return ask(PUSH_REASON);
+	if (tool.unreviewed) return { action: "ask", reason: "The lab hasn't reviewed this tool yet, so it asks every time.", keys: [`unreviewed!${tool.name}`], scope: "this call" };
 	if (mode === "full") return { action: "run" };
 	// Discovery mode: what acts inside the lab the session works at runs without asking (the lab's filters, checks and
 	// audit stay on there). Anything on this computer still asks.
-	if (discovery && (tool.site === discovery || (!tool.site && workspace.kind === "sandbox" && (IN_SANDBOX.has(tool.kind) || key === "write")))) return { action: "run" };
+	if (discovery && (tool.site === discovery || (!tool.site && workspace.kind === "sandbox" && (IN_SANDBOX.has(tool.kind) || keys[0] === "write")))) return { action: "run" };
 	// An answer about something outside the project is remembered for that path only; "!" keys never are.
-	const outside = `${key}:outside:${String(args.path ?? args.url ?? "")}`;
-	if (!key.includes("!") && allowed.has(extra ? outside : key)) return { action: "run" };
+	const outside = `${keys.join(" ")}:outside:${String(args.path ?? args.url ?? "")}`;
+	const remembered = (list: string[]) => list.every((key) => !key.includes("!") && allowed.has(key));
+	if (extra ? allowed.has(outside) : remembered(keys)) return { action: "run" };
+	const askOutside = (reason: string): Verdict => ({ action: "ask", reason, keys: [outside], scope: "this path" });
+	const local = workspace.kind === "local";
+	const access = local ? folderAccess(config, workspace.root) : undefined;
 	switch (tool.kind) {
 		case "net": {
 			// The engine's own ports show the person's sandbox apps; nothing goes anywhere the person didn't send it.
 			if (typeof args.url === "string" && isOpenPort(args.url)) return { action: "run" };
-			if (extra) return { action: "ask", reason: extra, key: outside };
+			if (extra) return askOutside(extra);
 			const name = tool.host?.(args) ?? host(args);
-			const reason = localHost(name) ? `It reaches ${name}, an address on this computer or your network.` : `It sends a request to ${name}.`;
-			return { action: "ask", reason, key };
+			return ask(localHost(name) ? `It reaches ${name}, an address on this computer or your network.` : `It sends a request to ${name}.`);
 		}
 		case "read":
 		case "local":
 		case "site-read":
 		case "sandbox":
-			return extra ? { action: "ask", reason: extra, key: outside } : { action: "run" };
-		case "write":
-			if (extra) return { action: "ask", reason: extra, key: outside };
+			return extra ? askOutside(extra) : { action: "run" };
+		case "write": {
+			if (extra) return askOutside(extra);
+			const edit = keys[0] === "write";
 			// File edits in a session's own worktree go to its own branch, and work in a lab's sandbox comes home as a
-			// branch: the person reviews them when they merge. Other writes (a click in the browser, a new app) ask in every
-			// mode until allowed.
-			if (key === "write" && (mode === "edits" || ownWorktree(workspace) || workspace.sandboxed === "site")) return { action: "run" };
-			return { action: "ask", reason: key === "write" ? "It changes a file." : `It ${WRITES[tool.name] ?? (tool.name.endsWith("_sandbox_download") ? "copies a file from the sandbox into the project" : "changes something")}.`, key };
+			// branch: the person reviews them when they merge.
+			if (edit && (ownWorktree(workspace) || workspace.sandboxed === "site")) return { action: "run" };
+			if (mode === "auto" && (edit || PROJECT_WRITES.has(tool.name))) {
+				// Kept in history, so it can be taken back: runs where the person let EnrichedLab change the folder.
+				if (!local || access === "change") return { action: "run" };
+				if (access === "read") return ask("It changes a file, and you set this folder to read only.");
+				return ask(`It changes a file in “${basename(workspace.root)}”, a folder you haven't let EnrichedLab change yet.`, workspace.root);
+			}
+			// Other writes (a click in the browser, a note to memory) ask in every mode until allowed.
+			return ask(edit ? "It changes a file." : `It ${WRITES[tool.name] ?? (tool.name.endsWith("_sandbox_download") ? "copies a file from the sandbox into the project" : "changes something")}.`, edit && local && access === undefined ? workspace.root : undefined);
+		}
 		case "exec": {
 			const command = String(args.command ?? "");
 			// In its own worktree the agent commits to its own branch; the person merges it.
 			if (ownBranchCommit(command, workspace)) return { action: "run" };
 			// Contained by the OS: writes stay in the project and temp folders, no network. Runs without asking unless it
 			// names a path outside the project or expands variables (the sandbox can still read most of the disk).
-			// Contained commands that stay inside the project run; Windows contains writes only, so it still asks.
-			if (workspace.sandboxed && FULL_CONTAINMENT.has(workspace.sandboxed) && args.unsandboxed !== true && pathsInside(command, (path) => workspace.inside(path), workspace.kind === "sandbox" || process.platform !== "win32")) return { action: "run" };
+			// Windows contains writes only, so there it still asks. A folder set to read only asks for everything.
+			const contained = workspace.sandboxed && FULL_CONTAINMENT.has(workspace.sandboxed) && args.unsandboxed !== true;
+			if (contained && access !== "read" && pathsInside(command, (path) => workspace.inside(path), workspace.kind === "sandbox" || process.platform !== "win32")) return { action: "run" };
 			if (isReadOnlyCommand(command, config.permissions.allowCommands, (path) => workspace.inside(path))) return { action: "run" };
+			// In a lab's sandbox whose whole disk is checkpointed, any command can be taken back.
+			if (mode === "auto" && workspace.kind === "sandbox" && workspace.checkpointed === "filesystem" && args.unsandboxed !== true) return { action: "run" };
 			const reads = isReadOnlyCommand(command, config.permissions.allowCommands, () => true);
-			return { action: "ask", reason: reads ? "It reads outside the project folder." : "It runs a command that can change things.", key };
+			if (reads) return ask("It reads outside the project folder.");
+			return ask(contained || workspace.kind === "sandbox" ? "It runs a command that changes things outside the project folder." : "It runs a command on this computer outside the sandbox, where it can change anything you can.");
 		}
 		case "site-write":
-			return { action: "ask", reason: "The site doesn't mark this tool read-only.", key };
+			return ask("The lab doesn't mark this tool read-only.");
 	}
 }
 

@@ -147,6 +147,10 @@ export type SessionEvent =
 	 * sandbox, its tools) runs without asking, for a person the lab grants it to.
 	 */
 	| (EventBase & { t: "discovery"; on: boolean; site: string })
+	/** The person answered "allow for this session": these keys run without asking for the rest of it. */
+	| (EventBase & { t: "allow"; keys: string[]; scope: string })
+	/** The person set how much this session asks; absent `mode` returns to the configured one. */
+	| (EventBase & { t: "permissions"; mode?: PermissionMode })
 	/**
 	 * A short summary of one assistant step's reasoning, for the person reading the session. The full reasoning stays on
 	 * the step (`of`); the model never sees this. Made by a model in the same place as the session's model.
@@ -206,6 +210,8 @@ export interface SessionSummary {
 	place?: string;
 	/** The lab where Discovery mode is on for this session. */
 	discovery?: string;
+	/** How much this session asks, when the person set it for this session. */
+	permissions?: PermissionMode;
 }
 
 // ── Models and sites ─────────────────────────────────────────────────────────────────────────────────────────────
@@ -327,9 +333,17 @@ export interface PermissionRequest {
 	once?: boolean;
 	/** For a subagent's question: the session it works for, whose windows show the question. */
 	lead?: string;
+	/** What "allow for this session" covers, in words for the button: "“python” commands", "requests to example.org". */
+	scope?: string;
+	/** A folder the person hasn't let EnrichedLab change yet: offer allow_folder, which lets it change files there. */
+	folder?: string;
 }
 
-export type PermissionDecision = "allow" | "allow_session" | "deny";
+/** allow_folder: let EnrichedLab change files in the request's folder from now on, in every session. */
+export type PermissionDecision = "allow" | "allow_session" | "allow_folder" | "deny";
+
+/** How much a session asks: ask (before changes), auto (only for what history can't take back), full (never). */
+export type PermissionMode = "ask" | "auto" | "full";
 
 export interface CanvasSummary {
 	id: string;
@@ -571,6 +585,12 @@ export interface Requests {
 	"desktop.watch": { params: { site: string; on: boolean }; result: DesktopStream };
 	/** Turn Discovery mode on or off; on only in a session at a lab that grants the person `discovery`. */
 	"session.discovery": { params: { sessionId: string; on: boolean }; result: { summary: SessionSummary; detail: string } };
+	/** Set how much this session asks; no mode returns it to the configured one. */
+	"session.permissions": { params: { sessionId: string; mode?: PermissionMode }; result: SessionSummary };
+	/** What EnrichedLab may do in a folder: read it with `access` absent, set it with "change", "read" or "none". */
+	"folder.access": { params: { path: string; access?: "change" | "read" | "none" }; result: { path: string; access?: "change" | "read" } };
+	/** The folders the person answered for, with what EnrichedLab may do in each. */
+	"folder.list": { params: Record<string, never>; result: { path: string; access: "change" | "read"; at: string }[] };
 	"permission.answer": { params: { requestId: string; decision: PermissionDecision }; result: { ok: boolean } };
 	"model.list": { params: { refresh?: boolean }; result: { models: ModelInfo[]; default?: string } };
 	"model.default": { params: { model: string; effort?: string }; result: { ok: true } };
@@ -706,6 +726,8 @@ export interface Partial_ {
 export interface UiPrefs {
 	theme: "auto" | "light" | "dark";
 	showReasoning: boolean;
+	/** How much new sessions ask (a session can set its own); kept in config.json as permissions.mode. */
+	permissions: PermissionMode;
 }
 
 // ── The browser in a lab's sandbox ───────────────────────────────────────────────────────────────────────────────

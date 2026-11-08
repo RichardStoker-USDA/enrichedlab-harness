@@ -5,7 +5,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, extname, join, relative, resolve } from "node:path";
+import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
 import type {
 	DesktopStream,
 	Method,
@@ -24,7 +24,8 @@ import { type Attachments, fromV1, importProblem, toV1 } from "./session/log_v1.
 import { AppHost, type AppSession } from "./apps/host.ts";
 import { CanvasStore } from "./canvas.ts";
 import { applyBundles, listBundles } from "./bundles.ts";
-import { type LabConfig, loadConfig, type ProviderConfig, saveConfig } from "./config.ts";
+import { DEFAULT_CONFIG, type LabConfig, loadConfig, type PermissionMode, type ProviderConfig, saveConfig } from "./config.ts";
+import { folderAccess, modeOf } from "./permissions.ts";
 import { McpManager } from "./mcp.ts";
 import { ModelRegistry } from "./models/registry.ts";
 import { LocalModels } from "./models/local_service.ts";
@@ -434,7 +435,18 @@ export class Engine {
 				}
 			},
 			ask: (request, signal) => this.ask(request, signal),
+			grantFolder: (folder) => this.setFolderAccess(folder, "change"),
 		};
+	}
+
+	/** Save what EnrichedLab may do in a folder (asked once, when the person adds it); "none" forgets the folder. */
+	private setFolderAccess(path: string, access: "change" | "read" | "none"): void {
+		const folder = resolve(path);
+		const folders = { ...this.config.folders };
+		if (access === "none") delete folders[folder];
+		else folders[folder] = { access, at: new Date().toISOString() };
+		saveConfig(this.paths, { folders });
+		this.reloadConfig();
 	}
 
 	/** Ask whichever surface answers first. A headless run answers by its own rule. */
@@ -625,7 +637,8 @@ export class Engine {
 	}
 
 	uiPrefs(): UiPrefs {
-		return { theme: "auto", showReasoning: true, ...readJson<Partial<UiPrefs>>(this.paths.ui, {}) };
+		const { theme = "auto", showReasoning = true } = readJson<Partial<UiPrefs>>(this.paths.ui, {});
+		return { theme, showReasoning, permissions: modeOf(this.config.permissions.mode) };
 	}
 
 	/** ChatGPT plan models are offered while an account is signed in; config.json records only that. */
@@ -725,6 +738,28 @@ export class Engine {
 					const detail = this.discover(runtime, p.on === true);
 					return { summary: runtime.summary(), detail };
 				}
+				case "session.permissions": {
+					const runtime = this.session(need("sessionId"));
+					const mode = p.mode as string | undefined;
+					if (mode !== undefined && !["ask", "auto", "full"].includes(mode)) throw new RpcError(-32602, "mode must be ask, auto or full.");
+					runtime.setPermissionMode(mode as PermissionMode | undefined);
+					return runtime.summary();
+				}
+				case "folder.access": {
+					const path = need("path");
+					if (!isAbsolute(path)) throw new RpcError(-32602, "path must be absolute.");
+					const access = p.access as string | undefined;
+					if (access !== undefined) {
+						if (!["change", "read", "none"].includes(access)) throw new RpcError(-32602, "access must be change, read or none.");
+						this.setFolderAccess(path, access as "change" | "read" | "none");
+					}
+					const now = folderAccess(this.config, resolve(path));
+					return { path: resolve(path), ...(now ? { access: now } : {}) };
+				}
+				case "folder.list":
+					return Object.entries(this.config.folders ?? {})
+						.map(([path, grant]) => ({ path, access: grant.access, at: grant.at }))
+						.sort((a, b) => a.path.localeCompare(b.path));
 				case "session.cancel": {
 					const returned = this.session(need("sessionId")).cancel();
 					return returned.length ? { ok: true, returned } : { ok: true };
@@ -751,7 +786,7 @@ export class Engine {
 					const waiting = this.waiting.get(need("requestId"));
 					if (!waiting) return { ok: false };
 					const decision = p.decision as PermissionDecision;
-					if (!["allow", "allow_session", "deny"].includes(decision)) throw new RpcError(-32602, "decision must be allow, allow_session or deny.");
+					if (!["allow", "allow_session", "allow_folder", "deny"].includes(decision)) throw new RpcError(-32602, "decision must be allow, allow_session, allow_folder or deny.");
 					waiting.resolve(decision);
 					return { ok: true };
 				}
@@ -1095,7 +1130,13 @@ export class Engine {
 					const next: UiPrefs = { ...this.uiPrefs() };
 					if (p.theme === "auto" || p.theme === "light" || p.theme === "dark") next.theme = p.theme;
 					if (typeof p.showReasoning === "boolean") next.showReasoning = p.showReasoning;
-					writeJson(this.paths.ui, next);
+					writeJson(this.paths.ui, { theme: next.theme, showReasoning: next.showReasoning });
+					if (p.permissions === "ask" || p.permissions === "auto" || p.permissions === "full") {
+						const saved = readJson<Partial<LabConfig>>(this.paths.config, {});
+						saveConfig(this.paths, { permissions: { ...DEFAULT_CONFIG.permissions, ...saved.permissions, mode: p.permissions } });
+						this.reloadConfig();
+						next.permissions = p.permissions;
+					}
 					this.emit("ui.updated", next);
 					return next;
 				}

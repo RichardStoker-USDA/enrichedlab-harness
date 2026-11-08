@@ -288,16 +288,26 @@ struct ApprovalCard: View {
 			if request.view.unreviewed == true {
 				Text("This lab tool hasn't been reviewed by the lab yet.").font(.caption).foregroundStyle(.orange)
 			}
-			HStack(spacing: 8) {
-				// No Return or Escape shortcuts: a stray key in the composer must never answer a question.
-				Button("Decline") { answer(.deny) }
-				Spacer()
-				if request.once != true {
-					Button("Allow for This Session") { answer(.allowSession) }
+			// No Return or Escape shortcuts: a stray key in the composer must never answer a question.
+			ViewThatFits(in: .horizontal) {
+				HStack(spacing: 8) {
+					Button("Decline") { answer(.deny) }
+					Spacer(minLength: 8)
+					remembering
+					Button("Allow Once") { answer(.allow) }
+						.buttonStyle(.borderedProminent)
 				}
-				Button("Allow") { answer(.allow) }
-					.buttonStyle(.borderedProminent)
+				VStack(alignment: .trailing, spacing: 8) {
+					HStack(spacing: 8) {
+						Button("Decline") { answer(.deny) }
+						Spacer(minLength: 8)
+						Button("Allow Once") { answer(.allow) }
+							.buttonStyle(.borderedProminent)
+					}
+					remembering
+				}
 			}
+			.fixedSize(horizontal: false, vertical: true)
 			.disabled(answering)
 		}
 		.padding(12)
@@ -305,6 +315,18 @@ struct ApprovalCard: View {
 		.overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(Theme.accent.opacity(0.5)))
 		.accessibilityElement(children: .contain)
 		.accessibilityLabel("Question: \(request.reason)")
+	}
+
+	/// The answer that's remembered, saying exactly what it covers: this folder from now on, or a kind of step for
+	/// the rest of the session.
+	@ViewBuilder private var remembering: some View {
+		if let folder = request.folder {
+			Button("Allow Changes in “\(URL(fileURLWithPath: folder).lastPathComponent)”") { answer(.allowFolder) }
+				.help("From now on, in every session: file changes in \(shortPath(folder)) run without asking. Each one is kept in history.")
+		} else if request.once != true, let scope = request.scope {
+			Button("Allow \(scope) This Session") { answer(.allowSession) }
+				.help("For the rest of this session, \(scope) run without asking.")
+		}
 	}
 
 	private func answer(_ decision: PermissionDecision) {

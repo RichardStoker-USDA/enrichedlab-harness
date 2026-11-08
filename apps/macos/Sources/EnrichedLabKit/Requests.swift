@@ -223,9 +223,35 @@ extension EngineConnection {
 		try await call("ui.get", Empty())
 	}
 
-	public func setUiPrefs(theme: String? = nil, showReasoning: Bool? = nil) async throws -> UiPrefs {
-		struct P: Encodable, Sendable { var theme: String?; var showReasoning: Bool? }
-		return try await call("ui.set", P(theme: theme, showReasoning: showReasoning))
+	public func setUiPrefs(theme: String? = nil, showReasoning: Bool? = nil, permissions: PermissionMode? = nil) async throws -> UiPrefs {
+		struct P: Encodable, Sendable { var theme: String?; var showReasoning: Bool?; var permissions: String? }
+		return try await call("ui.set", P(theme: theme, showReasoning: showReasoning, permissions: permissions?.rawValue))
+	}
+
+	/// Set how much a session asks; nil returns it to the default for new sessions.
+	public func setPermissions(_ id: String, mode: PermissionMode?) async throws -> SessionSummary {
+		struct P: Encodable, Sendable { var sessionId: String; var mode: String? }
+		return try await call("session.permissions", P(sessionId: id, mode: mode?.rawValue))
+	}
+
+	public struct FolderGrant: Decodable, Sendable, Hashable, Identifiable {
+		public var path: String
+		public var access: FolderAccess
+		public var at: String
+		public var id: String { path }
+	}
+
+	public func folders() async throws -> [FolderGrant] {
+		struct P: Encodable, Sendable {}
+		return try await call("folder.list", P())
+	}
+
+	/// What EnrichedLab may do in a folder; pass `access` (change, read or none) to set it.
+	public func folderAccess(_ path: String, set access: String? = nil) async throws -> FolderAccess? {
+		struct P: Encodable, Sendable { var path: String; var access: String? }
+		struct R: Decodable { var path: String; var access: FolderAccess? }
+		let result: R = try await call("folder.access", P(path: path, access: access))
+		return result.access
 	}
 
 	public func providers() async throws -> ProviderList {

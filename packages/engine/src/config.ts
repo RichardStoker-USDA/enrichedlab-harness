@@ -53,7 +53,11 @@ export interface McpServerConfig {
 	enabled?: boolean;
 }
 
-export type PermissionMode = "ask" | "edits" | "full";
+/** ask, auto (asks only for what history can't take back) or full. "edits", an older name, reads as auto. */
+export type PermissionMode = "ask" | "auto" | "full";
+
+/** What the person let EnrichedLab do in a folder they added: change its files, or only read them. */
+export type FolderAccess = "change" | "read";
 
 export interface LabConfig {
 	model?: string;
@@ -72,6 +76,8 @@ export interface LabConfig {
 	mcpServers: Record<string, McpServerConfig>;
 	/** sandbox "workspace" (the default): local commands run contained (macOS Seatbelt, Linux bubblewrap) and don't ask. */
 	permissions: { mode: PermissionMode; allowCommands: string[]; sandbox?: SandboxMode };
+	/** Folders the person added, by absolute path, with what they let EnrichedLab do there (asked once, when added). */
+	folders?: Record<string, { access: FolderAccess; at: string }>;
 	/** Look for model servers on this computer; `ports` replaces the default list (11434, 1234, 8080, 8000, 30000). */
 	discovery: { local: boolean; ports?: number[] };
 	instructions: { global: string[] };
@@ -87,7 +93,7 @@ export const DEFAULT_CONFIG: LabConfig = {
 	models: {},
 	mcpServers: {},
 	// Agent commands run contained where the OS allows it (macOS Seatbelt, Linux bubblewrap); "off" turns it off.
-	permissions: { mode: "ask", allowCommands: [], sandbox: "workspace" },
+	permissions: { mode: "auto", allowCommands: [], sandbox: "workspace" },
 	discovery: { local: true },
 	instructions: { global: ["~/.el/AGENTS.md"] },
 	skills: { dirs: ["~/.el/skills", ".agents/skills", ".el/skills"] },

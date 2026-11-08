@@ -232,7 +232,7 @@ export async function runTui(options: TuiOptions): Promise<void> {
 		render();
 	}
 
-	async function answer(decision: "allow" | "allow_session" | "deny"): Promise<void> {
+	async function answer(decision: "allow" | "allow_session" | "allow_folder" | "deny"): Promise<void> {
 		const request = approvals.shift();
 		if (!request) return;
 		showFirstApproval();
@@ -485,7 +485,7 @@ export async function runTui(options: TuiOptions): Promise<void> {
 					["Ctrl+O", "open steps, output and reasoning"],
 					["Tab", "complete a path or command"],
 					["Ctrl+C", "clear the prompt; twice to leave"],
-					["y  a  n", "answer a permission request: once, for the session, no"],
+					["y  a  n", "answer a permission request: once, remembered (its line says for what), no"],
 				];
 				const rows = (title: string, list: [string, string][], width: number) => {
 					const pad = Math.max(...list.map(([k]) => k.length)) + 3;
@@ -538,6 +538,7 @@ export async function runTui(options: TuiOptions): Promise<void> {
 	tui.addInputListener((data) => {
 		if (approvals.length && editor.getText() === "") {
 			if (data === "y" || data === "Y") return void answer("allow"), { consume: true };
+			if ((data === "a" || data === "A") && approvals[0]?.folder) return void answer("allow_folder"), { consume: true };
 			if ((data === "a" || data === "A") && !approvals[0]?.once) return void answer("allow_session"), { consume: true };
 			if (data === "n" || data === "N") return void answer("deny"), { consume: true };
 		}

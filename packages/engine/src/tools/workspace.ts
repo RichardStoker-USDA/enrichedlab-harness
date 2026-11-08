@@ -35,6 +35,8 @@ export interface Workspace {
 	exec(command: string, options: { timeoutMs: number; signal: AbortSignal; onOutput?: (text: string) => void; unsandboxed?: boolean; env?: Record<string, string> }): Promise<ExecResult>;
 	/** Set when commands run contained: by the OS ("seatbelt", "bwrap") or in a site's sandbox ("site"). */
 	readonly sandboxed?: string;
+	/** What the session's history can bring back here: "filesystem" (a lab's whole-disk checkpoints) or "folder". */
+	readonly checkpointed?: "filesystem" | "folder";
 	shellName: string;
 	/** Content search done where the files are, for places where reading file by file is slow. */
 	grep?(pattern: string, base: string, options: { glob?: string; ignoreCase?: boolean; limit: number }): Promise<string[]>;

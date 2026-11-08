@@ -42,6 +42,7 @@ private struct GeneralSettings: View {
 				Text("Adds each model's effort setting, the context gauge and speed, full tool output on every step, lab sandboxes and the lab contract check. Everything else works the same.")
 					.foregroundStyle(.secondary)
 			}
+			ApprovalSettings()
 			Section("Engine") {
 				LabeledContent("Version", value: app.engineVersion ?? "not connected")
 				LabeledContent("Data", value: shortPath(app.locator.home.path))
@@ -49,6 +50,60 @@ private struct GeneralSettings: View {
 			}
 		}
 		.formStyle(.grouped)
+	}
+}
+
+/// How much new sessions ask, and the folders EnrichedLab may change or only read.
+private struct ApprovalSettings: View {
+	@Environment(AppModel.self) private var app
+	@State private var folders: [EngineConnection.FolderGrant] = []
+
+	var body: some View {
+		Section {
+			Picker("New sessions", selection: Binding(get: { app.ui.permissionMode }, set: { mode in Task { await app.setDefaultPermissions(mode) } })) {
+				ForEach(PermissionMode.allCases, id: \.self) { mode in
+					VStack(alignment: .leading, spacing: 2) {
+						Text(mode.title)
+						Text(mode.detail).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+					}
+					.tag(mode)
+				}
+			}
+			.pickerStyle(.radioGroup)
+		} header: {
+			Text("Approvals")
+		} footer: {
+			Text("Each session can change this from the shield menu beside its model.").foregroundStyle(.secondary)
+		}
+		Section("Folders") {
+			if folders.isEmpty {
+				Text("EnrichedLab asks about each folder the first time you start a session in it.").foregroundStyle(.secondary)
+			}
+			ForEach(folders) { folder in
+				LabeledContent {
+					Picker("Access", selection: Binding(get: { folder.access }, set: { access in Task { await set(folder.path, access.rawValue) } })) {
+						Text("Change files").tag(FolderAccess.change)
+						Text("Read only").tag(FolderAccess.read)
+					}
+					.labelsHidden()
+					.fixedSize()
+					Button("Forget") { Task { await set(folder.path, "none") } }
+						.help("Ask again the next time a session starts in this folder")
+				} label: {
+					Text(shortPath(folder.path)).lineLimit(1).truncationMode(.middle).help(folder.path)
+				}
+			}
+		}
+		.task { await load() }
+	}
+
+	private func load() async {
+		folders = (try? await app.connection.folders()) ?? []
+	}
+
+	private func set(_ path: String, _ access: String) async {
+		do { _ = try await app.connection.folderAccess(path, set: access) } catch { app.said(error) }
+		await load()
 	}
 }
 

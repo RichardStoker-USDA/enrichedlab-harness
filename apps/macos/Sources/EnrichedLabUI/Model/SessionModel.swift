@@ -179,6 +179,14 @@ public final class SessionModel {
 		}
 	}
 
+	/// How much this session asks: its own mode, else the default for new sessions.
+	public var permissionMode: PermissionMode { summary.permissions.flatMap(PermissionMode.init(rawValue:)) ?? app.ui.permissionMode }
+
+	/// Set how much this session asks; nil returns it to the default.
+	public func setPermissions(_ mode: PermissionMode?) async {
+		do { summary = try await app.connection.setPermissions(id, mode: mode) } catch { app.said(error, prefix: "Couldn't change that") }
+	}
+
 	public func setModel(_ model: String?, effort: String? = nil) async {
 		do { status = try await app.connection.setModel(id, model: model, effort: effort) } catch { app.said(error) }
 	}

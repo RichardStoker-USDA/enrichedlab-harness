@@ -55,7 +55,9 @@ because it is data, not decoration.
   edited geom.py") over the ruled step lines. Edits show their diff; commands show output on demand.
 - Answers: real typesetting. Headings, lists, tables with tabular numbers, block quotes, and code with syntax
   highlighting, a language label and a copy button. Views the agent shows appear as a line that opens their pane.
-- An approval opens inline at its step: the exact command or change, then Decline, Allow for this session, Allow.
+- An approval opens inline at its step: the exact command or change, then Decline, the remembered answer naming what
+  it covers ("Allow “python3” Commands This Session", or "Allow Changes in “project”" for a folder not answered for
+  yet), and Allow Once.
 
 ## The workbench
 

@@ -20,12 +20,33 @@ contained command gets the engine's environment without anything that looks like
 agent socket (`withoutSecrets` in `util.ts`), so `env` or `printenv` show nothing secret. A command the person
 approves to run uncontained gets the whole environment.
 
-"Allow for this session" covers what was asked about and nothing wider. File edits share one answer; each other
-kind of change (a click or typing in the browser, a new app, a memory or skill, a filled PDF, a sandbox download)
-has its own, and edits mode and a session's own worktree run file edits only. In a lab's sandbox, commands and file
+## How much it asks
+
+Each session asks in one of three modes, set for new sessions in Settings and for one session from the shield menu
+beside its model (`permissions.mode` in config.json, `session.permissions` over RPC):
+
+| Mode | Runs without asking | Asks |
+| --- | --- | --- |
+| Ask Before Changes (`ask`) | reads in the project, contained commands that stay in it | file changes, other commands, new hosts |
+| Ask When It Can't Be Undone (`auto`, the default) | also file changes in a folder the person let it change | commands outside the containment, new hosts, changes outside the folder, signed-in browser actions, memory and skills |
+| Allow Everything (`full`) | everything | pushes and unreviewed lab tools |
+
+`auto` rests on history: what runs without asking is what the session's history can take back. The first time a
+session starts in a folder, the window asks once whether EnrichedLab may change files there or only read them
+(`folder.access`, kept in config.json under `folders`; Settings lists them). Listing the folder at that moment brings up
+any macOS privacy prompt then, not mid-task. A question about a change in a folder nobody answered for offers "Allow
+Changes in this folder", which saves the same answer.
+
+"Allow for this session" covers what the button names and nothing wider, and is kept in the session log (an `allow`
+event), so it outlasts a restart. A command is remembered per program it runs (`touch`, `rm`, `git commit`), so
+`python3 a.py | grep x` and `python3 b.py | grep y` share an answer; a command with substitutions or here-documents,
+or one that hands the line to another program (`sudo`, `ssh`, `xargs`, `env`), is remembered exactly. File edits
+share one answer; each other kind of change (a click or typing in the browser, a new app, a memory or skill, a filled
+PDF, a sandbox download) has its own. A session's own worktree runs file edits. In a lab's sandbox, commands and file
 edits inside the project run without asking: the sandbox is a separate machine with no network, and its work comes
-home as a branch the person merges. Commands that change lab data outside the project still ask. An answer about a
-path outside the project covers that path. Pushes and unreviewed lab tools ask every time.
+home as a branch the person merges. Commands that change lab data outside the project ask, unless the lab
+checkpoints the whole sandbox disk (`endpoints.checkpoints`) and the session is in `auto`. An answer about a path
+outside the project covers that path. Pushes and unreviewed lab tools ask every time, in every mode.
 
 A lab sandbox is one Linux container per person at that lab, and the sessions moved there share it: a command in one
 project can read the others'. Keep work that must stay apart in different labs or sandboxes (`el sandbox create`). Hiding reads and blocking the

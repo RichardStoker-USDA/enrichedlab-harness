@@ -151,6 +151,18 @@ public struct RootView: View {
 		} message: { request in
 			Text("“\(request.name)” wants to use your sign-in at \(request.lab). Allow it only if it's a computer you just signed in on.")
 		}
+		.alert(
+			"Let EnrichedLab work in “\(app.folderQuestion?.folder.lastPathComponent ?? "")”?",
+			isPresented: Binding(get: { app.folderQuestion != nil }, set: { if !$0 { app.folderQuestion?.respond(nil) } }),
+			presenting: app.folderQuestion
+		) { question in
+			Button("Allow Changes") { question.respond(.change) }
+			Button("Read Only") { question.respond(.read) }
+			Button("Cancel", role: .cancel) { question.respond(nil) }
+		} message: { question in
+			Text("The agent can read and change files in this folder. Every change is kept in history, so you or the agent can go back to any step, and commands ask before reaching the network.\n\nRead Only asks before every change. You can change this in Settings.")
+				.help(question.folder.path)
+		}
 		.onOpenURL { url in app.openInvite(url) }
 		.task {
 			app.start()

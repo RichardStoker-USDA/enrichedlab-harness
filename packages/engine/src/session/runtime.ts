@@ -17,7 +17,7 @@ import type {
 	ToolCall,
 	Usage,
 } from "@enrichedlab/protocol";
-import type { LabConfig } from "../config.ts";
+import type { LabConfig, PermissionMode } from "../config.ts";
 import { adapterFor, type ModelRegistry, whereOf } from "../models/registry.ts";
 import { ModelHttpError, type ModelProfile, type ToolSchema } from "../models/types.ts";
 import { Checkpoints } from "./checkpoint.ts";
@@ -70,6 +70,8 @@ export interface RuntimeDeps {
 	canvas: CanvasPublisher;
 	notify<N extends keyof Notifications>(name: N, params: Notifications[N]): void;
 	ask(request: PermissionRequest, signal: AbortSignal): Promise<PermissionDecision | "cancelled">;
+	/** Let EnrichedLab change files in a folder from now on (the person answered allow_folder). */
+	grantFolder?(folder: string): void;
 }
 
 type Ev<T extends SessionEvent["t"]> = Extract<SessionEvent, { t: T }>;
@@ -110,6 +112,8 @@ export class SessionRuntime {
 		this.checkpoints = new Checkpoints(join(log.dir, "checkpoints"));
 		this.id = log.id;
 		this.events = log.read();
+		// "Allow for this session" answers outlast a restart: they're in the log.
+		for (const e of this.events) if (e.t === "allow") for (const key of e.keys) this.allowed.add(key);
 		this.meta = log.meta() ?? {
 			id: log.id,
 			cwd: workspace.root,
@@ -233,6 +237,18 @@ export class SessionRuntime {
 	private get discovering(): string | undefined {
 		const site = this.discovery;
 		return site && site === this.place && this.deps.lab?.(site)?.capabilities.includes("discovery") ? site : undefined;
+	}
+
+	/** How much this session asks, when the person set it for this session. */
+	get permissionMode(): PermissionMode | undefined {
+		const last = [...this.events].reverse().find((e) => e.t === "permissions") as Ev<"permissions"> | undefined;
+		return last?.mode;
+	}
+
+	/** Set how much this session asks; undefined returns it to the configured mode. */
+	setPermissionMode(mode: PermissionMode | undefined): void {
+		this.append({ t: "permissions", id: newId("e"), at: now(), ...(mode ? { mode } : {}) });
+		this.touch({ permissions: mode });
 	}
 
 	/** Turn Discovery mode on or off; the engine checks the lab's grant before turning it on. */
@@ -840,7 +856,7 @@ export class SessionRuntime {
 			return { ok: false, content: `The arguments were not valid JSON (${errorText(error)}). Send the call again with valid JSON.`, decision: "refused", tool };
 		}
 		let decision: Ev<"tool">["decision"] = "auto";
-		const verdict = decide(tool, args, this.workspace, this.deps.config(), this.allowed, this.discovering);
+		const verdict = decide(tool, args, this.workspace, this.deps.config(), this.allowed, this.discovering, this.permissionMode);
 		// A read-only subagent is read-only whatever the person's permission mode or sandbox would allow.
 		if (this.agentMode === "read" && !readOnlyCall(tool, args, this.workspace, this.deps.config().permissions.allowCommands)) {
 			return { ok: false, content: "Refused: this subagent works read-only. Say in your answer what should change.", decision: "refused", tool, args };
@@ -854,7 +870,8 @@ export class SessionRuntime {
 				tool: tool.name,
 				view: safeView(tool, args),
 				reason: this.parent ? `A subagent asks: ${verdict.reason}` : verdict.reason,
-				...(verdict.key.includes("!") ? { once: true } : {}),
+				...(verdict.keys.some((key) => key.includes("!")) ? { once: true } : { scope: verdict.scope }),
+				...(verdict.folder && this.deps.grantFolder ? { folder: verdict.folder } : {}),
 			};
 			this.pending.set(request.requestId, request);
 			this.setActivity("waiting", tool.name);
@@ -862,8 +879,12 @@ export class SessionRuntime {
 			this.pending.delete(request.requestId);
 			if (answer === "cancelled") return { ok: false, content: "Cancelled while waiting for the person.", decision: "refused", tool, args };
 			if (answer === "deny") return { ok: false, content: "The person declined this call. Ask what they would like instead, or take another approach.", decision: "denied", tool, args };
-			if (answer === "allow_session" && !verdict.key.includes("!")) this.allowed.add(verdict.key);
-			decision = answer === "allow_session" ? "allowed_session" : "allowed";
+			if (answer === "allow_session" && !verdict.keys.some((key) => key.includes("!"))) {
+				for (const key of verdict.keys) this.allowed.add(key);
+				this.append({ t: "allow", id: newId("e"), at: now(), keys: verdict.keys, scope: verdict.scope });
+			}
+			if (answer === "allow_folder" && verdict.folder) this.deps.grantFolder?.(verdict.folder);
+			decision = answer === "allow" ? "allowed" : "allowed_session";
 			this.setActivity("tool", tool.name);
 		}
 		const hooks = this.deps.config().hooks;

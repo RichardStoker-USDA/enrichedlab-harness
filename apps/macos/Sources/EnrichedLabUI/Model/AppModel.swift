@@ -243,6 +243,8 @@ public final class AppModel {
 	/// Start a session; a `prompt` runs as the first turn once the session is in its place.
 	@discardableResult
 	public func create(folder: URL, place: String, model: String?, prompt: String?, images: [Part]? = nil) async -> String? {
+		// Work on this computer starts in a folder the person has answered for (asked once per folder).
+		if place == "local" || !(sites.first { $0.name == place }?.isolated ?? false), !(await askFolder(folder)) { return nil }
 		var made: String?
 		// A lab that keeps its data inside binds the session to it from the start: its models, its sandbox.
 		let isolated = sites.first { $0.name == place }?.isolated == true
@@ -411,6 +413,40 @@ public final class AppModel {
 		do { ui = try await connection.setUiPrefs(theme: theme) } catch {
 			ui = before
 			said(error, prefix: "Couldn't save that setting")
+		}
+	}
+
+	/// How much new sessions ask.
+	public func setDefaultPermissions(_ mode: PermissionMode) async {
+		let before = ui
+		ui.permissions = mode.rawValue
+		do { ui = try await connection.setUiPrefs(permissions: mode) } catch {
+			ui = before
+			said(error, prefix: "Couldn't save that setting")
+		}
+	}
+
+	/// The question asked once when a folder is added: may EnrichedLab change files there, or only read them.
+	public var folderQuestion: FolderQuestion?
+
+	/// Ask about a folder the person hasn't answered for yet; true once it may be used (changed or read).
+	public func askFolder(_ folder: URL) async -> Bool {
+		if let known = try? await connection.folderAccess(folder.path), known != nil { return true }
+		// Listing it now brings up any macOS privacy prompt for the folder at the start, not halfway through a task.
+		_ = try? FileManager.default.contentsOfDirectory(atPath: folder.path)
+		// One question at a time: a newer one answers an older, unanswered one with cancel.
+		folderQuestion?.respond(nil)
+		let answer: FolderAccess? = await withCheckedContinuation { continuation in
+			folderQuestion = FolderQuestion(folder: folder) { continuation.resume(returning: $0) }
+		}
+		folderQuestion = nil
+		guard let answer else { return false }
+		do {
+			_ = try await connection.folderAccess(folder.path, set: answer.rawValue)
+			return true
+		} catch {
+			said(error, prefix: "Couldn't save your answer for that folder")
+			return false
 		}
 	}
 
@@ -653,4 +689,23 @@ public enum SettingsTab: String, Hashable, CaseIterable {
 func projectFolder(_ cwd: String) -> String {
 	if let range = cwd.range(of: "/.git/enrichedlab-worktrees/") { return String(cwd[..<range.lowerBound]) }
 	return cwd
+}
+
+/// A folder waiting on the person's answer: change its files, only read them, or nil when they cancelled. Answered
+/// once: a second answer (the alert closing after a button) is ignored.
+public final class FolderQuestion: Identifiable {
+	public let folder: URL
+	private var answer: ((FolderAccess?) -> Void)?
+	public var id: String { folder.path }
+
+	init(folder: URL, answer: @escaping (FolderAccess?) -> Void) {
+		self.folder = folder
+		self.answer = answer
+	}
+
+	public func respond(_ access: FolderAccess?) {
+		let pending = answer
+		answer = nil
+		pending?(access)
+	}
 }

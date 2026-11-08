@@ -17,6 +17,8 @@ import SwiftUI
 /// EL_SCENE_UNTIL    streaming (a long tool call is arriving), question (it asks), or done (allowed, then finished)
 /// EL_SCENE_OPEN     a file in the session's folder to open as a view (a dashboard, say)
 /// EL_SCENE_DRAG     window or divider: drag the window's edge, or the workbench's divider, in small steps as a person would
+/// EL_SCENE_SEND     a message sent in the opened session; the scene waits for its first question
+/// EL_SCENE_FOLDER   a folder to ask about, as the first session there does (the question stays open)
 @MainActor
 enum Automation {
 	static var active: Bool { ProcessInfo.processInfo.environment["EL_SCENE"] != nil }
@@ -31,6 +33,10 @@ enum Automation {
 		if let size = env["EL_SCENE_SIZE"]?.split(separator: "x").compactMap({ Double($0) }), size.count == 2, let window = mainWindow {
 			window.setContentSize(NSSize(width: size[0], height: size[1]))
 			window.center()
+		}
+		if let folder = env["EL_SCENE_FOLDER"] {
+			Task { _ = await app.askFolder(URL(fileURLWithPath: folder)) }
+			try? await Task.sleep(for: .milliseconds(600))
 		}
 		if let prompt = env["EL_SCENE_PROMPT"] { await live(app: app, prompt: prompt, until: env["EL_SCENE_UNTIL"] ?? "done") }
 		if let id = env["EL_SCENE_SESSION"] {
@@ -49,6 +55,11 @@ enum Automation {
 				if let view = session.canvases.first { session.showView(view.id) }
 			default: break
 			}
+		}
+		if let text = env["EL_SCENE_SEND"], let session = app.session {
+			_ = await session.send(text)
+			for _ in 0 ..< 300 where session.pending.isEmpty { try? await Task.sleep(for: .milliseconds(100)) }
+			print("scene: sent; \(session.pending.count) question(s): \(session.pending.first?.reason ?? "none")")
 		}
 		if let path = env["EL_SCENE_OPEN"], let session = app.session {
 			await session.openFile(path.hasPrefix("/") ? path : "\(session.summary.cwd)/\(path)")
@@ -137,6 +148,14 @@ enum Automation {
 				if first == nil { opening = max(opening, stall) } else { streaming = max(streaming, stall) }
 			}
 		}
+		// The first session in a folder asks about it: a live scene lets the agent change files there.
+		let answering = Task { @MainActor in
+			while !Task.isCancelled {
+				app.folderQuestion?.respond(.change)
+				try? await Task.sleep(for: .milliseconds(50))
+			}
+		}
+		defer { answering.cancel() }
 		let sent = clock.now
 		guard await app.create(folder: URL(fileURLWithPath: folder), place: "local", model: nil, prompt: prompt) != nil else { print("scene: live: not started"); return }
 		var answered = false
