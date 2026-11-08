@@ -48,8 +48,8 @@ public struct RootView: View {
 	/// Room for the workbench when it opens: a wider window when the screen allows (as macOS does), else the
 	/// sidebar steps aside.
 	private func makeRoom() {
-		guard width > 0, width < roomy - 1, columns != .detailOnly else { return }
-		if let window, let screen = window.screen, !window.styleMask.contains(.fullScreen) {
+		guard width > 0, width < roomy - 1 else { return }
+		if columns != .detailOnly, let window, let screen = window.screen, !window.styleMask.contains(.fullScreen) {
 			let visible = screen.visibleFrame
 			var frame = window.frame
 			// The frame is a little wider than the content (the window's edges).
@@ -69,8 +69,9 @@ public struct RootView: View {
 				return
 			}
 		}
-		asideSidebar()
-		// Without the sidebar, widen as far as the screen allows toward what the run sheet and workbench need.
+		// The sidebar steps aside (if it shows), then the window widens as far as the screen allows toward what the run
+		// sheet and workbench need.
+		if columns != .detailOnly { asideSidebar() }
 		if let window, let screen = window.screen, !window.styleMask.contains(.fullScreen) {
 			let visible = screen.visibleFrame
 			var frame = window.frame
