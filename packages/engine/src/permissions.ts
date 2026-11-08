@@ -12,7 +12,7 @@
 import { lstatSync, readlinkSync, realpathSync, statSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import type { FolderAccess, LabConfig, PermissionMode } from "./config.ts";
-import { isReadOnlyCommand, type Judging, pathsInside } from "./tools/shell.ts";
+import { isReadOnlyCommand, type Judging, pathsInside, personAllows } from "./tools/shell.ts";
 import { everyCommand, plainCommands } from "./tools/shell_syntax.ts";
 import type { Tool } from "./tools/types.ts";
 import { isOpenPort } from "./sites/port_proxy.ts";
@@ -202,9 +202,12 @@ const GIT_COMMANDS = new Set(("add am annotate apply archive bisect blame branch
 /** git options whose value is the next word. */
 const GIT_VALUE_OPTIONS = new Set(["-c", "-C", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env", "--list-cmds", "--attr-source"]);
 /** Settings that make git run a program (or rename a command): set on the command line, git could push unseen. */
-const GIT_RUNS = /^(alias\.|core\.(sshcommand|fsmonitor|pager|editor|askpass|hookspath|gitproxy)|diff\.|filter\.|merge\.|gpg\.|credential\.|uploadpack\.|receivepack\.|sequence\.|interactive\.|remote\.|protocol\.|url\.|include)/i;
+const GIT_RUNS = /^(alias\.|core\.(sshcommand|fsmonitor|pager|editor|askpass|hookspath|gitproxy|alternaterefscommand)|diff\.|filter\.|merge\.|gpg\.|credential\.|uploadpack\.|receivepack\.|sequence\.|interactive\.|remote\.|protocol\.|url\.|include|pager\.|log\.showsignature|submodule\.)/i;
 /** Programs that never run their arguments, so a shell's name among them is just a name. */
-const NON_RUNNING = new Set(["ls", "cat", "head", "tail", "wc", "echo", "printf", "which", "whereis", "type", "file", "stat", "grep", "egrep", "fgrep", "sort", "cut", "tr", "diff", "cmp", "basename", "dirname", "realpath", "readlink", "nl", "jq", "bat", "eza", "tree", "du", "df", "man", "apropos", "whatis", "test", "[", "true", "false", "pwd", "date", "uname", "id", "whoami"]);
+// Not sort (--compress-program), bat (--pager), man (a pager) or find (-exec): those can run a program.
+const NON_RUNNING = new Set(["ls", "cat", "head", "tail", "wc", "echo", "printf", "which", "whereis", "type", "file", "stat", "grep", "egrep", "fgrep", "cut", "tr", "diff", "cmp", "basename", "dirname", "realpath", "readlink", "nl", "jq", "eza", "tree", "du", "df", "apropos", "whatis", "test", "[", "true", "false", "pwd", "date", "uname", "id", "whoami"]);
+/** Programs that run the program named in their arguments: an expanded word there could be git. */
+const WRAPPERS = new Set(["command", "builtin", "exec", "env", "xargs", "nice", "nohup", "timeout", "sudo", "doas", "time", "stdbuf", "ionice", "chrt", "taskset", "setsid", "flock", "watch", "parallel", "script", "unbuffer", "caffeinate", "arch", "ssh", "su", "runuser", "find", "fd"]);
 
 /** A glob pattern as a regular expression for one name, as bash matches it. */
 function patternRegex(pattern: string): RegExp | undefined {
@@ -259,6 +262,11 @@ function publishing(command: string, depth = 0): "push" | "hidden" | undefined {
 		if (assigns.some((a) => /^GIT_/.test(a))) hidden = true;
 		if (!argv.length) continue;
 		if (argv[0] === undefined || patterns[0] !== undefined) hidden = true;
+		const lead = argv[0] === undefined ? "" : argv[0].replace(/^.*\//, "");
+		// A wrapper given an expanded word (command "$CMD" push), env splitting a string into a command (env -S), or
+		// git settings handed to env (env GIT_SSH_COMMAND=...): what runs depends on more than the line.
+		if (WRAPPERS.has(lead) && argv.includes(undefined)) hidden = true;
+		if (lead === "env" && argv.some((w) => w !== undefined && (/^(-[a-zA-Z]*S|--split-string)/.test(w) || /^GIT_/.test(w)))) hidden = true;
 		for (let i = 0; i < argv.length; i++) {
 			if (could(argv[i], patterns[i], ["git", "git.exe"])) {
 				sawGit = true;
@@ -267,6 +275,8 @@ function publishing(command: string, depth = 0): "push" | "hidden" | undefined {
 					const w = argv[j];
 					if (w === undefined) break;
 					if (w === "-c" && (argv[j + 1] === undefined || GIT_RUNS.test(argv[j + 1]!))) hidden = true;
+					// Attached forms: -cname=value, --config-env=..., --exec-path=...
+					if (/^-c./.test(w) && GIT_RUNS.test(w.slice(2))) hidden = true;
 					if (/^--(exec-path|config-env)(=|$)/.test(w)) hidden = true;
 					if (GIT_VALUE_OPTIONS.has(w)) j++;
 					else if (!w.startsWith("-")) break;
@@ -304,6 +314,13 @@ function publishing(command: string, depth = 0): "push" | "hidden" | undefined {
 			}
 		}
 		for (const w of argv) if (w !== undefined) words.push(w);
+		// A word that is itself a command line (a pager, an editor, env -S, --compress-program) is read as one too.
+		for (const w of argv) {
+			if (w === undefined || !/\s/.test(w) || depth >= 3) continue;
+			const inner = publishing(w, depth + 1);
+			if (inner === "push") return "push";
+			if (inner === "hidden" && everyCommand(w)) hidden = true;
+		}
 	}
 	words.push(...line.heredocs);
 	const text = words.join(" ");
@@ -495,7 +512,9 @@ export function decide(tool: Tool, args: Record<string, unknown>, workspace: Wor
 			const edit = keys[0] === "write";
 			// File edits in a session's own worktree go to its own branch, and work in a lab's sandbox comes home as a
 			// branch: the person reviews them when they merge.
-			if (edit && (ownWorktree(workspace) || workspace.sandboxed === "site")) return { action: "run" };
+			if (edit && ownWorktree(workspace)) return { action: "run" };
+			// In a lab's sandbox, file edits run under its fence; where the fence doesn't hold, each one asks.
+			if (edit && workspace.sandboxed === "site") return workspace.fenced === true ? { action: "run" } : ask("This lab's sandbox can't fence file changes (no Landlock 3 or root-owned python3 there), so each one asks.");
 			if (mode === "auto" && edit) {
 				// Kept in history, so it can be taken back: runs where the person let EnrichedLab change the folder.
 				if (!local || targetAccess === "change") return { action: "run" };
@@ -522,8 +541,12 @@ export function decide(tool: Tool, args: Record<string, unknown>, workspace: Wor
 			const inside = (path: string) => workspace.inside(path);
 			// Without history (its store failed) a contained change can't be taken back either: it asks.
 			if (contained && recoverable && !(local && readOnlyWithin(config, workspace.root)) && pathsInside(command, inside, lab || process.platform !== "win32", false, judging)) return lab ? { action: "run", fence: true } : { action: "run" };
-			// A read in a fenced lab sandbox runs under the fence too.
-			if (isReadOnlyCommand(command, config.permissions.allowCommands, inside, judging)) return fenced ? { action: "run", fence: true } : { action: "run" };
+			// Reads run unasked only where they run contained (here under the OS sandbox, or under a lab's fence): what a
+			// program does can't be read from its words, so nothing runs uncontained without a yes, except what the
+			// person listed in allowCommands.
+			const runsContained = fenced || Boolean(local && workspace.sandboxed && FULL_CONTAINMENT.has(workspace.sandboxed) && args.unsandboxed !== true);
+			if (runsContained && isReadOnlyCommand(command, config.permissions.allowCommands, inside, judging)) return fenced ? { action: "run", fence: true } : { action: "run" };
+			if (personAllows(command, config.permissions.allowCommands)) return { action: "run" };
 			// In a lab's sandbox whose whole disk is checkpointed, any command can be taken back.
 			if (mode === "auto" && workspace.kind === "sandbox" && workspace.checkpointed === "filesystem" && args.unsandboxed !== true) return { action: "run" };
 			const reads = isReadOnlyCommand(command, config.permissions.allowCommands, () => true);

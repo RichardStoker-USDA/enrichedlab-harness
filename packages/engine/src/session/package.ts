@@ -176,7 +176,7 @@ function readPackaged(folder: string, id: string): Buffer | undefined {
 	if (!packaged(folder, id)) return undefined;
 	let fd: number;
 	try {
-		fd = openPhysical(join(physical(folder), id), constants.O_RDONLY);
+		fd = openPhysical(join(folder, id), constants.O_RDONLY);
 	} catch {
 		return undefined;
 	}
@@ -201,7 +201,9 @@ export function writePackage(folder: string, input: PackageInput): { files: numb
 
 	file("session.jsonl", Buffer.from(input.log.map((e) => JSON.stringify(e)).join("\n") + "\n"), { name: "Session log", description: "Every message, model step with its full reasoning, tool call and output, in the shared log format v1.", encodingFormat: "application/jsonl" });
 	for (const [hash, image] of Object.entries(input.attachments)) {
-		file(`images/${hash}.${image.mime.split("/")[1] ?? "bin"}`, Buffer.from(image.data, "base64"), { encodingFormat: image.mime });
+		// Names from the log are made safe for a path: hex for the hash, letters and digits for the type.
+		const name = `${hash.replace(/[^0-9a-f]/gi, "").slice(0, 128) || "image"}.${(image.mime.split("/")[1] ?? "bin").replace(/[^a-z0-9]/gi, "").slice(0, 16) || "bin"}`;
+		file(`images/${name}`, Buffer.from(image.data, "base64"), { encodingFormat: image.mime });
 	}
 
 	const local = !input.summary.place || input.summary.place === "local";
@@ -381,7 +383,9 @@ export interface CheckRow {
 }
 
 /** Check a run package: every file against its checksum, the history bundle, and every content id the steps name. */
-export function verifyPackage(folder: string): CheckRow[] {
+export function verifyPackage(given: string): CheckRow[] {
+	// Where the package really is, resolved once: every read below is beneath this, never a fresh lookup of the name.
+	const folder = physical(given);
 	const rows: CheckRow[] = [];
 	const meta = readPackaged(folder, "ro-crate-metadata.json");
 	if (!meta) return [{ check: "metadata", ok: false, detail: "no ro-crate-metadata.json as a plain file in the package" }];
@@ -455,7 +459,8 @@ const SKIP = [".git", "node_modules", ".venv", "venv", ".pixi", "__pycache__", "
  * environment. Links in the history come out as plain files. `prepare` runs first (e.g. to build the project's
  * environment). Then every file is compared with what the step left. The scratch folder is removed afterwards.
  */
-export async function reproduceStep(folder: string, step: string, options: { prepare?: (dir: string) => Promise<void>; timeoutMs?: number } = {}): Promise<Reproduced> {
+export async function reproduceStep(given: string, step: string, options: { prepare?: (dir: string) => Promise<void>; timeoutMs?: number } = {}): Promise<Reproduced> {
+	const folder = physical(given);
 	const meta = readPackaged(folder, "ro-crate-metadata.json");
 	if (!meta) throw new Error("The package has no ro-crate-metadata.json as a plain file.");
 	const graph = (JSON.parse(meta.toString("utf8")) as { "@graph": Entity[] })["@graph"];

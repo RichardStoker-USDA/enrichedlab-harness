@@ -231,7 +231,9 @@ function seatbeltProfile(writable: string[], network: NetworkAccess, readable: s
  * credential folders hidden, the network as given. Returned unchanged where this computer has no facility
  * (Windows today); `facility` says which one applied. */
 /** `temp: false` leaves the system's temp folders out of what may be written (a replay writes only its own folder). */
-export function contained(file: string, args: string[], options: { writable: string[]; network: NetworkAccess; readable?: string[]; server?: boolean; temp?: boolean }): { file: string; args: string[]; facility?: Facility } {
+/** `exact`: each writable path must already be where it leads (physical); one that now leads elsewhere refuses. */
+export function contained(file: string, args: string[], options: { writable: string[]; network: NetworkAccess; readable?: string[]; server?: boolean; temp?: boolean; exact?: boolean }): { file: string; args: string[]; facility?: Facility } {
+	if (options.exact) for (const p of options.writable) if (real(p) !== p) throw new Error(`${p} now leads somewhere else (a link may have moved); nothing ran.`);
 	const facility = sandboxer();
 	if (!facility) return { file, args };
 	if (facility === "restricted-token") {
@@ -290,6 +292,7 @@ export class LocalWorkspace implements Workspace {
 	}
 
 	resolve(path: string): string {
+		if (path.includes("\0")) throw new Error("A path can't hold a NUL character.");
 		const expanded = path === "~" ? homedir() : path.startsWith("~/") ? join(homedir(), path.slice(2)) : path;
 		const joined = isAbsolute(expanded) ? expanded : `${this.root}${sep}${expanded}`;
 		// A ".." goes where the system takes it (after following the link before it), the same way inside() judges it,
@@ -393,7 +396,10 @@ export class LocalWorkspace implements Workspace {
 			throw new Error(`${this.display(full)} changed while it was being written (a link may have moved); nothing was written.`);
 		}
 		try {
-			if (!fstatSync(fd).isFile()) throw new Error(`${this.display(full)} isn't a file; nothing was written.`);
+			const opened = fstatSync(fd);
+			if (!opened.isFile()) throw new Error(`${this.display(full)} isn't a file; nothing was written.`);
+			// Another name for the same file (a hard link) may sit outside the project: writing here would change it there.
+			if (opened.nlink > 1 && !options.outside) throw new Error(`${this.display(full)} has another name elsewhere (a hard link); nothing was written.`);
 			ftruncateSync(fd, 0);
 			writeSync(fd, typeof data === "string" ? Buffer.from(data) : data, 0, undefined, 0);
 		} finally {

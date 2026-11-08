@@ -48,7 +48,7 @@ const tool = (callId: string, content: string, handle?: string): SessionEvent =>
 /** What a sandbox where Landlock holds prints for the fence probe: its one-time code back. */
 function probeAnswer(command: string): string {
 	const nonce = /probe '([0-9a-f]+)'/.exec(command)?.[1];
-	return nonce ? `el-fence ok ${nonce} abi 6\n` : "";
+	return nonce ? `el-fence ok ${nonce} abi 6 py /usr/bin/python3\n` : "";
 }
 
 /** A lab sandbox whose fence probe reports that Landlock holds. */

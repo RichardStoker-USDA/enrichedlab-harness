@@ -125,7 +125,7 @@ Scientists validate everything, so every step has to be readable and repeatable.
   and only the session refs fetched; every content id must be the kind of object it names (a commit for a history
   point, a blob for a file). Export copies a changed file only when it is a plain file inside the project, read the
   same link-free way, so a file swapped for a link to somewhere else is left out. On Linux, the rerun's private
-  `/tmp` and `/run` are read-only. A lab session's files stay in the lab; its
+  `/tmp` and `/run` are read-only. The package folder is resolved once, and every read is beneath that. A lab session's files stay in the lab; its
   receipts are in the log.
 
 ## Desktops

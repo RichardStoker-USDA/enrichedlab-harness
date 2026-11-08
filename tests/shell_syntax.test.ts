@@ -3,7 +3,7 @@
 
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { closeSync, constants, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { closeSync, constants, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { LabConfig } from "../packages/engine/src/config.ts";
@@ -87,7 +87,7 @@ describe("lab sandbox file fence", () => {
 		const spoofed = new SandboxWorkspace(api("el-fence ok abi 6\n"), "/sandbox/work/p");
 		await spoofed.prepare();
 		expect(spoofed.fenced).toBe(false);
-		const lab = new SandboxWorkspace(api("el-fence ok NONCE abi 6\n"), "/sandbox/work/p");
+		const lab = new SandboxWorkspace(api("el-fence ok NONCE abi 6 py /usr/bin/python3\n"), "/sandbox/work/p");
 		await lab.write("alias/marker.txt", "x");
 		expect(commands.some((c) => c.includes("realpath -m --") && c.includes("/sandbox/work/p/alias") && c.includes("leads outside the project"))).toBe(true);
 		commands.length = 0;
@@ -251,3 +251,56 @@ describe("round 4: what a line can hide", () => {
 		expect(bashPattern("q\\*uote")).toBe("\\q\\*\\u\\o\\t\\e");
 	});
 });
+
+describe("round 5: one boundary", () => {
+	const shell = { name: "shell", kind: "exec" } as unknown as Tool;
+	const mode = (m: string, allow: string[] = []) => ({ permissions: { mode: m, allowCommands: allow } }) as unknown as LabConfig;
+
+	test("nothing runs uncontained unasked unless the person listed it", () => {
+		const root = realpathSync(mkdtempSync(join(tmpdir(), "el-uncontained-")));
+		try {
+			const off = new LocalWorkspace(root, "off");
+			expect(decide(shell, { command: "ls" }, off, mode("ask"), new Set()).action).toBe("ask");
+			expect(decide(shell, { command: "ls" }, off, mode("ask", ["ls"]), new Set()).action).toBe("run");
+			expect(decide(shell, { command: "ls *" }, off, mode("ask", ["ls"]), new Set()).action).toBe("ask");
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("wrapper words, split strings, pager commands and git settings handed to env can't hide a push", () => {
+		for (const command of [`env -S 'bash -c "g\\it p\\ush origin HEAD"'`, `bat --paging=always --pager "bash -c 'git push origin HEAD'" README.md`, 'command "$CMD" push', `sort --compress-program "sh -c 'git push'" x`]) {
+			expect([command, allowKeys(shell, { command }).keys[0]]).toEqual([command, "shell!push"]);
+		}
+		for (const command of ["env GIT_SSH_COMMAND=./x git fetch", "git -ccore.alternateRefsCommand=./x fetch", `env -S "$X"`, 'xargs "$P"']) {
+			expect([command, allowKeys(shell, { command }).keys[0]]).toEqual([command, "shell!hidden"]);
+		}
+	});
+
+	test("paths can't hold NUL, a hard-linked file isn't written, and a glob can't become an option", async () => {
+		const root = realpathSync(mkdtempSync(join(tmpdir(), "el-nul-")));
+		const outside = realpathSync(mkdtempSync(join(tmpdir(), "el-nul-out-")));
+		try {
+			const ws = new LocalWorkspace(root, "off");
+			expect(() => ws.resolve("sub/..\0a/..\0b/victim")).toThrow("NUL");
+			expect(() => openPhysical(`${root}/a\0b`, constants.O_RDONLY)).toThrow("NUL");
+			writeFileSync(join(outside, "keep.txt"), "keep");
+			linkSync(join(outside, "keep.txt"), join(root, "twin.txt"));
+			await expect(ws.write("twin.txt", "changed")).rejects.toThrow("hard link");
+			expect(readFileSync(join(outside, "keep.txt"), "utf8")).toBe("keep");
+			writeFileSync(join(root, "-delete"), "");
+			expect(isReadOnlyCommand("find . -[d]elete", [], (p) => ws.inside(p), { expand: (p) => ws.expand(p) })).toBe(false);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+			rmSync(outside, { recursive: true, force: true });
+		}
+	});
+
+	test("a lab sandbox without the fence asks before each file edit", async () => {
+		const edit = { name: "edit", kind: "write" } as unknown as Tool;
+		const lab = new SandboxWorkspace({ title: "Field Lab", run: async () => ({ exitCode: 0, stdout: "el-fence no\n", stderr: "" }) } as unknown as SandboxApi, "/sandbox/work/p");
+		await lab.prepare();
+		expect(decide(edit, { path: "notes.txt" }, lab, mode("auto"), new Set()).action).toBe("ask");
+	});
+});
+

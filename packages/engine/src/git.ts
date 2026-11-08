@@ -10,7 +10,8 @@ import { join } from "node:path";
 import { SECRET_NAME } from "./util.ts";
 
 function git(cwd: string, args: string[], env?: Record<string, string>): string {
-	return execFileSync("git", args, { cwd, env: { ...process.env, ...env, GIT_TERMINAL_PROMPT: "0" }, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+	// The engine's own git work in the project never runs the repository's hooks or fsmonitor program.
+	return execFileSync("git", ["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", ...args], { cwd, env: { ...process.env, ...env, GIT_TERMINAL_PROMPT: "0" }, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 }
 
 /** The repository's top folder, or undefined outside git. */

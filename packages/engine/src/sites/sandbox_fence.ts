@@ -8,8 +8,8 @@
 // covered by Landlock. A sandbox whose kernel or image can't fence (an older Landlock, no root-owned python3) says
 // so when probed, and its commands ask instead.
 
-/** The interpreter the fence runs with: the system's own, which the sandbox user can't replace. */
-export const FENCE_PYTHON = "/usr/bin/python3";
+/** Interpreters the fence may run with: the image's own, root-owned and writable by nobody else (checked in the probe). */
+export const FENCE_PYTHONS = ["/usr/bin/python3", "/usr/local/bin/python3"];
 
 /**
  * The Landlock program. `probe <nonce>`: fences a child to one folder and checks that it can't truncate, write,
@@ -21,9 +21,9 @@ import ctypes, os, shutil, signal, sys, tempfile
 NR = (444, 445, 446)
 WRITE_FILE, REMOVE_DIR, REMOVE_FILE = 1 << 1, 1 << 4, 1 << 5
 MAKE = sum(1 << b for b in range(6, 13))
-REFER, TRUNCATE = 1 << 13, 1 << 14
-EVERY = WRITE_FILE | REMOVE_DIR | REMOVE_FILE | MAKE | REFER | TRUNCATE
-FILE_RIGHTS = WRITE_FILE | TRUNCATE
+REFER, TRUNCATE, IOCTL_DEV = 1 << 13, 1 << 14, 1 << 15
+EVERY = WRITE_FILE | REMOVE_DIR | REMOVE_FILE | MAKE | REFER | TRUNCATE | IOCTL_DEV
+FILE_RIGHTS = WRITE_FILE | TRUNCATE | IOCTL_DEV
 libc = ctypes.CDLL(None, use_errno=True)
 libc.syscall.restype = ctypes.c_long
 L = ctypes.c_long
@@ -45,7 +45,8 @@ def fence(rules):
     v = abi()
     if v < 3:
         raise OSError("Landlock ABI %d; 3 or later is needed" % v)
-    attr = Ruleset(EVERY, 3 if v >= 4 else 0, 3 if v >= 6 else 0)
+    handled = EVERY if v >= 5 else EVERY & ~IOCTL_DEV
+    attr = Ruleset(handled, 3 if v >= 4 else 0, 3 if v >= 6 else 0)
     size = 8 if v < 4 else (16 if v < 6 else 24)
     fd = libc.syscall(L(NR[0]), ctypes.byref(attr), L(size), L(0))
     if fd < 0:
@@ -56,7 +57,7 @@ def fence(rules):
             parent = target if opened else os.open(target, os.O_PATH | os.O_CLOEXEC | os.O_NOFOLLOW)
         except OSError:
             continue
-        rule = Beneath(rights, parent)
+        rule = Beneath(rights & handled, parent)
         r = libc.syscall(L(NR[1]), L(fd), L(1), ctypes.byref(rule), L(0))
         if not opened:
             os.close(parent)
@@ -106,7 +107,7 @@ def probe(nonce):
         with open(existing) as f:
             kept = f.read() == "keep"
         held = os.waitstatus_to_exitcode(status) == 0 and kept and os.path.exists(os.path.join(inside, "ok")) and sorted(os.listdir(outside)) == ["existing"]
-        print("el-fence %s %s abi %d" % ("ok" if held else "no", nonce, abi()))
+        print("el-fence %s %s abi %d py %s" % ("ok" if held else "no", nonce, abi(), sys.executable))
     finally:
         shutil.rmtree(base, ignore_errors=True)
 
@@ -117,10 +118,11 @@ def run(root, command):
     if not os.path.isdir(root) or os.path.islink(root) or (named.st_dev, named.st_ino) != (started.st_dev, started.st_ino):
         raise OSError("the project folder isn't the folder the command started in")
     temp = tempfile.mkdtemp(prefix="el-fence-")
+    own = os.open(temp, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
     try:
         env = {k: v for k, v in os.environ.items() if k not in DROP and not k.startswith("BASH_FUNC_") and not v.startswith("() {")}
         env.update(TMPDIR=temp, TMP=temp, TEMP=temp)
-        rules = [(here, EVERY), (os.open(temp, os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC), EVERY)] + [(d, FILE_RIGHTS) for d in DEVICES if os.path.exists(d)]
+        rules = [(here, EVERY), (own, EVERY)] + [(d, FILE_RIGHTS) for d in DEVICES if os.path.exists(d)]
         pid = os.fork()
         if pid == 0:
             try:
@@ -156,11 +158,26 @@ else:
 `;
 
 /** Runs the probe with the system's python3 when it is root-owned and writable only by root; else says "no". */
+/** The interpreter starts without loader variables, so nothing runs in it before the fence is set. */
+const CLEAN = "env -u LD_PRELOAD -u LD_AUDIT -u LD_LIBRARY_PATH -u PYTHONHOME -u PYTHONPATH";
+
+/** Probes with the first interpreter that is root-owned, in a root-owned folder, and writable only by root. */
 export function probeCommand(nonce: string, quote: (text: string) => string): string {
-	return `if [ -x ${FENCE_PYTHON} ] && [ "$(stat -L -c %u ${FENCE_PYTHON})" = 0 ] && [ "$(stat -L -c %u /usr/bin)" = 0 ] && [ $(( 0$(stat -L -c %a ${FENCE_PYTHON}) & 022 )) = 0 ]; then ${FENCE_PYTHON} -I -c ${quote(FENCE_PY)} probe ${quote(nonce)}; else echo "el-fence no"; fi`;
+	const ok = (py: string) => `[ -x ${py} ] && [ "$(stat -L -c %u ${py})" = 0 ] && [ "$(stat -L -c %u $(dirname ${py}))" = 0 ] && [ $(( 0$(stat -L -c %a ${py}) & 022 )) = 0 ] && [ $(( 0$(stat -L -c %a $(dirname ${py})) & 022 )) = 0 ]`;
+	const pick = FENCE_PYTHONS.map((py) => `if [ -z "$__el_py" ] && ${ok(py)}; then __el_py=${py}; fi`).join("; ");
+	return `__el_py=; ${pick}; if [ -n "$__el_py" ]; then ${CLEAN} "$__el_py" -I -c ${quote(FENCE_PY)} probe ${quote(nonce)}; else echo "el-fence no"; fi`;
 }
 
-/** The command fenced: the project is `root`, which must be the folder the shell is in. */
-export function fencedCommand(root: string, command: string, quote: (text: string) => string): string {
-	return `${FENCE_PYTHON} -I -c ${quote(FENCE_PY)} run ${quote(root)} ${quote(command)}`;
+/** The interpreter a probe answer names, when it is one the fence may use; undefined otherwise. */
+export function fencePython(line: string, nonce: string): string | undefined {
+	const m = new RegExp(`^el-fence ok ${nonce} abi \\d+ py (\\S+)$`).exec(line.trim());
+	const py = m?.[1];
+	if (!py) return undefined;
+	// python3 may be a link to python3.x in the same folder: the probe ran it by the name it was checked under.
+	return FENCE_PYTHONS.find((name) => py === name || (py.startsWith(name.slice(0, name.lastIndexOf("/") + 1)) && /\/python3(\.\d+)?$/.test(py))) ? py : undefined;
+}
+
+/** The command fenced with the interpreter the probe checked: the project is `root`, the folder the shell is in. */
+export function fencedCommand(root: string, command: string, quote: (text: string) => string, python = FENCE_PYTHONS[0]!): string {
+	return `${CLEAN} ${python} -I -c ${quote(FENCE_PY)} run ${quote(root)} ${quote(command)}`;
 }

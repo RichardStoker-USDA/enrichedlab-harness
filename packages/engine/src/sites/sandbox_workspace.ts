@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { posix } from "node:path";
 import type { Entry, ExecResult, Workspace } from "../tools/workspace.ts";
-import { fencedCommand, probeCommand } from "./sandbox_fence.ts";
+import { fencedCommand, fencePython, probeCommand } from "./sandbox_fence.ts";
 
 /** What a site's sandbox offers. Gate implements it; other lab adapters will too. */
 export interface SandboxApi {
@@ -115,6 +115,7 @@ export class SandboxWorkspace implements Workspace {
 	}
 
 	private fenceHolds = false;
+	private fencePy?: string;
 
 	/** Commands can run under the file fence: a probe in this sandbox showed Landlock holds (sandbox_fence.ts). */
 	get fenced(): boolean {
@@ -127,7 +128,9 @@ export class SandboxWorkspace implements Workspace {
 		const nonce = randomBytes(12).toString("hex");
 		this.ready ??= this.api.run(`mkdir -p ${shq(this.root)} && cd ${shq(this.root)} && { ${probeCommand(nonce, shq)}; }`, 60).then((r) => {
 			if (r.exitCode !== 0 && !/el-fence/.test(r.stdout)) throw new Error(`Couldn't make ${this.root} in the ${this.api.title} sandbox: ${r.stderr || r.stdout}`);
-			this.fenceHolds = r.stdout.split("\n").some((line) => line.startsWith(`el-fence ok ${nonce} `));
+			// Only a line with this probe's code counts, naming an interpreter the fence may use.
+			this.fencePy = r.stdout.split("\n").map((line) => fencePython(line, nonce)).find(Boolean);
+			this.fenceHolds = this.fencePy !== undefined;
 		});
 		// A failed start is tried again next time.
 		this.ready.catch(() => (this.ready = undefined));
@@ -140,6 +143,7 @@ export class SandboxWorkspace implements Workspace {
 	}
 
 	resolve(path: string): string {
+		if (path.includes("\0")) throw new Error("A path can't hold a NUL character.");
 		return posix.normalize(posix.isAbsolute(path) ? path : posix.join(this.root, path));
 	}
 
@@ -212,7 +216,7 @@ export class SandboxWorkspace implements Workspace {
 		// whatever a link on the way does; the folder check above still refuses early.
 		await this.prepare();
 		const fence = this.fenced && !options.outside;
-		const step = (command: string, seconds: number) => this.run(fence ? fencedCommand(this.root, command, shq) : command, seconds);
+		const step = (command: string, seconds: number) => this.run(fence ? fencedCommand(this.root, command, shq, this.fencePy) : command, seconds);
 		const upload = async () => {
 			const scratch = await mkdtemp(join(tmpdir(), "enrichedlab-write-"));
 			try {
@@ -257,7 +261,7 @@ export class SandboxWorkspace implements Workspace {
 		const words = options.fence?.length
 			? `__el_root=$(pwd -P); for __el_p in ${options.fence.map((w) => (w.pattern ? bashPattern(w.pattern) : shq(w.text))).join(" ")}; do __el_r=$(realpath -m -- "$__el_p" 2>/dev/null || readlink -f -- "$__el_p" 2>/dev/null); case "$__el_r" in "$__el_root"|"$__el_root"/*) ;; *) echo "EnrichedLab: $__el_p leads outside the project; a command that reaches there needs the person's yes." >&2; exit 126;; esac; done; `
 			: "";
-		const body = options.fence ? fencedCommand(this.root, command, shq) : command;
+		const body = options.fence ? fencedCommand(this.root, command, shq, this.fencePy) : command;
 		// One group after the cd, so nothing in it runs if the cd fails.
 		const r = await this.run(options.fence ? `{ ${words}${body}\n}` : command, Math.max(1, Math.round(options.timeoutMs / 1000)), options.signal);
 		const output = [r.stdout, r.stderr].filter(Boolean).join(r.stdout && r.stderr ? "\n" : "");

@@ -67,7 +67,8 @@ function eachName(text: string, pattern: string | undefined, ok: (path: string) 
 	if (couldClimb(pattern)) return false;
 	if (judging.expand) {
 		const matches = judging.expand(pattern);
-		if (!matches) return false;
+		// A name starting with "-" becomes an option once the shell expands it (find -[d]elete): not a path to judge.
+		if (!matches || matches.some((m) => m.replace(/^.*\//, "").startsWith("-"))) return false;
 		// No match: bash passes the pattern on as it is.
 		return matches.length ? matches.every(ok) : ok(text);
 	}
@@ -78,6 +79,12 @@ function eachName(text: string, pattern: string | undefined, ok: (path: string) 
 
 
 const looksLikePath = (t: string) => /^(~|\/|\\\\|[A-Za-z]:[\\/])/.test(t) || /(^|[\\/])\.\.([\\/]|$)/.test(t);
+
+/** True when the command is one the person listed in allowCommands (a whole word prefix, nothing chained). */
+export function personAllows(command: string, extra: string[]): boolean {
+	const text = command.trim();
+	return Boolean(text) && extra.some((prefix) => text === prefix || text.startsWith(`${prefix} `)) && !/[;&|<>`$\n*?[\]{}~]/.test(text);
+}
 
 /** True when every part of a command only reads, inside the project when `inside` is given. Anything unusual
  * (variables, substitution, writing redirection, background jobs, environment prefixes) is not. */

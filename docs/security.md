@@ -33,6 +33,33 @@ contained command gets the engine's environment without anything that looks like
 agent socket (`withoutSecrets` in `util.ts`), so `env` or `printenv` show nothing secret. A command the person
 approves to run uncontained gets the whole environment.
 
+## What is trusted
+
+Approvals and fences guard against what the agent does and what a project holds, not against the person's own
+computer. Untrusted: the model's output, every file in a project (its `.git/config`, `.pixi`, scripts and data),
+packages and run packages from others, and anything a command started by the agent leaves behind. Trusted: the
+person's own environment as EnrichedLab starts in it (`PATH`, loader variables, `TMPDIR`, global and system git
+settings, Homebrew's folders), and a lab's image and the environment its gate gives each command. Whoever can change
+those already runs code as the person, so a defense against them would only move the problem.
+
+Safety comes from containment, not from reading commands: nothing runs outside the OS sandbox (or a lab's fence)
+without a yes, except what the person listed in `allowCommands`. Reading a command's words decides only what may
+run unasked inside containment and what an answer covers. Inside containment a command can still read most of the
+disk (credential folders aren't readable) and has no network, so it can't push, whatever its words say.
+
+Accepted residuals, each with its reason:
+
+- In `full` mode, for commands run outside containment and for programs and scripts generally, only pushes the line
+  shows are caught. A script or program that pushes on its own can't be seen from its words; `full` means the person
+  allowed that.
+- In a lab sandbox, Landlock covers file contents, names and existence, not modes, owners or times, and doesn't
+  restrict running programs. A fenced command could `chmod` another project's files in the same person's sandbox,
+  which loses no data and can be undone. UDP and pathname sockets are left to the lab's no-network rule.
+- `full`, Discovery mode, and `auto` in a lab that checkpoints its whole disk run commands without the fence.
+- Races that need a second process running outside containment at the same moment (an approved background
+  command) aren't defended; file operations refuse links and hard links, not a real folder renamed into place.
+- Windows file operations aren't anchored the same way (its links need privileges to make).
+
 ## How much it asks
 
 Each session asks in one of three modes, set for new sessions in Settings and for one session from the shield menu
@@ -52,6 +79,8 @@ session starts in a folder, the window asks once whether EnrichedLab may change 
 any macOS privacy prompt then, not mid-task. A question about a change in a folder nobody answered for offers "Allow
 Changes in this folder", which saves the same answer.
 
+A command that would run outside containment (the sandbox off for this folder, or `unsandboxed`) asks even when it
+only reads, unless the person listed it in `allowCommands` (no globs, chaining or expansion in it).
 "Allow for this session" covers what the button names and nothing wider, and is kept in the session log (an `allow`
 event), so it outlasts a restart. A command is remembered per program it runs (`touch`, `rm`, `git commit`), so
 `python3 a.py | grep x` and `python3 b.py | grep y` share an answer. Lines are read the way the shell reads them:
@@ -76,10 +105,11 @@ change which program runs or what it loads. That is judged broadly: a toolchain'
 command (`PATH`, `DIR`, `LIB`, `INI`, `RC`, `CONFIG`, `OPTS`, `PRELOAD`, `CMD`). Data variables in front
 (`SEED=42 python3 run.py`) share the program's answer. A push asks every time, however it's quoted, encoded or
 globbed (`git 'push'`, `$'\x67it' $'\x70ush'`, `/usr/bin/g[i]t p[u]sh`, a continued line), anywhere in the line,
-including code handed to `eval` or a shell (directly or through `env`, `timeout`, `nice`, `xargs` and the like) and
-here-documents, and so does a line where git or push sits beside a function, alias or sourced file. A line that
+including code handed to `eval` or a shell (directly or through `env`, `env -S`, `timeout`, `nice`, `xargs` and the
+like), a word that is itself a command line (a pager, an editor, `--compress-program`) and here-documents, and so does a line where git or push sits beside a function, alias or sourced file. A line that
 could push unseen asks every time too, in every mode, and its answer is never remembered (a file or variable it
 reads can change without the line changing): a program named by expansion or a glob (`$C a`, `$(cat cmd.txt)`),
+a wrapper given an expanded word (`command "$CMD" push`, `xargs "$P"`), git settings handed to `env`,
 git given an expanded word, a word after git that isn't one of git's own commands (an alias, from settings a file
 edit can change), a git setting that runs a program (`-c alias.*`, `-c core.sshCommand=...`, `GIT_*` set in front or
 exported), code for `eval` or a shell that expands or arrives on its input (`curl x | env bash`), or a line that
@@ -94,27 +124,29 @@ another folder takes its place, the answer no longer applies there and the quest
 before identities (0.2.30) ask once more. Every call is decided again just before it runs, and a file write lands
 on the real path it was judged for: its folders are made and the file opened without following a link anywhere on
 the way (`tools/anchored.ts`: `O_NOFOLLOW_ANY` on macOS, a folder-by-folder `openat` walk on Linux), so a folder
-swapped for a link after the check makes the write fail instead of landing elsewhere.
+swapped for a link after the check makes the write fail instead of landing elsewhere. A path holding a NUL is
+refused, and a file with a second name (a hard link) isn't written unless its outside path was approved.
 Without step history (its store failed), a contained command that changes things asks too. A session
 keeps the mode it started with; a subagent asks as much as the session that started it. A session's own worktree
 runs file edits. In a lab's sandbox, commands and file
 edits inside the project run without asking: the sandbox is a separate machine with no network, and its work comes
 home as a branch the person merges. There the fence is Linux Landlock, ABI 3 or later (`sites/sandbox_fence.ts`):
-the system's own `/usr/bin/python3` (root-owned, writable by no one else) fences the command, then starts it with
-`/bin/bash` and the shell startup variables removed. It and everything it runs can write, truncate, make, rename,
+the image's own `/usr/bin/python3` or `/usr/local/bin/python3` (root-owned, in a root-owned folder, writable by no one
+else; started without loader variables) fences the command, then starts it with `/bin/bash` and the shell startup
+variables removed. It and everything it runs can write, truncate, make, rename,
 link or remove files only in the project (anchored to the folder the command starts in, which must be the folder
 named, so a renamed or swapped project is refused), in a temp folder made for that command (`TMPDIR`, removed
 after), and on `/dev/null`, `/dev/zero`, `/dev/full` and `/dev/tty`, whatever a script or interpreter does. Where the
 kernel has them (ABI 4 and 6), TCP connections and binds, signals to processes outside the fence and abstract
-sockets are refused too. Reading isn't fenced, and file modes, owners and times aren't covered by Landlock: a
-command can't change another project's files, but it could `chmod` them. Before the first decision the sandbox is
+sockets are refused too, and from ABI 5 device ioctls outside those four devices. Reading isn't fenced, and file
+modes, owners and times aren't covered (see "What is trusted"). Before the first decision the sandbox is
 probed once with a fresh code: a child fences itself and must fail to truncate, write, create, remove, rename into
 or link in a folder outside, and only a line carrying that code counts. A sandbox where that fails (an older
 kernel, no root-owned `python3`) runs no command unasked. A fenced command runs on the same terms as a contained one
 on this computer: it names no path outside the project, and every named path (every name a glob matches, expanded
 there) must also lead inside once links are followed (`realpath -m`). Read-only commands run under the fence too.
 File edits in the sandbox run under it as well, after a check of where their folder leads, and replace a link at
-the end instead of following it. `full` and Discovery mode don't fence (the person let the session act outside the
+the end instead of following it; where the fence doesn't hold, each file edit asks. `full` and Discovery mode don't fence (the person let the session act outside the
 project), and in `auto` a sandbox whose whole disk is checkpointed runs changes unfenced, because the disk can be
 put back. A lab's own command tools (`<lab>_sandbox_run`, `<lab>_sandbox_job_start`) run
 outside any project: read-only commands run (a version check only for a program found on PATH, never one the

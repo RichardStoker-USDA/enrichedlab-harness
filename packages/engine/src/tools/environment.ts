@@ -48,7 +48,7 @@ async function run(program: string, args: string[], root: string, env: Record<st
 	// The folder is judged again right before each launch: one moved during an earlier step isn't granted.
 	check();
 	const caches = env.PIXI_CACHE_DIR!;
-	const launch = contained(program, args, { writable: [root, caches], readable: [program], network: "all" });
+	const launch = contained(program, args, { writable: [root, caches], readable: [program], network: "all", exact: true });
 	// Package install scripts never run uncontained: no facility here, no install.
 	if (!launch.facility) throw new ToolError("This computer has no sandbox to contain package installs (Seatbelt on macOS, bubblewrap on Linux), so nothing was installed.");
 	const child = Bun.spawn([launch.file, ...launch.args], { cwd: tmpdir(), stdout: "pipe", stderr: "pipe", env });

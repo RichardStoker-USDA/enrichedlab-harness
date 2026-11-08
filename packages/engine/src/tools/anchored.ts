@@ -12,6 +12,8 @@ const DARWIN_NOFOLLOW_ANY = 0x20000000;
 const DARWIN_AT_FDCWD = -2;
 const DARWIN_AT_SYMLINK_NOFOLLOW_ANY = 0x0800;
 const LINUX_O_CLOEXEC = 0o2000000;
+/** Opens a folder for walking through it: needs search permission only, like ordinary path lookup. */
+const LINUX_O_PATH = 0o10000000;
 
 type Libc = {
 	openat: (dir: number, path: Buffer, flags: number, mode: number) => number;
@@ -35,10 +37,16 @@ function lib(): Libc {
 	return libc;
 }
 
-const c = (text: string) => Buffer.from(`${text}\0`);
+/** A C string; a NUL inside would end it early (".." from "..\0a"), so it is refused. */
+const c = (text: string) => {
+	if (text.includes("\0")) throw new Error("A path can't hold a NUL character.");
+	return Buffer.from(`${text}\0`);
+};
 
 function parts(path: string): string[] {
 	if (!isAbsolute(path)) throw new Error(`${path} isn't an absolute path.`);
+	// C ends a name at NUL: "..\0a" would reach the kernel as "..".
+	if (path.includes("\0")) throw new Error("A path can't hold a NUL character.");
 	const names = path.split(sep).filter(Boolean);
 	if (names.some((n) => n === "." || n === "..")) throw new Error(`${path} isn't a physical path.`);
 	return names;
@@ -47,12 +55,16 @@ function parts(path: string): string[] {
 /** Linux: open the folder at `names` by walking from / without following any link (making missing ones when asked). */
 function linuxWalk(path: string, names: string[], make: boolean): number {
 	const { openat, mkdirat, close } = lib();
-	let dir = openat(-100, c("/"), constants.O_RDONLY | constants.O_DIRECTORY | LINUX_O_CLOEXEC, 0);
+	let dir = openat(-100, c("/"), LINUX_O_PATH | constants.O_DIRECTORY | LINUX_O_CLOEXEC, 0);
 	if (dir < 0) throw new Error("Couldn't open /.");
 	for (const part of names) {
-		const flags = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW | LINUX_O_CLOEXEC;
+		const flags = LINUX_O_PATH | constants.O_DIRECTORY | constants.O_NOFOLLOW | LINUX_O_CLOEXEC;
 		let next = openat(dir, c(part), flags, 0);
-		if (next < 0 && make && mkdirat(dir, c(part), 0o777) === 0) next = openat(dir, c(part), flags, 0);
+		// Made, or made meanwhile by someone else (EEXIST): either way opened again the same link-free way.
+		if (next < 0 && make) {
+			mkdirat(dir, c(part), 0o777);
+			next = openat(dir, c(part), flags, 0);
+		}
 		close(dir);
 		if (next < 0) throw new Error(`${path}: a part of the path is missing, isn't a folder, or is a link.`);
 		dir = next;
@@ -70,6 +82,7 @@ function linuxParent(path: string): { dir: number; name: string } {
 
 /** Open a physical path without following a link anywhere in it. */
 export function openPhysical(path: string, flags: number, mode = 0o666): number {
+	if (path.includes("\0")) throw new Error("A path can't hold a NUL character.");
 	if (process.platform === "darwin") return openSync(path, flags | DARWIN_NOFOLLOW_ANY, mode);
 	if (process.platform !== "linux") return openSync(path, flags | constants.O_NOFOLLOW, mode);
 	const { dir, name } = linuxParent(path);
@@ -88,6 +101,7 @@ export function openPhysical(path: string, flags: number, mode = 0o666): number 
 
 /** Remove a file at a physical path without following a link anywhere in it; true when it was removed. */
 export function unlinkPhysical(path: string): boolean {
+	if (path.includes("\0")) throw new Error("A path can't hold a NUL character.");
 	if (process.platform === "darwin") return lib().unlinkat(DARWIN_AT_FDCWD, c(path), DARWIN_AT_SYMLINK_NOFOLLOW_ANY) === 0;
 	if (process.platform !== "linux") {
 		rmSync(path, { force: true });
@@ -108,6 +122,7 @@ export function unlinkPhysical(path: string): boolean {
 
 /** mkdir -p for a physical path: every folder on the way must be a folder, not a link, or it fails. */
 export function mkdirPhysical(path: string): void {
+	if (path.includes("\0")) throw new Error("A path can't hold a NUL character.");
 	if (process.platform === "darwin") {
 		const names = parts(path);
 		let at = "";

@@ -32,7 +32,8 @@ sync, for the project or for one app's folder (`folder: "apps/<name>"`). The ins
 app's: it may write the project and pixi's own caches under `~/.el/tools`, and it gets no keys or tokens. Where this
 computer can't contain it (no Seatbelt or bubblewrap), nothing installs, for a project or an app. The folder is
 checked again before every pixi run, and `pixi.toml` and `pixi.lock` must be the project's own files, not links;
-a new `pixi.toml` is made without following a link. Contained
+a new `pixi.toml` is made without following a link. pixi is always the pinned build EnrichedLab downloads and checks
+against its SHA-256, never one found on PATH. Contained
 shell commands then run inside that environment: its programs come first on PATH and `CONDA_PREFIX` is set. A command
 run outside the sandbox never gets it, so a program the project holds can't stand in for the system's there. Package
 names can't be options (they start with a letter or digit, after `--`), and listing never downloads pixi. Each project

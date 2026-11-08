@@ -23,13 +23,12 @@ const PIXI_BUILDS: Record<string, [string, string]> = {
 
 /** True when pixi is here without downloading: on PATH, or the pinned build already under `tools`. */
 export function pixiPresent(tools: string): boolean {
-	return Boolean(Bun.which("pixi")) || existsSync(join(tools, `pixi-${PIXI_VERSION}${process.platform === "win32" ? ".exe" : ""}`));
+	return existsSync(join(tools, `pixi-${PIXI_VERSION}${process.platform === "win32" ? ".exe" : ""}`));
 }
 
 /** The pixi program: on PATH, else the pinned build under `tools`, downloaded and checked the first time. */
 export async function pixi(tools: string, log: (line: string) => void = () => undefined): Promise<string> {
-	const found = Bun.which("pixi");
-	if (found) return found;
+	// Only the pinned build, checked against its SHA-256: never a pixi found on PATH.
 	const build = PIXI_BUILDS[`${process.platform}-${process.arch}`];
 	if (!build) throw new Error(`No pixi build for ${process.platform} ${process.arch}.`);
 	const file = join(tools, `pixi-${PIXI_VERSION}${process.platform === "win32" ? ".exe" : ""}`);

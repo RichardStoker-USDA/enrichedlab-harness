@@ -86,7 +86,9 @@ export class Checkpoints {
 						continue;
 					}
 					try {
-						if (!fstatSync(fd).isFile()) continue;
+						const opened = fstatSync(fd);
+						// A file with another name (a hard link) could be changed somewhere outside: left as it is.
+						if (!opened.isFile() || opened.nlink > 1) continue;
 						ftruncateSync(fd, 0);
 						writeSync(fd, readFileSync(join(this.dir, file.blob)), 0, undefined, 0);
 					} finally {
