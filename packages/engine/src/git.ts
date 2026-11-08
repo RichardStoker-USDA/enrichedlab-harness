@@ -4,7 +4,7 @@
 
 import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve, sep } from "node:path";
 import { contained, trustedGit } from "./tools/workspace.ts";
@@ -49,16 +49,19 @@ function git(cwd: string, args: string[], env?: Record<string, string>): string 
 		}
 		writableFor.set(cwd, writable);
 	}
-	// Where nothing contains it, the repository's filter drivers are turned off instead: none of them runs.
+	// Where nothing contains it, the drivers the repository's own settings define (project content, includes from
+	// them counted) are turned off instead; the person's global ones (git-lfs) stay. git too old to say where a
+	// setting comes from doesn't run here.
 	if (!contained(full[0]!, [], { writable: [], network: "none" }).facility) {
-		const names = (() => {
-			try {
-				// Every scope, includes followed (git config reads them by default when no file is named).
-				return execFileSync(program, ["config", "--name-only", "--get-regexp", "^(filter|diff)\\."], options).split("\n");
-			} catch {
-				return [];
-			}
-		})();
+		let listed: string;
+		try {
+			listed = execFileSync(program, ["config", "--show-scope", "--name-only", "--get-regexp", "^(filter|diff)\\."], options);
+		} catch (error) {
+			// Exit 1 is "no such settings"; anything else (an old git without --show-scope) refuses.
+			if ((error as { status?: number }).status !== 1) throw new Error("This git can't say where its settings come from (it needs 2.26 or later), so the engine's git work didn't run.");
+			listed = "";
+		}
+		const names = listed.split("\n").filter((line) => /^(local|worktree|command)\t/.test(line)).map((line) => line.slice(line.indexOf("\t") + 1));
 		const named = (kind: string) => [...new Set(names.map((n) => new RegExp(`^${kind}\\.(.+)\\.[^.]+$`).exec(n.trim())?.[1]).filter((d): d is string => Boolean(d)))];
 		const off = [
 			...named("filter").flatMap((d) => ["-c", `filter.${d}.clean=`, "-c", `filter.${d}.smudge=`, "-c", `filter.${d}.process=`, "-c", `filter.${d}.required=false`]),
@@ -66,6 +69,9 @@ function git(cwd: string, args: string[], env?: Record<string, string>): string 
 			...named("diff").flatMap((d) => ["-c", `diff.${d}.textconv=`, "-c", `diff.${d}.command=`]),
 			"-c",
 			"diff.external=",
+			// fetch can list an alternate repository's refs with a program: one that prints nothing instead.
+			"-c",
+			"core.alternateRefsCommand=true",
 		];
 		return execFileSync(program, [...full.slice(1, 5), ...off, ...full.slice(5)], options).trim();
 	}
@@ -250,7 +256,8 @@ export function packForSend(repo: string, bundle: string): Pack {
 export function fetchBundle(repo: string, bundle: string, source: string, branch: string, base: string, home = base): string[] {
 	const temp = `refs/enrichedlab/fetch/${randomBytes(4).toString("hex")}`;
 	// The bundle is a file EnrichedLab downloaded: only the file transport, never a network or helper transport.
-	if (!isAbsolute(bundle) || !existsSync(bundle)) throw new Error(`${bundle} isn't a bundle file.`);
+	// A folder would make git start upload-pack there; only a plain file is a bundle.
+	if (!isAbsolute(bundle) || !statSync(bundle, { throwIfNoEntry: false })?.isFile()) throw new Error(`${bundle} isn't a bundle file.`);
 	git(repo, ["fetch", "-q", "--no-recurse-submodules", bundle, `${source}:${temp}`], { GIT_ALLOW_PROTOCOL: "file" });
 	try {
 		const tip = home === base ? git(repo, ["rev-parse", temp]) : rebuild(repo, base, home, temp);

@@ -7,7 +7,7 @@ import { readdir, readFile, stat } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { withoutSecrets } from "../util.ts";
-import { mkdirPhysical, openPhysical } from "./anchored.ts";
+import { holdFolder, mkdirPhysical, openPhysical } from "./anchored.ts";
 
 export interface Entry {
 	name: string;
@@ -38,7 +38,10 @@ export interface Workspace {
 	 * `fence` (lab sandboxes): the command runs under the sandbox's file fence (sandbox_fence.ts), and the paths it names
 	 * must lead inside the project, links followed, or it doesn't run.
 	 */
-	exec(command: string, options: { timeoutMs: number; signal: AbortSignal; onOutput?: (text: string) => void; unsandboxed?: boolean; env?: Record<string, string>; fence?: { text: string; pattern?: string }[] }): Promise<ExecResult>;
+	/** `readOnly`: the command runs contained with nothing in the project writable (a read-only subagent), or not at all. */
+	exec(command: string, options: { timeoutMs: number; signal: AbortSignal; onOutput?: (text: string) => void; unsandboxed?: boolean; env?: Record<string, string>; fence?: { text: string; pattern?: string }[]; readOnly?: boolean }): Promise<ExecResult>;
+	/** The worktree EnrichedLab made for this session (known from the session's own record, never from the path). */
+	readonly worktree?: { path: string; gitDir: string };
 	/** Set when commands run contained: by the OS ("seatbelt", "bwrap") or in a site's sandbox ("site"). */
 	readonly sandboxed?: string;
 	/** The names a glob pattern matches here, relative as the shell gives them; undefined when it can't say. */
@@ -136,11 +139,28 @@ export function safeTemp(): string {
 	return temp === sep || holds(temp, home) || temp.split(sep).filter(Boolean).length < 2 ? fallback : temp;
 }
 
-/** git from the system's or Homebrew's own folders, never one found on the caller's PATH. */
+/** Where a trusted git may really live: the system's and Homebrew's own folders (a link from them must stay there). */
+const GIT_HOMES = ["/usr/bin/", "/bin/", "/usr/libexec/", "/Library/Developer/CommandLineTools/", "/Applications/Xcode.app/", "/opt/homebrew/", "/usr/local/Cellar/", "/usr/local/bin/", "/usr/local/opt/"];
+
+/**
+ * git from the system's or Homebrew's own folders, never one found on the caller's PATH. The program it leads to
+ * must also be there, owned by root or the person and writable by no one else: a link into a project isn't git.
+ */
 export function trustedGit(): string | undefined {
 	// macOS's /usr/bin/git is a stub that asks to install the developer tools when they're missing.
 	const tools = process.platform !== "darwin" || existsSync("/Library/Developer/CommandLineTools/usr/bin/git") || existsSync("/Applications/Xcode.app");
-	return ["/opt/homebrew/bin/git", "/usr/local/bin/git", ...(tools ? ["/usr/bin/git"] : []), "/bin/git"].find((at) => existsSync(at));
+	const uid = process.getuid?.() ?? 0;
+	return ["/opt/homebrew/bin/git", "/usr/local/bin/git", ...(tools ? ["/usr/bin/git"] : []), "/bin/git"].find((at) => {
+		try {
+			const target = realpathSync(at);
+			const s = statSync(target);
+			const dir = statSync(dirname(target));
+			const owned = (x: { uid: number; mode: number }) => (x.uid === 0 || x.uid === uid) && (x.mode & 0o022) === 0;
+			return GIT_HOMES.some((home) => target.startsWith(home)) && s.isFile() && owned(s) && owned(dir);
+		} catch {
+			return false;
+		}
+	});
 }
 
 /** git settings that make a read command (status, diff, log, show, blame) run a program. */
@@ -167,7 +187,7 @@ export type Facility = "seatbelt" | "bubblewrap" | "restricted-token";
 export const FULL_CONTAINMENT = new Set<string>(["seatbelt", "bubblewrap", "site"]);
 
 /** The OS facility that contains a command, when this machine has one that works. */
-function sandboxer(): Facility | undefined {
+export function sandboxer(): Facility | undefined {
 	if (process.platform === "darwin" && existsSync("/usr/bin/sandbox-exec")) return "seatbelt";
 	if (process.platform === "win32") {
 		// Check once that a command starts and reports its exit code under the restricted token; if not, commands
@@ -206,7 +226,7 @@ export type NetworkAccess = "none" | "loopback" | "all";
 
 /** Seatbelt profile: writes only to `writable`, the credential folders unreadable, and the network as `network`
  * allows ("none" includes local sockets: Docker, ssh-agent). */
-function seatbeltProfile(writable: string[], network: NetworkAccess, readable: string[] = []): string {
+function seatbeltProfile(writable: string[], network: NetworkAccess, readable: string[] = [], protect: string[] = []): string {
 	const quote = (p: string) => JSON.stringify(p);
 	const hidden = PRIVATE_DIRS.map((d) => `(subpath ${quote(join(homedir(), d))})`).join(" ");
 	const net =
@@ -220,6 +240,8 @@ function seatbeltProfile(writable: string[], network: NetworkAccess, readable: s
 		"(allow default)",
 		"(deny file-write*)",
 		`(allow file-write* ${writable.map((p) => `(subpath ${quote(p)})`).join(" ")} (literal "/dev/null") (regex #"^/dev/(tty|fd/|stdout|stderr)"))`,
+		// Later rules win: protected paths inside a writable folder stay read only, existing or not.
+		...(protect.length ? [`(deny file-write* ${protect.map((p) => `(subpath ${quote(p)})`).join(" ")})`] : []),
 		`(deny file-read* ${hidden})`,
 		// Paths inside a hidden folder that this program needs (an app's runner and data); later rules win.
 		...(readable.length ? [`(allow file-read* ${readable.map((p) => `(subpath ${quote(p)})`).join(" ")})`] : []),
@@ -231,9 +253,20 @@ function seatbeltProfile(writable: string[], network: NetworkAccess, readable: s
  * credential folders hidden, the network as given. Returned unchanged where this computer has no facility
  * (Windows today); `facility` says which one applied. */
 /** `temp: false` leaves the system's temp folders out of what may be written (a replay writes only its own folder). */
-/** `exact`: each writable path must already be where it leads (physical); one that now leads elsewhere refuses. */
-export function contained(file: string, args: string[], options: { writable: string[]; network: NetworkAccess; readable?: string[]; server?: boolean; temp?: boolean; exact?: boolean }): { file: string; args: string[]; facility?: Facility } {
-	if (options.exact) for (const p of options.writable) if (real(p) !== p) throw new Error(`${p} now leads somewhere else (a link may have moved); nothing ran.`);
+/**
+ * `exact`: each writable path must already be where it leads (physical); one that now leads elsewhere refuses, and
+ * what is granted is that checked folder itself (bubblewrap binds a handle opened without following links, not the
+ * name, so a link swapped in afterwards grants nothing; Seatbelt judges the real path of every write). The caller
+ * hands `pass` to the program as its file descriptors 3, 4, ... (after stdin, stdout, stderr) and calls `release`
+ * once it has exited. `protect`: paths inside the writable ones that stay read only (a
+ * repository's settings and hooks).
+ */
+export function contained(file: string, args: string[], options: { writable: string[]; network: NetworkAccess; readable?: string[]; server?: boolean; temp?: boolean; exact?: boolean; protect?: string[] }): { file: string; args: string[]; facility?: Facility; pass?: number[]; release?: () => void } {
+	// Each path resolved once: the check and the grant are the same answer.
+	const resolved = options.writable.map(real);
+	if (options.exact) resolved.forEach((p, i) => {
+		if (p !== options.writable[i]) throw new Error(`${options.writable[i]} now leads somewhere else (a link may have moved); nothing ran.`);
+	});
 	const facility = sandboxer();
 	if (!facility) return { file, args };
 	if (facility === "restricted-token") {
@@ -246,17 +279,34 @@ export function contained(file: string, args: string[], options: { writable: str
 		const writable = [...options.writable, ...(options.temp === false ? [] : [safeTemp()])].map((p) => resolve(p));
 		return { file: self[0]!, args: [...self.slice(1), "__contain", JSON.stringify(writable), "--", file, ...args], facility };
 	}
-	const writable = [...options.writable.map(real), ...(options.temp === false ? [] : [safeTemp(), "/private/tmp", "/tmp"])].filter((p, i, all) => existsSync(p) && all.indexOf(p) === i);
-	const readable = [...options.writable, ...(options.readable ?? [])].map(real).filter((p) => existsSync(p));
-	if (facility === "seatbelt") return { file: "/usr/bin/sandbox-exec", args: ["-p", seatbeltProfile(writable, options.network, readable), file, ...args], facility };
+	const writable = [...resolved, ...(options.temp === false ? [] : [safeTemp(), "/private/tmp", "/tmp"])].filter((p, i, all) => existsSync(p) && all.indexOf(p) === i);
+	const readable = [...resolved, ...(options.readable ?? []).map(real)].filter((p) => existsSync(p));
+	const protect = (options.protect ?? []).map(real);
+	if (facility === "seatbelt") return { file: "/usr/bin/sandbox-exec", args: ["-p", seatbeltProfile(writable, options.network, readable, protect), file, ...args], facility };
 	// Read-only root, the writable folders bound, a private /tmp, credential folders hidden, every namespace unshared
 	// (network, pids, IPC, user) so host sockets under /tmp and /run are out of reach. Loopback can't be split from
 	// the network in a namespace, so "loopback" shares the network here.
 	const hidden = PRIVATE_DIRS.map((d) => join(homedir(), d)).filter((p) => existsSync(p)).flatMap((p) => ["--tmpfs", p]);
-	const binds = [
-		...writable.filter((p) => p !== "/tmp" && p !== "/private/tmp").flatMap((p) => ["--bind", p, p]),
-		...(options.readable ?? []).map(real).filter((p) => existsSync(p)).flatMap((p) => ["--ro-bind", p, p]),
-	];
+	const held: number[] = [];
+	// An exact folder is bound from a handle on the checked folder, passed to bubblewrap as an open file descriptor
+	// (--bind-fd), so it can't follow a link put in its place after the check.
+	const bind = (p: string) => {
+		if (!options.exact || !resolved.includes(p)) return ["--bind", p, p];
+		held.push(holdFolder(p));
+		return ["--bind-fd", String(2 + held.length), p];
+	};
+	let binds: string[];
+	try {
+		binds = [
+			...writable.filter((p) => p !== "/tmp" && p !== "/private/tmp").flatMap(bind),
+			...(options.readable ?? []).map(real).filter((p) => existsSync(p)).flatMap((p) => ["--ro-bind", p, p]),
+			// Bound read only over the writable folder (only what exists: bubblewrap can't protect a missing path).
+			...protect.filter((p) => existsSync(p)).flatMap((p) => ["--ro-bind", p, p]),
+		];
+	} catch (error) {
+		for (const fd of held) closeSync(fd);
+		throw error;
+	}
 	const net = options.network === "none" ? [] : ["--share-net"];
 	// Without temp folders (a replay), the private /tmp and /run that hide the host's sockets can't be written either.
 	const sealed = options.temp === false ? ["--remount-ro", "/tmp", "--remount-ro", "/run"] : [];
@@ -264,6 +314,7 @@ export function contained(file: string, args: string[], options: { writable: str
 		file: trustedBwrap() ?? "/usr/bin/bwrap",
 		args: ["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--tmpfs", "/run", ...sealed, ...hidden, ...binds, "--unshare-all", ...net, "--die-with-parent", "--new-session", "--", file, ...args],
 		facility,
+		...(held.length ? { pass: [...held], release: () => held.splice(0).forEach((fd) => closeSync(fd)) } : {}),
 	};
 }
 
@@ -276,19 +327,44 @@ export class LocalWorkspace implements Workspace {
 	/** Set when commands run contained (see SandboxMode): the facility in use. */
 	readonly sandboxed?: Facility;
 
+	/** The session's own worktree: its folder, and the repository's git folder it commits into. */
+	readonly worktree?: { path: string; gitDir: string };
+
+	/** `worktree`: the one EnrichedLab made for this session, from the session's record (engine.ts). */
 	constructor(
 		readonly root: string,
 		sandbox: SandboxMode = "off",
+		worktree?: { path: string; repo: string },
 	) {
 		this.label = `this computer, in ${root}`;
 		if (sandbox === "workspace") this.sandboxed = sandboxer();
+		if (worktree) {
+			const gitDir = real(join(worktree.repo, ".git"));
+			const path = real(worktree.path);
+			const here = real(root);
+			// Only a worktree inside the repository's own .git, holding this folder.
+			if (statSync(gitDir, { throwIfNoEntry: false })?.isDirectory() && path.startsWith(`${gitDir}${sep}`) && (here === path || here.startsWith(`${path}${sep}`))) this.worktree = { path, gitDir };
+		}
+	}
+
+	/**
+	 * What contained commands may write: the project, and in the session's worktree the repository's git folder too
+	 * (commits go there). Never a repository's settings, hooks or info folder, which make git run programs later.
+	 */
+	private writable(): { writable: string[]; protect: string[] } {
+		const writable = [this.root, ...(this.worktree ? [this.worktree.gitDir] : [])];
+		const gitDirs = [...(this.worktree ? [this.worktree.gitDir] : []), ...writable.map((w) => join(w, ".git")).filter((g) => statSync(g, { throwIfNoEntry: false })?.isDirectory())];
+		const protect = [...new Set(gitDirs)].flatMap((g) => [join(g, "config"), join(g, "hooks"), join(g, "info")]);
+		if (this.worktree) protect.push(join(this.worktree.gitDir, "worktrees", basename(this.worktree.path), "config.worktree"));
+		return { writable, protect };
 	}
 
 	/** The program and arguments that run `command`, contained when the workspace is sandboxed. */
-	private launch(command: string, contain: boolean): { file: string; args: string[] } {
+	private launch(command: string, contain: boolean, readOnly = false): { file: string; args: string[] } {
 		const plain = { file: this.shell.file, args: this.shell.args(command) };
 		if (!contain || !this.sandboxed) return plain;
-		return contained(plain.file, plain.args, { writable: [this.root], network: "none" });
+		if (readOnly) return contained(plain.file, plain.args, { writable: [], network: "none" });
+		return contained(plain.file, plain.args, { ...this.writable(), network: "none" });
 	}
 
 	resolve(path: string): string {
@@ -428,9 +504,11 @@ export class LocalWorkspace implements Workspace {
 		return out.sort((a, b) => (a.type === "dir" ? 0 : 1) - (b.type === "dir" ? 0 : 1) || a.name.localeCompare(b.name));
 	}
 
-	exec(command: string, options: { timeoutMs: number; signal: AbortSignal; onOutput?: (text: string) => void; unsandboxed?: boolean; env?: Record<string, string> }): Promise<ExecResult> {
+	exec(command: string, options: { timeoutMs: number; signal: AbortSignal; onOutput?: (text: string) => void; unsandboxed?: boolean; env?: Record<string, string>; readOnly?: boolean }): Promise<ExecResult> {
 		if (options.signal.aborted) return Promise.resolve({ exitCode: null, output: "", timedOut: false });
-		const { file, args } = this.launch(command, !options.unsandboxed);
+		// Read only is the OS's to enforce: where nothing can contain the command, it doesn't run.
+		if (options.readOnly && (!this.sandboxed || !FULL_CONTAINMENT.has(this.sandboxed) || options.unsandboxed)) return Promise.resolve({ exitCode: 125, output: "A read-only subagent runs commands only where the OS can keep them from writing (macOS Seatbelt, Linux bubblewrap), so this didn't run.", timedOut: false });
+		const { file, args } = this.launch(command, !options.unsandboxed, options.readOnly);
 		// A contained command runs without asking, so it never sees the engine's keys and tokens: `env` would show them.
 		const base = shellSafe(options.env ?? process.env);
 		const env = this.sandboxed && !options.unsandboxed ? withoutSecrets(base) : base;

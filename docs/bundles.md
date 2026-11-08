@@ -13,10 +13,11 @@ How EnrichedLab handles git on a person's computer and in a lab sandbox, and how
   repository) works in `<repo>/.git/enrichedlab-worktrees/<id>` on its own branch `enrichedlab/<title>-<id>`. Parallel
   agents never write over each other or the person's checkout. `el worktrees` lists them; `--prune` removes the
   ones merged into the current branch.
-- **What asks.** In its own worktree the agent edits files and runs `git add` / `git commit` without asking; the
-  person reviews the branch when merging. Elsewhere commits ask like any command. `git push` asks in every mode, every
-  time, and "allow for this session" doesn't cover it; `el run` refuses pushes unless `--push` is given.
-  `--amend` and `--no-verify` always ask.
+- **What asks.** In its own worktree the agent edits files and commits without asking: its commands run contained
+  with the repository's git folder writable (its settings and hooks stay read only), and the person reviews the
+  branch when merging. Where commands can't be contained, commits ask like any command. `git push` (and
+  `send-pack`, `svn dcommit` and the like) asks in every mode, every time, and "allow for this session" doesn't
+  cover it; `el run` refuses pushes unless `--push` is given.
 - **Commit messages** follow the prompt's rule: one imperative subject under 80 characters, no AI attribution.
 
 ## Git with a lab sandbox

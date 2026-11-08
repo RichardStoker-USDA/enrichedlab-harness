@@ -137,6 +137,12 @@ export class SandboxWorkspace implements Workspace {
 		return this.ready;
 	}
 
+	/** `script` fenced to this folder when the fence holds here (run it from the folder); undefined when it doesn't. */
+	async fencedScript(script: string): Promise<string | undefined> {
+		await this.prepare();
+		return this.fenced ? fencedCommand(this.root, script, shq, this.fencePy) : undefined;
+	}
+
 	private async run(command: string, timeoutSeconds = 120, signal?: AbortSignal) {
 		await this.prepare();
 		return this.api.run(`cd ${shq(this.root)} && ${command}`, timeoutSeconds, signal);
@@ -249,10 +255,10 @@ export class SandboxWorkspace implements Workspace {
 		if (done.exitCode !== 0) throw new Error(done.stderr.trim() || `Can't write ${this.display(full)}.`);
 	}
 
-	async exec(command: string, options: { timeoutMs: number; signal: AbortSignal; onOutput?: (text: string) => void; fence?: FenceWord[] }): Promise<ExecResult> {
+	async exec(command: string, options: { timeoutMs: number; signal: AbortSignal; onOutput?: (text: string) => void; fence?: FenceWord[]; readOnly?: boolean }): Promise<ExecResult> {
 		// Fenced: under Landlock, writes land only in the project and temp folders (sandbox_fence.ts); a sandbox where the
-		// fence doesn't hold runs nothing fenced.
-		if (options.fence) {
+		// fence doesn't hold runs nothing fenced. A read-only subagent's command is always fenced, with no project rights.
+		if (options.fence || options.readOnly) {
 			await this.prepare();
 			if (!this.fenced) return { exitCode: 125, output: "This sandbox can't fence commands (it needs Landlock ABI 3 or later and a root-owned /usr/bin/python3), so it didn't run. Ask the person to run it.", timedOut: false };
 		}
@@ -261,9 +267,10 @@ export class SandboxWorkspace implements Workspace {
 		const words = options.fence?.length
 			? `__el_root=$(pwd -P); for __el_p in ${options.fence.map((w) => (w.pattern ? bashPattern(w.pattern) : shq(w.text))).join(" ")}; do __el_r=$(realpath -m -- "$__el_p" 2>/dev/null || readlink -f -- "$__el_p" 2>/dev/null); case "$__el_r" in "$__el_root"|"$__el_root"/*) ;; *) echo "EnrichedLab: $__el_p leads outside the project; a command that reaches there needs the person's yes." >&2; exit 126;; esac; done; `
 			: "";
-		const body = options.fence ? fencedCommand(this.root, command, shq, this.fencePy) : command;
+		const fenced = Boolean(options.fence || options.readOnly);
+		const body = fenced ? fencedCommand(this.root, command, shq, this.fencePy, options.readOnly) : command;
 		// One group after the cd, so nothing in it runs if the cd fails.
-		const r = await this.run(options.fence ? `{ ${words}${body}\n}` : command, Math.max(1, Math.round(options.timeoutMs / 1000)), options.signal);
+		const r = await this.run(fenced ? `{ ${words}${body}\n}` : command, Math.max(1, Math.round(options.timeoutMs / 1000)), options.signal);
 		const output = [r.stdout, r.stderr].filter(Boolean).join(r.stdout && r.stderr ? "\n" : "");
 		options.onOutput?.(output);
 		return { exitCode: r.exitCode, output, timedOut: r.timedOut };

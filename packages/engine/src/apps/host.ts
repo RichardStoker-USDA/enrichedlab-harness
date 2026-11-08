@@ -252,10 +252,12 @@ export class AppHost {
 		const plan = b?.runtime === "command" || b?.runtime === "serve" ? environmentPlan(dir) : undefined;
 		if (plan) lines.push(...describeEnvironment(plan));
 		if (b?.runtime === "command" || b?.runtime === "serve") lines.push(`Run ${b.command.join(" ")} on this computer${process.platform === "win32" ? " with your access" : ", contained"}`);
+		// Elsewhere a Bun backend runs contained to its data folder, like the page; on Windows it runs as the person.
+		if (b?.runtime === "bun" && process.platform === "win32") lines.push(`Run its backend (${b.main}) on this computer with your access`);
 		// The page is held to the origins it names; the program behind it reaches the network as a whole.
 		if (b && m.permissions.network?.length) lines.push("Let its program reach the network: any address, not only the ones named above");
 		if (b?.runtime === "container") lines.push(`Run the container ${b.image}${b.build !== undefined ? " (built from its folder)" : ""}`);
-		const program = b && b.runtime !== "bun" ? JSON.stringify(b) : "";
+		const program = b && (b.runtime !== "bun" || process.platform === "win32") ? JSON.stringify(b) : "";
 		return { lines, key: `${permissionKey(m.permissions)}|${program}|${plan?.digest ?? ""}` };
 	}
 

@@ -13,7 +13,7 @@ export const FENCE_PYTHONS = ["/usr/bin/python3", "/usr/local/bin/python3"];
 
 /**
  * The Landlock program. `probe <nonce>`: fences a child to one folder and checks that it can't truncate, write,
- * remove, rename into or link in another; prints "el-fence ok <nonce> abi <n> py <interpreter>" when all of that holds. `run <root> <command>`:
+ * remove, rename into, link in, or hard-link a file from another; prints "el-fence ok <nonce> abi <n> py <interpreter>" when all of that holds. `run <root> <command>`:
  * checks that <root> is the folder it was started in, fences, and runs the command with /bin/bash.
  */
 export const FENCE_PY = String.raw`
@@ -94,6 +94,7 @@ def probe(nonce):
                     lambda: os.rename(os.path.join(inside, "ok"), os.path.join(outside, "moved")),
                     lambda: os.mkdir(os.path.join(outside, "d")),
                     lambda: os.symlink("x", os.path.join(outside, "l")),
+                    lambda: os.link(existing, os.path.join(inside, "hard")),
                 ):
                     try:
                         attempt()
@@ -111,7 +112,7 @@ def probe(nonce):
     finally:
         shutil.rmtree(base, ignore_errors=True)
 
-def run(root, command):
+def run(root, command, mode):
     here = os.open(".", os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
     named = os.lstat(root)
     started = os.fstat(here)
@@ -122,7 +123,8 @@ def run(root, command):
     try:
         env = {k: v for k, v in os.environ.items() if k not in DROP and not k.startswith("BASH_FUNC_") and not v.startswith("() {")}
         env.update(TMPDIR=temp, TMP=temp, TEMP=temp)
-        rules = [(here, EVERY), (own, EVERY)] + [(d, FILE_RIGHTS) for d in DEVICES if os.path.exists(d)]
+        # "read": nothing in the project may change (a read-only subagent); only its own temp folder and the devices.
+        rules = ([] if mode == "read" else [(here, EVERY)]) + [(own, EVERY)] + [(d, FILE_RIGHTS) for d in DEVICES if os.path.exists(d)]
         pid = os.fork()
         if pid == 0:
             try:
@@ -151,7 +153,7 @@ if sys.argv[1] == "probe":
         print("el-fence no")
 else:
     try:
-        sys.exit(run(sys.argv[2], sys.argv[3]))
+        sys.exit(run(sys.argv[2], sys.argv[3], sys.argv[4] if len(sys.argv) > 4 else "write"))
     except OSError as e:
         sys.stderr.write("The sandbox couldn't fence this command (%s), so it didn't run.\n" % e)
         sys.exit(125)
@@ -177,6 +179,7 @@ export function fencePython(line: string, nonce: string): string | undefined {
 }
 
 /** The command fenced with the interpreter the probe checked: the project is `root`, the folder the shell is in. */
-export function fencedCommand(root: string, command: string, quote: (text: string) => string, python = FENCE_PYTHONS[0]!): string {
-	return `${CLEAN} ${python} -I -c ${quote(FENCE_PY)} run ${quote(root)} ${quote(command)}`;
+/** `readOnly`: nothing in the project may change. */
+export function fencedCommand(root: string, command: string, quote: (text: string) => string, python = FENCE_PYTHONS[0]!, readOnly = false): string {
+	return `${CLEAN} ${python} -I -c ${quote(FENCE_PY)} run ${quote(root)} ${quote(command)}${readOnly ? " read" : ""}`;
 }

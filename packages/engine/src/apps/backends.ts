@@ -25,6 +25,15 @@ import { RUNNER_SOURCE } from "./runner.ts";
 import { AttachTransport } from "../sites/attach.ts";
 import { type SandboxApi, shq } from "../sites/sandbox_workspace.ts";
 
+/**
+ * A backend runs contained, or not at all: on Windows it runs as the person (its servers stall under the restricted
+ * token), which the consent card says before anything starts; anywhere else without a sandbox it doesn't start.
+ */
+function uncontainedOk(launch: { facility?: string }): void {
+	if (launch.facility || process.platform === "win32") return;
+	throw new Error("This computer has no sandbox to contain the app's backend (bubblewrap on Linux, Seatbelt on macOS), so it didn't start.");
+}
+
 export interface BackendTool {
 	name: string;
 	description: string;
@@ -285,12 +294,14 @@ export async function startBackend(manifest: AppManifest, ctx: BackendContext): 
 			// The compiled binary is Bun; BUN_BE_BUN makes it act as the bun command. From source, execPath is bun.
 			const runner = runnerPath(ctx.runDir);
 			const launch = contained(process.execPath, [runner, join(ctx.dir, backend.main)], { writable: [ctx.dataDir], readable: [runner, ctx.dir], network, server: true });
+			uncontainedOk(launch);
 			return connectStdio(launch.file, launch.args, { ...env, BUN_BE_BUN: "1", NO_COLOR: "1" }, ctx.dir, ctx);
 		}
 		case "command": {
 			const command = hasEnvironment(ctx.dir) ? await inEnvironment(ctx.dir, backend.command, ctx.toolsDir, ctx.log) : backend.command;
 			const [program, ...args] = command;
 			const launch = contained(program!, args, { writable: [ctx.dataDir, join(ctx.dir, ".pixi")], readable: [ctx.dir, ctx.toolsDir], network, server: true });
+			uncontainedOk(launch);
 			return connectStdio(launch.file, launch.args, env, ctx.dir, ctx);
 		}
 		case "container": {
@@ -333,6 +344,7 @@ export async function startBackend(manifest: AppManifest, ctx: BackendContext): 
 			// Writes go to the data folder (and the environment's own cache), so history files don't touch the app's
 			// folder and its reload.
 			const launch = contained(program!, args, { writable: [ctx.dataDir, join(ctx.dir, ".pixi")], readable: [ctx.dir, ctx.toolsDir], network: ctx.network ? "all" : "loopback", server: true });
+			uncontainedOk(launch);
 			const proc = spawn(launch.file, launch.args, { cwd: ctx.dir, env: { ...env, PORT: String(port), HOST: "127.0.0.1", TMPDIR: ctx.dataDir }, stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" });
 			for (const stream of [proc.stdout, proc.stderr]) stream?.on("data", (chunk: Buffer) => chunk.toString("utf8").split("\n").forEach((line) => line.trim() && ctx.log(line)));
 			const url = `http://127.0.0.1:${port}${backend.path ?? "/"}`;

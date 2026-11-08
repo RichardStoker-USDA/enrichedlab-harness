@@ -3,7 +3,7 @@
 
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { closeSync, constants, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { closeSync, constants, existsSync, linkSync, mkdirSync, readdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { LabConfig } from "../packages/engine/src/config.ts";
@@ -396,3 +396,82 @@ describe("round 5: one boundary", () => {
 	});
 });
 
+describe("round 6: containment is the boundary", () => {
+	const shell = { name: "shell", kind: "exec" } as unknown as Tool;
+
+	test("in a folder set to read only, a read runs with nothing writable", () => {
+		const root = realpathSync(mkdtempSync(join(tmpdir(), "el-rofolder-")));
+		try {
+			const ws = new LocalWorkspace(root, "workspace");
+			if (!ws.sandboxed) return;
+			const config = { permissions: { mode: "auto", allowCommands: [] }, folders: { [root]: { access: "read" } } } as unknown as LabConfig;
+			expect(decide(shell, { command: "cat a.txt" }, ws, config, new Set())).toEqual({ action: "run", readOnly: true });
+			expect(decide(shell, { command: "cat a.txt" }, ws, { permissions: { mode: "auto", allowCommands: [] } } as unknown as LabConfig, new Set(), undefined, undefined, false)).toEqual({ action: "run", readOnly: true });
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("git's other publishing commands are pushes", () => {
+		for (const command of ["git send-pack origin HEAD", "/usr/libexec/git-core/git-send-pack ../r main", "git http-push https://h/r main", "git svn dcommit", "git send-email 0001.patch", "git p4 submit"]) {
+			expect([command, allowKeys(shell, { command }).keys[0]]).toEqual([command, "shell!push"]);
+		}
+		expect(allowKeys(shell, { command: "git status" }).keys[0]).not.toBe("shell!push");
+	});
+
+	test.skipIf(process.platform !== "darwin")("a read-only subagent's commands run where nothing in the project can change, or not at all", async () => {
+		const root = realpathSync(mkdtempSync(join(homedir(), ".el-readonly-")));
+		try {
+			writeFileSync(join(root, "a.txt"), "data\n");
+			const opts = { timeoutMs: 30_000, signal: new AbortController().signal, readOnly: true };
+			const ws = new LocalWorkspace(root, "workspace");
+			expect((await ws.exec("cat a.txt", opts)).output).toContain("data");
+			// A program the words don't show writing (a pager, a script) is stopped by the OS, not by reading the line.
+			expect((await ws.exec("bat --paging=always --pager 'sh -c \"echo x > b.txt\"' a.txt 2>/dev/null; sh -c 'echo x > c.txt'", opts)).exitCode).not.toBe(0);
+			expect(existsSync(join(root, "b.txt")) || existsSync(join(root, "c.txt"))).toBe(false);
+			const off = new LocalWorkspace(root, "off");
+			expect((await off.exec("cat a.txt", opts)).exitCode).toBe(125);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test.skipIf(process.platform === "win32")("bringing work back from a lab runs none of the project's hooks or filter drivers", async () => {
+		const { execFileSync } = await import("node:child_process");
+		const { fetchRepo } = await import("../packages/engine/src/sites/repo_handoff.ts");
+		const base = realpathSync(mkdtempSync(join(tmpdir(), "el-handoff-")));
+		try {
+			const git = (cwd: string, ...a: string[]) => execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", ...a], { cwd, encoding: "utf8" }).trim();
+			const repo = join(base, "home");
+			const dir = join(base, "sandbox");
+			const out = join(base, "out");
+			const marks = join(base, "marks");
+			for (const d of [repo, out, marks]) mkdirSync(d);
+			git(repo, "init", "-q", "-b", "main");
+			writeFileSync(join(repo, "a.txt"), "one\n");
+			git(repo, "add", ".");
+			git(repo, "commit", "-q", "-m", "start");
+			const head = git(repo, "rev-parse", "HEAD");
+			execFileSync("git", ["clone", "-q", repo, dir]);
+			git(dir, "checkout", "-q", "-b", "work");
+			// What an agent in the sandbox could leave: a filter driver and a hook in the repository's own settings.
+			git(dir, "config", "filter.evil.clean", `sh -c 'touch ${marks}/filter; cat'`);
+			writeFileSync(join(dir, ".gitattributes"), "* filter=evil\n");
+			writeFileSync(join(dir, ".git", "hooks", "pre-commit"), `#!/bin/sh\ntouch ${marks}/hook\n`, { mode: 0o755 });
+			writeFileSync(join(dir, "b.txt"), "two\n");
+			const api = {
+				title: "Test Lab",
+				run: async (command: string) => {
+					const r = spawnSync("bash", ["-c", command.replaceAll("/sandbox/out", out)], { encoding: "utf8" });
+					return { exitCode: r.status ?? 1, stdout: r.stdout, stderr: r.stderr };
+				},
+				get: async (from: string, to: string) => writeFileSync(to, readFileSync(from.replace("/sandbox/out", out))),
+			} as unknown as SandboxApi;
+			const commits = await fetchRepo(api, dir, { repo, base: head, home: head }, "enrichedlab/test-1");
+			expect(commits.length).toBe(1);
+			expect(readdirSync(marks)).toEqual([]);
+		} finally {
+			rmSync(base, { recursive: true, force: true });
+		}
+	});
+});

@@ -9,7 +9,7 @@ import { basename, join } from "node:path";
 import { pixi, pixiPresent } from "../apps/environments.ts";
 import { type Tool, ToolError } from "./types.ts";
 import { openPhysical } from "./anchored.ts";
-import { contained, physical } from "./workspace.ts";
+import { contained, type NetworkAccess, physical } from "./workspace.ts";
 
 /** Where a lab's vetted packages come from (its descriptor's `packages`). */
 export interface PackageSources {
@@ -33,7 +33,8 @@ export function manifest(name: string, sources?: PackageSources): string {
 
 /** Each installed package and its version, from `pixi list`. */
 async function installed(program: string, root: string, env: Record<string, string>, check: () => void): Promise<Map<string, string>> {
-	const out = await run(program, ["list", "--json", "--manifest-path", join(root, "pixi.toml")], root, env, () => undefined, check).catch(() => "[]");
+	// Listing reads what is built: no network.
+	const out = await run(program, ["list", "--json", "--manifest-path", join(root, "pixi.toml")], root, env, () => undefined, check, "none").catch(() => "[]");
 	const list = new Map<string, string>();
 	try {
 		for (const p of JSON.parse(out) as { name: string; version: string }[]) list.set(p.name, p.version);
@@ -44,14 +45,14 @@ async function installed(program: string, root: string, env: Record<string, stri
 }
 
 /** Run pixi contained: it may write the project (pixi.toml, pixi.lock, .pixi) and its own caches, and reach the indexes. */
-async function run(program: string, args: string[], root: string, env: Record<string, string>, log: (line: string) => void, check: () => void): Promise<string> {
+async function run(program: string, args: string[], root: string, env: Record<string, string>, log: (line: string) => void, check: () => void, network: NetworkAccess = "all"): Promise<string> {
 	// The folder is judged again right before each launch: one moved during an earlier step isn't granted.
 	check();
 	const caches = env.PIXI_CACHE_DIR!;
-	const launch = contained(program, args, { writable: [root, caches], readable: [program], network: "all", exact: true });
+	const launch = contained(program, args, { writable: [root, physical(caches)], readable: [program], network, exact: true });
 	// Package install scripts never run uncontained: no facility here, no install.
 	if (!launch.facility) throw new ToolError("This computer has no sandbox to contain package installs (Seatbelt on macOS, bubblewrap on Linux), so nothing was installed.");
-	const child = Bun.spawn([launch.file, ...launch.args], { cwd: tmpdir(), stdout: "pipe", stderr: "pipe", env });
+	const child = Bun.spawn([launch.file, ...launch.args], { cwd: tmpdir(), stdio: ["ignore", "pipe", "pipe", ...(launch.pass ?? [])], env });
 	let out = "";
 	let err = "";
 	const read = async (stream: ReadableStream<Uint8Array>, keep: (text: string) => void) => {
@@ -61,7 +62,7 @@ async function run(program: string, args: string[], root: string, env: Record<st
 			for (const line of text.split(/\r|\n/)) if (line.trim()) log(line.trim());
 		}
 	};
-	await Promise.all([read(child.stdout, (t) => (out += t)), read(child.stderr, (t) => (err += t)), child.exited]);
+	await Promise.all([read(child.stdout, (t) => (out += t)), read(child.stderr, (t) => (err += t)), child.exited]).finally(() => launch.release?.());
 	if (child.exitCode !== 0) throw new ToolError(`pixi ${args[0]} failed:\n${(err || out).trim().split("\n").slice(-25).join("\n")}`);
 	return out;
 }

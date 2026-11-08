@@ -88,7 +88,7 @@ MCP `_meta["org.enrichedlab/project"]`, which a `bun` backend gets as `app.proje
 
 | Backend | What runs | Contained by |
 | --- | --- | --- |
-| `bun` | a module exporting `tools`, on the Bun runtime inside `el` (`BUN_BE_BUN=1`); nothing to install | OS sandbox: writes only to the app's data folder, no network unless `permissions.network` |
+| `bun` | a module exporting `tools`, on the Bun runtime inside `el` (`BUN_BE_BUN=1`); nothing to install | OS sandbox: writes only to the app's data folder, no network unless `permissions.network`; without one (Linux without bubblewrap) it doesn't start, and on Windows it runs as the person, which the consent card says |
 | `command` | any MCP server on stdio the person has (`uv run server.py`, `Rscript srv.R`) | the same |
 | `container` | an MCP server on stdio in an image, built from the folder when `build` is set (Docker, Podman or nerdctl) | the container: `--network none` unless allowed, app folder read-only |
 | `serve` | a web app on `$PORT` (R or Python Shiny, Streamlit, a dev server); the page is its address | OS sandbox with loopback only |

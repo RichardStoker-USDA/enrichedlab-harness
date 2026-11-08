@@ -324,7 +324,10 @@ describe("permissions", () => {
 		const lab = new SandboxWorkspace(api, "/sandbox/work/project-1");
 		const run = { name: "field_sandbox_run", kind: "sandbox" } as unknown as Tool;
 		const askMode = { permissions: { mode: "ask", allowCommands: [] } } as unknown as LabConfig;
-		expect(decide(run, { command: "ls /sandbox/work" }, lab, askMode, new Set()).action).toBe("run");
+		// Round 6: they run outside the fence, so even a read asks unless the person listed it.
+		expect(decide(run, { command: "ls /sandbox/work" }, lab, askMode, new Set()).action).toBe("ask");
+		expect(decide(run, { command: "bat --paging=always --pager /sandbox/work/p/pager README.md" }, lab, askMode, new Set()).action).toBe("ask");
+		expect(decide(run, { command: "ls /sandbox/work" }, lab, { permissions: { mode: "ask", allowCommands: ["ls"] } } as unknown as LabConfig, new Set()).action).toBe("run");
 		expect(decide(run, { command: "rm -rf /sandbox/work/other" }, lab, askMode, new Set())).toMatchObject({ action: "ask", keys: ["sandbox:rm"] });
 		expect(decide(run, { command: "rm -rf /sandbox/work/other" }, lab, askMode, new Set(["shell:rm"])).action).toBe("ask");
 		// B3: in a lab whose fence isn't known to hold, nothing runs on its words alone, checkpointed or not.
@@ -706,19 +709,38 @@ describe("git push", () => {
 });
 
 describe("own-branch commits", () => {
-	test.if(posix)("in a session's own worktree, add and commit run; push, amend and commits elsewhere ask", () => {
+	test.if(process.platform === "darwin")("in a session's own worktree, commits run contained; its git settings and hooks stay read only", async () => {
+		const { execFileSync } = await import("node:child_process");
+		const { createWorktree } = await import("../packages/engine/src/git.ts");
 		const config = { permissions: { mode: "ask", allowCommands: [] } } as unknown as LabConfig;
 		const shell = { name: "shell", kind: "exec" } as unknown as Tool;
-		const repo = scratch("own");
-		const tree = join(repo, ".git", "enrichedlab-worktrees", "w1");
-		mkdirSync(tree, { recursive: true });
-		const own = new LocalWorkspace(tree);
-		const plain = new LocalWorkspace(repo);
+		const repo = realpathSync(scratch("own"));
+		const git = (...a: string[]) => execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", ...a], { cwd: repo, encoding: "utf8" });
+		git("init", "-q");
+		writeFileSync(join(repo, "a.txt"), "one\n");
+		git("add", ".");
+		git("commit", "-q", "-m", "start");
+		const made = createWorktree(repo, "s1", "test");
+		const own = new LocalWorkspace(made.path, "workspace", { path: made.path, repo });
+		expect(own.worktree?.gitDir).toBe(join(repo, ".git"));
 		const run = (ws: LocalWorkspace, command: string) => decide(shell, { command }, ws, config, new Set()).action;
 		expect(run(own, "git add -A && git commit -m 'Fix the parser'")).toBe("run");
-		expect(run(own, "git commit --amend -m x")).toBe("ask");
 		expect(run(own, "git push origin HEAD")).toBe("ask");
-		expect(run(plain, "git commit -m 'Fix the parser'")).toBe("ask");
+		// A folder that only looks like one (no record that the engine made it) isn't the session's worktree.
+		const lookalike = join(repo, ".git", "enrichedlab-worktrees", "w9");
+		mkdirSync(lookalike, { recursive: true });
+		expect(new LocalWorkspace(lookalike).worktree).toBeUndefined();
+		expect(run(new LocalWorkspace(lookalike), "git commit -m x")).toBe("ask");
+		// The commit itself works under the sandbox; the repository's settings and hooks can't be changed from there.
+		writeFileSync(join(made.path, "b.txt"), "two\n");
+		const opts = { timeoutMs: 30_000, signal: new AbortController().signal };
+		const commit = await own.exec("git add -A && git -c user.name=t -c user.email=t@t commit -q -m 'Add b' && git log --oneline -1", opts);
+		expect([commit.exitCode, commit.output]).toEqual([0, expect.stringContaining("Add b")]);
+		const before = readFileSync(join(repo, ".git", "config"), "utf8");
+		expect((await own.exec("git config core.hooksPath /tmp/elsewhere", opts)).exitCode).not.toBe(0);
+		expect((await own.exec(`printf x > ${join(repo, ".git", "hooks", "pre-commit")}`, opts)).exitCode).not.toBe(0);
+		expect(readFileSync(join(repo, ".git", "config"), "utf8")).toBe(before);
+		expect(existsSync(join(repo, ".git", "hooks", "pre-commit"))).toBe(false);
 	});
 });
 

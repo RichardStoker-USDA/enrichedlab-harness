@@ -99,6 +99,12 @@ export function openPhysical(path: string, flags: number, mode = 0o666): number 
 	}
 }
 
+/** Linux: a handle on the folder at a physical path, opened without following a link anywhere (O_PATH: no read needed). */
+export function holdFolder(path: string): number {
+	if (process.platform !== "linux") throw new Error("Folder handles are for Linux.");
+	return linuxWalk(path, parts(path), false);
+}
+
 /** Remove a file at a physical path without following a link anywhere in it; true when it was removed. */
 export function unlinkPhysical(path: string): boolean {
 	if (path.includes("\0")) throw new Error("A path can't hold a NUL character.");

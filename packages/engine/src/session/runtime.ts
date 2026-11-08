@@ -22,7 +22,6 @@ import { adapterFor, type ModelRegistry, whereOf } from "../models/registry.ts";
 import { ModelHttpError, type ModelProfile, type ToolSchema } from "../models/types.ts";
 import { Checkpoints } from "./checkpoint.ts";
 import { changedSince, restoreSnapshot } from "../git.ts";
-import { isReadOnlyCommand } from "../tools/shell.ts";
 import { runHooks } from "../hooks.ts";
 import { projectRoot } from "../prompt.ts";
 import { findSkills, type Skill, skillDirs, skillTool } from "../skills.ts";
@@ -34,7 +33,7 @@ import { type History, localHistory, type Snapshot, sandboxHistory, storeFor } f
 import { canonical, decide } from "../permissions.ts";
 import type { CanvasPublisher, Tool, ToolContext } from "../tools/types.ts";
 import { ToolError } from "../tools/types.ts";
-import type { Workspace } from "../tools/workspace.ts";
+import { FULL_CONTAINMENT, type Workspace } from "../tools/workspace.ts";
 import { SandboxWorkspace } from "../sites/sandbox_workspace.ts";
 import { clip, errorText, estimateTokens, newId, now, redact, sleep } from "../util.ts";
 import { summarize } from "./compaction.ts";
@@ -222,6 +221,11 @@ export class SessionRuntime {
 			this.skillCache = { at: Date.now(), skills: findSkills([...builtin, ...skillDirs(this.deps.config().skills.dirs, projectRoot(this.cwd))]) };
 		}
 		return this.skillCache.skills;
+	}
+
+	/** The worktree EnrichedLab made for this session, as its record says. */
+	get worktree(): { repo: string; path: string; branch: string } | undefined {
+		return this.header?.worktree;
 	}
 
 	private get header(): Ev<"header"> | undefined {
@@ -1058,7 +1062,7 @@ export class SessionRuntime {
 		await this.workspace.prepare?.().catch(() => undefined);
 		const verdict = decide(tool, args, this.workspace, this.deps.config(), this.allowed, this.discovering, this.permissionMode, !this.historyOff);
 		// A read-only subagent is read-only whatever the person's permission mode or sandbox would allow.
-		if (this.agentMode === "read" && !readOnlyCall(tool, args, this.workspace, this.deps.config().permissions.allowCommands)) {
+		if (this.agentMode === "read" && !readOnlyCall(tool, args, this.workspace)) {
 			return { ok: false, content: "Refused: this subagent works read-only. Say in your answer what should change.", decision: "refused", tool, args };
 		}
 		if (verdict.action === "ask") {
@@ -1109,6 +1113,7 @@ export class SessionRuntime {
 				project: projectRoot(this.cwd),
 				sealed: this.deps.sealed?.(this.site),
 				fence: verdict.action === "run" && verdict.fence === true,
+				readOnly: this.agentMode === "read" || (verdict.action === "run" && verdict.readOnly === true),
 				outside: Boolean(tool.ask?.(args, { workspace: this.workspace })),
 				tools: this.deps.toolsDir,
 				packages: this.deps.packageSources?.(this.site),
@@ -1239,8 +1244,12 @@ function transient(error: unknown): boolean {
 	return /network|socket|connection|timed? ?out|terminated|fetch failed|ended early|EOF|ECONN/i.test(e?.message ?? "");
 }
 
-/** What a read-only subagent may do: read, search, look things up, and run commands that only read the project. */
-function readOnlyCall(tool: Tool, args: Record<string, unknown>, workspace: Workspace, allowCommands: string[]): boolean {
-	if (tool.kind === "exec") return isReadOnlyCommand(String(args.command ?? ""), allowCommands, (path) => workspace.inside(path), { expand: workspace.expand?.bind(workspace), gitSafe: workspace.gitSafe?.bind(workspace) });
+/**
+ * What a read-only subagent may do: read, search, look things up, and run commands where the OS keeps them from
+ * writing (contained with nothing in the project writable, or under a lab's fence with no project rights): the
+ * command's words decide nothing.
+ */
+function readOnlyCall(tool: Tool, args: Record<string, unknown>, workspace: Workspace): boolean {
+	if (tool.kind === "exec") return args.unsandboxed !== true && (workspace.fenced === true || (workspace.kind === "local" && workspace.sandboxed !== undefined && FULL_CONTAINMENT.has(workspace.sandboxed)));
 	return tool.kind === "read" || tool.kind === "site-read" || tool.kind === "net" || (tool.kind === "local" && !tool.name.startsWith("agent_") && tool.name !== "remember");
 }

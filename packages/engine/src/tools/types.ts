@@ -45,6 +45,8 @@ export interface ToolContext {
 	outside?: boolean;
 	/** It runs because of the paths it names, in a lab's sandbox: the sandbox checks where they lead first. */
 	fence?: boolean;
+	/** A read-only subagent's call: commands run contained with nothing in the project writable. */
+	readOnly?: boolean;
 	/** Where shared tools (pixi and its caches) are kept on this computer. */
 	tools?: string;
 	/** The vetted package sources of the session's lab, when it names them (its descriptor's `packages`). */

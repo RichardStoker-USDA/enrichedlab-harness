@@ -4,7 +4,7 @@
 // pixi comes from PATH, or is downloaded once into ~/.el/tools and checked against the hashes below.
 
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, statSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { contained, physical } from "../tools/workspace.ts";
@@ -32,7 +32,11 @@ export async function pixi(tools: string, log: (line: string) => void = () => un
 	const build = PIXI_BUILDS[`${process.platform}-${process.arch}`];
 	if (!build) throw new Error(`No pixi build for ${process.platform} ${process.arch}.`);
 	const file = join(tools, `pixi-${PIXI_VERSION}${process.platform === "win32" ? ".exe" : ""}`);
-	if (existsSync(file)) return file;
+	// One already here is checked again before use (a command could have changed it); one that doesn't match is replaced.
+	if (existsSync(file)) {
+		if (pixiMatches(file, build[1])) return file;
+		rmSync(file, { force: true });
+	}
 	mkdirSync(tools, { recursive: true });
 	log(`Getting pixi ${PIXI_VERSION}, which builds app environments without administrator rights`);
 	const response = await fetch(`https://github.com/prefix-dev/pixi/releases/download/v${PIXI_VERSION}/${build[0]}`, { redirect: "follow", signal: AbortSignal.timeout(300_000) });
@@ -43,6 +47,19 @@ export async function pixi(tools: string, log: (line: string) => void = () => un
 	chmodSync(`${file}.part`, 0o755);
 	renameSync(`${file}.part`, file);
 	return file;
+}
+
+/** Files already checked against the pinned hash, by identity and change time, so each launch doesn't reread 50 MB. */
+const checked = new Map<string, string>();
+
+function pixiMatches(file: string, sha256: string): boolean {
+	const s = lstatSync(file, { throwIfNoEntry: false });
+	if (!s?.isFile()) return false;
+	const id = `${s.dev}:${s.ino}:${s.size}:${s.mtimeMs}:${s.ctimeMs}`;
+	if (checked.get(file) === id) return true;
+	const ok = createHash("sha256").update(readFileSync(file)).digest("hex") === sha256;
+	if (ok) checked.set(file, id);
+	return ok;
 }
 
 /** True when the app folder declares an environment. */
@@ -67,16 +84,16 @@ export async function inEnvironment(dir: string, command: string[], tools: strin
 	mkdirSync(caches, { recursive: true });
 	const env: Record<string, string> = { PIXI_NO_PATH_UPDATE: "1", PIXI_CACHE_DIR: caches, PIXI_HOME: caches };
 	for (const key of ["PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "SYSTEMROOT", "SSL_CERT_FILE", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY"]) if (process.env[key]) env[key] = process.env[key]!;
-	const launch = contained(program, ["install", "--manifest-path", manifest], { writable: [home, caches], readable: [program], network: "all" });
+	const launch = contained(program, ["install", "--manifest-path", manifest], { writable: [home, physical(caches)], readable: [program], network: "all", exact: true });
 	// Build scripts never run uncontained: without a facility here, nothing is installed (the consent card says contained).
 	if (!launch.facility) throw new Error("This computer has no sandbox to contain the app's install (Seatbelt on macOS, bubblewrap on Linux), so nothing was installed.");
 	// From a scratch folder: some packages' install scripts write test files where they run, and the app's folder
 	// is watched for edits.
-	const install = Bun.spawn([launch.file, ...launch.args], { cwd: tmpdir(), stdout: "pipe", stderr: "pipe", env });
+	const install = Bun.spawn([launch.file, ...launch.args], { cwd: tmpdir(), stdio: ["ignore", "pipe", "pipe", ...(launch.pass ?? [])], env });
 	const lines = async (stream: ReadableStream<Uint8Array>) => {
 		for await (const chunk of stream) for (const line of new TextDecoder().decode(chunk).split(/\r|\n/)) if (line.trim()) log(line.trim());
 	};
-	await Promise.all([lines(install.stdout), lines(install.stderr), install.exited]);
+	await Promise.all([lines(install.stdout), lines(install.stderr), install.exited]).finally(() => launch.release?.());
 	if (install.exitCode !== 0) throw new Error(`Building the app's environment failed; the app's log has pixi's output.`);
 	return [program, "run", "--manifest-path", manifest, "--frozen", "--", ...command];
 }

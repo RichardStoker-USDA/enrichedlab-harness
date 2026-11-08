@@ -51,9 +51,10 @@ Updates are signed and install themselves the same way: the app offers them, `el
   fill PDF forms.
 - **Where work runs.** Each session works on this computer or in a lab sandbox, and can move between them, taking
   its git repository along. A lab that keeps its data inside pins its sessions there.
-- **Contained by default.** On macOS and Linux the agent's commands can write only to the project, can't read your
-  credentials, and have no network unless you allow it. On Windows they can write only to the project and ask
-  before they run ([docs/security.md](docs/security.md)).
+- **Contained by default.** On macOS and Linux the agent's commands can write only to the project and temp folders,
+  can't read your credential folders, and have no network unless you allow it; anything that would run outside that
+  asks first. On Windows they can write only to the project and temp folders, can read your credential folders, and
+  ask before they run ([docs/security.md](docs/security.md)).
 
 ## Terminal
 

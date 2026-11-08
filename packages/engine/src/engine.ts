@@ -374,7 +374,7 @@ export class Engine {
 		const site = runtime.site;
 		if (site && this.sites.isolated(site) && place !== site) throw new RpcError(-32602, `${this.sites.title(site)} keeps this session's work in its sandbox.`);
 		if (place === "local") {
-			const local = new LocalWorkspace(runtime.cwd, this.config.permissions.sandbox);
+			const local = new LocalWorkspace(runtime.cwd, this.config.permissions.sandbox, runtime.worktree);
 			const carried = runtime.placement?.carried;
 			let detail = "Files and commands act on this computer again.";
 			if (carried && from !== "local") {
@@ -578,6 +578,8 @@ export class Engine {
 		if (!/^s[0-9a-z]+$/.test(id) || !log.exists()) throw new RpcError(-32004, `No session ${id}.`);
 		const meta = log.meta();
 		session = new SessionRuntime(log, new LocalWorkspace(meta?.cwd ?? process.cwd(), this.config.permissions.sandbox), this.deps());
+		// Its own worktree, as its record says: commits there go into the repository's git folder.
+		if (session.worktree && session.workspace.kind === "local") session.useWorkspace(new LocalWorkspace(session.workspace.root, this.config.permissions.sandbox, session.worktree));
 		// A session that last worked in a site's sandbox picks up there.
 		const placed = session.placement;
 		if (placed && placed.place !== "local") session.useWorkspace(new SandboxWorkspace(this.sandboxFor(placed.place), placed.root));
@@ -629,7 +631,7 @@ export class Engine {
 		const pinned = site && this.sites.isolated(site) ? site : undefined;
 		if (pinned && !this.sites.sandbox(pinned)) throw new RpcError(-32602, `Sign in to ${this.sites.title(pinned)} first; its work happens in its sandbox.`);
 		const tail = newId("p").slice(-6);
-		const workspace: Workspace = pinned ? new SandboxWorkspace(this.sandboxFor(pinned), this.sandboxRoot(folder, tail)) : new LocalWorkspace(folder, this.config.permissions.sandbox);
+		const workspace: Workspace = pinned ? new SandboxWorkspace(this.sandboxFor(pinned), this.sandboxRoot(folder, tail)) : new LocalWorkspace(folder, this.config.permissions.sandbox, tree);
 		const allowed = (m: ModelProfile | undefined) => (m && this.sites.allows(m, site) ? m : undefined);
 		const profile = allowed(this.registry.resolve(model)) ?? allowed(this.registry.preferred()) ?? this.registry.all().find((m) => this.sites.allows(m, site));
 		// An isolated site's bundles reach only the sessions bound to that site.

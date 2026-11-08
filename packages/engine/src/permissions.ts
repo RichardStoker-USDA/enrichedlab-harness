@@ -20,8 +20,11 @@ import { FULL_CONTAINMENT, physical } from "./tools/workspace.ts";
 import type { Workspace } from "./tools/workspace.ts";
 
 export type Verdict =
-	/** `fence`: it runs because of the paths it names, in a lab's sandbox, so the sandbox checks where they lead first. */
-	| { action: "run"; fence?: boolean }
+	/**
+	 * `fence`: it runs because of the paths it names, in a lab's sandbox, so the sandbox checks where they lead first.
+	 * `readOnly`: it runs contained with nothing in the project writable (it only reads, where nothing may change).
+	 */
+	| { action: "run"; fence?: boolean; readOnly?: boolean }
 	| {
 			action: "ask";
 			reason: string;
@@ -201,6 +204,10 @@ const GIT_COMMANDS = new Set(("add am annotate apply archive bisect blame branch
 	"update-ref update-server-info upload-archive upload-pack var verify-commit verify-pack verify-tag version whatchanged worktree write-tree").split(" "));
 /** git options whose value is the next word. */
 const GIT_VALUE_OPTIONS = new Set(["-c", "-C", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env", "--list-cmds", "--attr-source"]);
+/** git subcommands that send work somewhere else: push and its plumbing, and patches mailed out. */
+const PUBLISH = ["push", "send-pack", "http-push", "send-email", "imap-send"];
+const GIT_PUBLISHERS = PUBLISH.flatMap((p) => [`git-${p}`, `git-${p}.exe`]);
+
 /** Settings that make git run a program (or rename a command): set on the command line, git could push unseen. */
 const GIT_RUNS = /^(alias\.|core\.(sshcommand|fsmonitor|pager|editor|askpass|hookspath|gitproxy|alternaterefscommand)|diff\.|filter\.|merge\.|gpg\.|credential\.|uploadpack\.|receivepack\.|sequence\.|interactive\.|remote\.|protocol\.|url\.|include|pager\.|log\.showsignature|submodule\.)/i;
 /** Programs that never run their arguments, so a shell's name among them is just a name. */
@@ -244,7 +251,7 @@ function patternRegex(pattern: string): RegExp | undefined {
  */
 function publishing(command: string, depth = 0): "push" | "hidden" | undefined {
 	const line = everyCommand(command);
-	if (!line || depth > 4) return /\bgit\b|\bpush\b/.test(command) ? "push" : "hidden";
+	if (!line || depth > 4) return /\bgit\b|\bpush\b|\bsend-pack\b/.test(command) ? "push" : "hidden";
 	const name = (w: string) => w.replace(/^.*\//, "");
 	const could = (text: string | undefined, pattern: string | undefined, names: string[]) => {
 		if (text === undefined) return false;
@@ -253,7 +260,7 @@ function publishing(command: string, depth = 0): "push" | "hidden" | undefined {
 		const re = patternRegex(last);
 		return !re || names.some((n) => re.test(n));
 	};
-	const isPush = (w: string | undefined, p: string | undefined) => (p ? could(w, p, ["push"]) : w !== undefined && /(^|\s)push\b/.test(w));
+	const isPush = (w: string | undefined, p: string | undefined) => (p ? could(w, p, PUBLISH) : w !== undefined && (/(^|\s)push\b/.test(w) || PUBLISH.includes(name(w))));
 	const words: string[] = [];
 	let hidden = false;
 	let sawGit = false;
@@ -268,6 +275,11 @@ function publishing(command: string, depth = 0): "push" | "hidden" | undefined {
 		if (WRAPPERS.has(lead) && argv.includes(undefined)) hidden = true;
 		if (lead === "env" && argv.some((w) => w !== undefined && (/^(-[a-zA-Z]*S|--split-string)/.test(w) || /^GIT_/.test(w)))) hidden = true;
 		for (let i = 0; i < argv.length; i++) {
+			// git's publishing programs named directly (git-send-pack, git-push).
+			if (could(argv[i], patterns[i], GIT_PUBLISHERS)) {
+				sawGit = true;
+				sawPush = true;
+			}
 			if (could(argv[i], patterns[i], ["git", "git.exe"])) {
 				sawGit = true;
 				let j = i + 1;
@@ -283,6 +295,8 @@ function publishing(command: string, depth = 0): "push" | "hidden" | undefined {
 				}
 				const sub = argv[j];
 				if (j < argv.length && (sub === undefined || patterns[j] !== undefined || !GIT_COMMANDS.has(sub))) hidden = true;
+				// git svn dcommit and git p4 submit publish too.
+				if ((sub === "svn" && argv.slice(j).includes("dcommit")) || (sub === "p4" && argv.slice(j).includes("submit"))) sawPush = true;
 				if (argv.slice(i + 1).includes(undefined)) hidden = true;
 			}
 			if (isPush(argv[i], patterns[i])) sawPush = true;
@@ -326,7 +340,7 @@ function publishing(command: string, depth = 0): "push" | "hidden" | undefined {
 	const text = words.join(" ");
 	// Functions, aliases and sourced files run what the line can't show: a push when git or push is in it at all.
 	if ((line.functions || words.some((w) => w === "alias" || w === "source" || w === ".")) && /\bgit\b|\bpush\b/.test(`${text} ${command}`)) return "push";
-	if ((sawGit && sawPush) || words.some((w) => /\bgit\b[\s\S]*\bpush\b/.test(w)) || (hidden && sawPush)) return "push";
+	if ((sawGit && sawPush) || words.some((w) => /\bgit\b[\s\S]*\b(push|send-pack|http-push|send-email|imap-send)\b/.test(w)) || (hidden && sawPush)) return "push";
 	return hidden ? "hidden" : undefined;
 }
 
@@ -497,9 +511,9 @@ export function decide(tool: Tool, args: Record<string, unknown>, workspace: Wor
 			const command = typeof args.command === "string" ? args.command : undefined;
 			if (!command) return extra ? askOutside(extra) : { action: "run" };
 			// A lab tool that runs a command in the person's sandbox, outside any session's project folder (where other
-			// sessions' projects live): read-only commands run; in auto, a sandbox whose whole disk is checkpointed runs
-			// anything; the rest asks, remembered per program.
-			if (isReadOnlyCommand(command, config.permissions.allowCommands, () => true)) return { action: "run" };
+			// sessions' projects live) and outside the fence: only what the person listed in allowCommands runs; in auto,
+			// a sandbox whose whole disk is checkpointed runs anything; the rest asks, remembered per program.
+			if (personAllows(command, config.permissions.allowCommands)) return { action: "run" };
 			if (mode === "auto" && workspace.kind === "sandbox" && workspace.checkpointed === "filesystem") return { action: "run" };
 			return ask("It runs a command in the lab's sandbox, outside this session's project folder, where other sessions' work can be.");
 		}
@@ -526,8 +540,6 @@ export function decide(tool: Tool, args: Record<string, unknown>, workspace: Wor
 		}
 		case "exec": {
 			const command = String(args.command ?? "");
-			// In its own worktree the agent commits to its own branch; the person merges it.
-			if (ownBranchCommit(command, workspace)) return { action: "run" };
 			// Contained by the OS: writes stay in the project and temp folders, no network. Runs without asking unless it
 			// names a path outside the project or expands variables (the sandbox can still read most of the disk).
 			// Windows contains writes only, so there it still asks. A folder set to read only asks for everything.
@@ -545,7 +557,12 @@ export function decide(tool: Tool, args: Record<string, unknown>, workspace: Wor
 			// program does can't be read from its words, so nothing runs uncontained without a yes, except what the
 			// person listed in allowCommands.
 			const runsContained = fenced || Boolean(local && workspace.sandboxed && FULL_CONTAINMENT.has(workspace.sandboxed) && args.unsandboxed !== true);
-			if (runsContained && isReadOnlyCommand(command, config.permissions.allowCommands, inside, judging)) return fenced ? { action: "run", fence: true } : { action: "run" };
+			if (runsContained && isReadOnlyCommand(command, config.permissions.allowCommands, inside, judging)) {
+				// In a folder set to read only, or without history to take a change back, the OS keeps it from writing:
+				// what a program does isn't decided by its words.
+				const sealed = !recoverable || (local && readOnlyWithin(config, workspace.root));
+				return { action: "run", ...(fenced ? { fence: true } : {}), ...(sealed ? { readOnly: true } : {}) };
+			}
 			if (personAllows(command, config.permissions.allowCommands)) return { action: "run" };
 			// In a lab's sandbox whose whole disk is checkpointed, any command can be taken back.
 			if (mode === "auto" && workspace.kind === "sandbox" && workspace.checkpointed === "filesystem" && args.unsandboxed !== true) return { action: "run" };
@@ -575,14 +592,7 @@ const WRITES: Record<string, string> = {
 /** Shells: handed a script or -c, they run what their words don't show. */
 const SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh", "mksh", "fish", "csh", "tcsh", "busybox", "rbash"]);
 
-/** True when the session works in a worktree EnrichedLab made for it. */
+/** True when the session works in the worktree EnrichedLab made for it (from the session's record, not its path). */
 function ownWorktree(workspace: Workspace): boolean {
-	return /[/\\]\.git[/\\]enrichedlab-worktrees[/\\]/.test(workspace.root);
-}
-
-/** `git add` and `git commit` (alone or joined with &&) inside a worktree EnrichedLab made for this session. */
-function ownBranchCommit(command: string, workspace: Workspace): boolean {
-	if (!ownWorktree(workspace)) return false;
-	const parts = command.split("&&").map((part) => part.trim());
-	return parts.every((part) => /^git\s+(add|commit|status|diff|log)\b/.test(part) && !/[;|<>`$\n&]/.test(part) && !/\s--(amend|no-verify)\b/.test(part) && pathsInside(part, (path) => workspace.inside(path)));
+	return workspace.worktree !== undefined;
 }

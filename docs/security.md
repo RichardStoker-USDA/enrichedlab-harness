@@ -18,11 +18,11 @@ for each operating system.
 | | macOS | Linux | Windows |
 | --- | --- | --- | --- |
 | Facility | Seatbelt (`sandbox-exec`) | bubblewrap, when user namespaces work | a write-restricted copy of the person's token |
-| Writes | project and temp folders | project and temp folders | project and temp folders |
+| Writes | project and temp folders, not a repository's git settings or hooks | the same (settings and hooks that exist) | project and temp folders |
 | Credential folders (`~/.ssh`, `~/.aws`, key stores, browser profiles) | hidden | hidden | readable |
 | Network | off unless allowed | off unless allowed | open |
 | Commands inside the project | run | run | ask first |
-| App backends | contained as above | contained as above | run as the person (the consent card says so) |
+| App backends | contained as above | contained as above; without bubblewrap they don't start | run as the person (the consent card says so) |
 
 None of these need administrator rights. Where the facility isn't available (bubblewrap inside a container, a
 locked-down Windows policy), commands run as the person and every one asks first.
@@ -36,35 +36,87 @@ approves to run uncontained gets the whole environment.
 ## What is trusted
 
 Approvals and fences guard against what the agent does and what a project holds, not against the person's own
-computer. Untrusted: the model's output, every file in a project (its `.git/config`, `.pixi`, scripts and data),
-packages and run packages from others, and anything a command started by the agent leaves behind. Trusted: the
-person's own environment as EnrichedLab starts in it (`PATH`, loader variables, `TMPDIR`, global and system git
-settings, Homebrew's folders), and a lab's image and the environment its gate gives each command. Whoever can change
-those already runs code as the person, so a defense against them would only move the problem.
+computer.
 
-Safety comes from containment, not from reading commands: nothing runs outside the OS sandbox (or a lab's fence)
-without a yes, except what the person listed in `allowCommands`. The engine's own git work on a project's repository
-(worktrees, snapshots, sending a project to a lab) runs contained too, because the repository's settings and
-attributes are project content and can name programs (filter and diff drivers): it may write that repository and
-the temp folders, with hooks and fsmonitor off and no network. What it may write widens past the folder only in
-layouts git makes itself (the folder's own `.git`, a repository above it whose `.git` sits in its top folder, or an
-EnrichedLab worktree inside `.git`), so a `.git` file or `core.worktree` pointing elsewhere grants nothing. Where
-this computer has no facility, the engine's git turns every configured filter driver off instead. Reading a command's words decides only what may
-run unasked inside containment and what an answer covers. Inside containment a command can still read most of the
-disk (credential folders aren't readable) and has no network, so it can't push, whatever its words say.
+- Untrusted: the model's output, every file in a project (its `.git/config`, `.gitattributes`, `.pixi`, scripts and
+  data), packages and run packages from others, and whatever a contained command leaves behind.
+- Trusted: the person's own environment as EnrichedLab starts in it (`PATH` and loader variables, global and system
+  git settings, Homebrew's folders), and a lab's image and the environment its gate gives each command. Whoever can
+  change those already runs code as the person. That holds only while they lead to what only the person controls:
+  a `PATH` entry, an `include.path` or a loader library inside a project hands that trust to project content, so
+  don't set one up that way.
+- What the person approves extends trust. An approved uncontained command or package install can change trusted
+  places (Homebrew, global git settings, the package cache), and the result counts as the person's. EnrichedLab
+  checks one of them itself: its own pixi, compared with the pinned SHA-256 before every use.
+- `TMPDIR`, `/tmp` and `/private/tmp` are shared scratch space, not trusted code: contained commands may write there,
+  so nothing that matters belongs there, and a project kept there isn't protected from other contained commands.
+
+Containment is the boundary: nothing runs outside the OS sandbox or a lab's fence without a yes. The exceptions are
+the person's own settings:
+
+- commands listed in `allowCommands` (a whole-word prefix, with no globs, chaining or expansion in the command);
+- `full` mode, which runs everything except pushes the line shows and lab tools the lab hasn't reviewed;
+- Discovery mode, for what acts inside the lab it applies to;
+- `auto` in a lab sandbox that checkpoints its whole disk, where commands run unfenced. A checkpoint brings the
+  sandbox's disk back; it doesn't take back what left the sandbox or what other sessions did there meanwhile.
+
+The engine's own work stays inside the same line:
+
+- Its git on a project's repository (worktrees, snapshots, sending a project to a lab) runs contained, because the
+  repository's settings and attributes are project content and can name programs (filter and diff drivers). It may
+  write that repository and the temp folders, with hooks and fsmonitor off and no network. What it may write widens
+  past the folder only in layouts git makes itself (the folder's own `.git`, a repository above it whose `.git`
+  sits in its top folder, or an EnrichedLab worktree inside `.git`), so a `.git` file or `core.worktree` pointing
+  elsewhere grants nothing. Where this computer has no facility, the filter, diff and alternate-refs programs the
+  repository's own settings define (local and worktree scope, includes from them counted) are turned off instead;
+  git older than 2.26 can't say where a setting comes from, so the engine's git doesn't run there. Its only fetch
+  reads a bundle file over the file transport, and a test pins the git subcommands it uses (none merges or prints
+  file content).
+- Bringing work back from a lab commits what's left with hooks, fsmonitor and signing off, under the lab's fence
+  when it holds; without the fence, the filter drivers the repository's own settings define are off too.
+- App backends (`bun`, `command`, `serve`) run contained or not at all. On Windows, where servers run as the person,
+  the consent card says so before anything starts.
+- Package installs and listings run contained with the pinned pixi; a listing gets no network.
+- In a session's own worktree (known from the session's record, not its path) commands run contained with the
+  repository's git folder writable, so commits work. In every repository the sandbox can reach, `.git/config`,
+  `.git/hooks`, `.git/info` and a worktree's `config.worktree` stay read only, since git runs programs from them
+  the next time the person uses git (on Linux, the ones that exist).
+- A read-only subagent's commands run contained with nothing in the project writable (under a lab's fence, with no
+  project rights), or not at all. Their words decide nothing.
+
+Reading a command's words still decides three things: which lines are pushes (they ask in every mode), what may
+run unasked inside containment (paths inside the project), and what an answer covers. Inside containment a command
+can still read most of the disk (credential folders aren't readable) and has no network, so it can't push whatever
+its words say.
 
 Accepted residuals, each with its reason:
 
-- In `full` mode, for commands run outside containment and for programs and scripts generally, only pushes the line
-  shows are caught. A script or program that pushes on its own can't be seen from its words; `full` means the person
-  allowed that.
-- In a lab sandbox, Landlock covers file contents, names and existence, not modes, owners or times, and doesn't
-  restrict running programs. A fenced command could `chmod` another project's files in the same person's sandbox,
-  which loses no data and can be undone. UDP and pathname sockets are left to the lab's no-network rule.
-- `full`, Discovery mode, and `auto` in a lab that checkpoints its whole disk run commands without the fence.
-- Races that need a second process running outside containment at the same moment (an approved background
-  command) aren't defended; file operations refuse links and hard links, not a real folder renamed into place.
-- Windows file operations aren't anchored the same way (its links need privileges to make).
+- Pushes the line doesn't show. In `full` mode and for commands the person approves outside containment, only pushes
+  the command line shows are caught (`git push`, `send-pack`, `http-push`, `svn dcommit`, `p4 submit`,
+  `send-email`, however quoted, wrapped or encoded). A script or program that pushes on its own isn't. "Pushes ask"
+  means pushes the line shows.
+- The lab fence by Landlock ABI. ABI 3 covers file contents, names, existence and truncation; refusing TCP needs ABI
+  4, device ioctls ABI 5, and signals and abstract sockets to processes outside the fence ABI 6. Below those, a fenced
+  command reaches the rest of the sandbox (one person's, with no network) that way. UDP is left to the lab's
+  no-network rule, and pathname sockets inside the sandbox aren't fenced, so a fenced command can talk to a server
+  another session started there.
+- Metadata and running programs. Landlock doesn't restrict modes, owners, times, extended attributes or ACLs, so a
+  fenced command can change those on other projects' files in the same sandbox (files the sandbox user owns). That
+  can change who may read them and their recorded times, and a project's checkpoints don't undo it. Running programs
+  isn't restricted either; that is needed, and whatever they start inherits the fence.
+- Hard links and mounts. A file in the project is in the project, whatever other names it has: a hard link that
+  already exists (made by the person, or by a command they approved outside containment) lets a contained command
+  change that file through it. Contained commands can't make new hard links to files outside (Seatbelt, Landlock and
+  bubblewrap each refuse it, and the fence's probe checks that), and EnrichedLab's own file writes refuse a file
+  with a second name. A folder mounted inside the project (an automount, a bind mount the person or the lab set up)
+  counts as part of the project for commands and file operations alike; the Linux walk crosses mount points.
+- Races with an uncontained process. A second process running outside containment at the same moment (an approved
+  background command) isn't defended against. File operations refuse links and hard links, not a real folder
+  renamed into place. Contained commands can't win these races: a folder granted by its checked path is bound by
+  handle (bubblewrap `--bind-fd`) or judged by real path (Seatbelt).
+- Windows. File operations there follow links and junctions, and any user can make a junction (`mklink /J`).
+  Commands on Windows aren't fully contained and ask first, so a junction in a project comes from the person or a
+  command they approved, and a write through one lands where it leads.
 
 ## How much it asks
 
@@ -109,7 +161,7 @@ what follows it (`sudo`, `ssh`, `env`, `timeout`, `xargs`, `eval`, `source`), or
 change which program runs or what it loads. That is judged broadly: a toolchain's own prefix (`PHP*`, `PYTHON*`,
 `GIT_*`, `LD_*`, `DYLD_*`, `NODE*`), or any part of the name that says path, folder, library, config, startup or
 command (`PATH`, `DIR`, `LIB`, `INI`, `RC`, `CONFIG`, `OPTS`, `PRELOAD`, `CMD`). Data variables in front
-(`SEED=42 python3 run.py`) share the program's answer. A push asks every time, however it's quoted, encoded or
+(`SEED=42 python3 run.py`) share the program's answer. A push the line shows asks every time, however it's quoted, encoded or
 globbed (`git 'push'`, `$'\x67it' $'\x70ush'`, `/usr/bin/g[i]t p[u]sh`, a continued line), anywhere in the line,
 including code handed to `eval` or a shell (directly or through `env`, `env -S`, `timeout`, `nice`, `xargs` and the
 like), a word that is itself a command line (a pager, an editor, `--compress-program`) and here-documents, and so does a line where git or push sits beside a function, alias or sourced file. A line that
@@ -134,7 +186,7 @@ swapped for a link after the check makes the write fail instead of landing elsew
 refused, and a file with a second name (a hard link) isn't written unless its outside path was approved.
 Without step history (its store failed), a contained command that changes things asks too. A session
 keeps the mode it started with; a subagent asks as much as the session that started it. A session's own worktree
-runs file edits. In a lab's sandbox, commands and file
+runs file edits, and its commits run contained like any command. In a lab's sandbox, commands and file
 edits inside the project run without asking: the sandbox is a separate machine with no network, and its work comes
 home as a branch the person merges. There the fence is Linux Landlock, ABI 3 or later (`sites/sandbox_fence.ts`):
 the image's own `/usr/bin/python3` or `/usr/local/bin/python3` (root-owned, in a root-owned folder, writable by no one
@@ -248,7 +300,7 @@ How EnrichedLab maps to the NIST AI Risk Management Framework (AI RMF 1.0) and i
 
 - **Govern.** Labs decide access by role (docs/labs.md). A lab that keeps data inside pins its sessions to its
   sandbox and models and removes web, personal MCP and download tools. Risk: an agent or an app acts beyond what the
-  person meant. Controls: pushes always ask, commits outside the session's worktree ask, an app's permissions are
+  person meant. Controls: pushes the command line shows ask in every mode, commands outside containment ask, an app's permissions are
   shown and granted before its page loads, and messages from apps are marked as the app's, not the person's.
 - **Map.** Each session records where it works, which model answered, every tool call with its arguments and
   result, permission decisions, and what apps told the model (`~/.el/sessions/<id>/log.jsonl`).

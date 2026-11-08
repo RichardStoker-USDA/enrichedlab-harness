@@ -241,7 +241,7 @@ export const shellTool: Tool = {
 		if (!command.trim()) throw new ToolError("The command is empty.");
 		const timeout = Math.min(MAX_TIMEOUT_S, Math.max(1, num(args, "timeout") ?? DEFAULT_TIMEOUT_S));
 		const started = Date.now();
-		const result = await ctx.workspace.exec(command, { timeoutMs: timeout * 1_000, signal: ctx.signal, onOutput: ctx.output, unsandboxed: args.unsandboxed === true, ...(ctx.fence ? { fence: wordsOf(command) } : {}) });
+		const result = await ctx.workspace.exec(command, { timeoutMs: timeout * 1_000, signal: ctx.signal, onOutput: ctx.output, unsandboxed: args.unsandboxed === true, ...(ctx.fence ? { fence: wordsOf(command) } : {}), ...(ctx.readOnly ? { readOnly: true } : {}) });
 		const seconds = ((Date.now() - started) / 1000).toFixed(1);
 		const status = result.timedOut ? `stopped after ${timeout}s` : ctx.signal.aborted ? "cancelled" : `exit ${result.exitCode ?? "?"}`;
 		const output = result.output.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "");

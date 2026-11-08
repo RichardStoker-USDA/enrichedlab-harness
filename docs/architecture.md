@@ -157,12 +157,13 @@ like any skill; a personal or project skill with the same name replaces one.
 
 **Permissions.** Three modes decide what asks: `ask`, `auto` (the default: asks only for what history can't take
 back) and `full` ([security.md](security.md#how-much-it-asks)). Reads inside the project run. A shell command runs
-without asking when it runs contained and names only paths inside the project, or when a quote-aware check finds every
-part read-only (no variables, substitutions, subshells, background jobs, writing redirections or environment
-prefixes; no command that runs another program) with every path inside the project after following symlinks.
+without asking only when it runs contained (the OS sandbox, or a lab's fence) and names only paths inside the
+project, or reads outside it; a command that would run uncontained asks unless the person listed it in
+`allowCommands`. Containment is the boundary; the parser's reading of a line decides pushes and what an answer covers.
 Anything outside the project asks, and `fetch` asks once per host. "Allow for this session" covers each program a
 command runs (`python3`, `git commit`), is kept in the session log, and the button says what it covers. A site tool
-runs when the site marks it read-only and asks otherwise. Sandbox commands run, since the sandbox is isolated. The person answers from whichever surface they are looking at; the
+runs when the site marks it read-only and asks otherwise. Commands in a lab's sandbox run under its fence where it
+holds and ask where it doesn't; a lab's own command tools, which act outside the project folder, ask unless listed. The person answers from whichever surface they are looking at; the
 first answer wins. `el run` refuses what would ask, unless started with `--allow`.
 
 **Windows that act.** A surface can say in `hello` what it can do for the engine. The desktop windows say "browser":
@@ -238,8 +239,8 @@ official AppBridge (AppPane.svelte). [apps.md](apps.md) has the details.
 ## Git and add-ons
 
 In a git repository each turn starts with a working-tree snapshot on a hidden ref, so undo covers shell changes. A
-session or full-mode subagent can work in its own worktree and branch, where it edits and commits without asking;
-pushes always ask. Bundles add skills, instructions, MCP servers, hooks and model settings, from the person or from
+session or full-mode subagent can work in its own worktree and branch, where it edits and commits without asking
+(commits run contained); pushes the command line shows always ask. Bundles add skills, instructions, MCP servers, hooks and model settings, from the person or from
 a lab. Details and rules: [bundles.md](bundles.md).
 
 ## Security
