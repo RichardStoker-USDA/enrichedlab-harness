@@ -450,7 +450,7 @@ export async function reproduceStep(folder: string, step: string, options: { pre
 		// environment of a few plain variables, nothing inherited. No facility here: it doesn't run.
 		const temp = join(work, ".tmp");
 		mkdirSync(temp);
-		const launch = contained("/bin/sh", ["-c", command], { writable: [work], network: "none" });
+		const launch = contained("/bin/sh", ["-c", command], { writable: [work], network: "none", temp: false });
 		if (!launch.facility || launch.facility === "restricted-token") throw new Error("This computer can't contain the rerun (it needs Seatbelt on macOS or bubblewrap on Linux), so it didn't run.");
 		const env: Record<string, string> = { PATH: "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin", HOME: work, TMPDIR: temp, LANG: process.env.LANG ?? "C.UTF-8", TZ: "UTC" };
 		const timeout = options.timeoutMs ?? 600_000;

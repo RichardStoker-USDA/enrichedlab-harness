@@ -8,7 +8,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { LabConfig } from "../packages/engine/src/config.ts";
-import { allowKey, allowKeys, canonical, decide, folderAccess, identity, pushes, scripted } from "../packages/engine/src/permissions.ts";
+import { allowKey, allowKeys, canonical, decide, folderAccess, HIDDEN_REASON, identity, pushes } from "../packages/engine/src/permissions.ts";
 import { manifest } from "../packages/engine/src/tools/environment.ts";
 import { commandWords, isReadOnlyCommand } from "../packages/engine/src/tools/shell.ts";
 import type { Tool } from "../packages/engine/src/tools/types.ts";
@@ -43,6 +43,15 @@ const at = "2026-11-03T00:00:00Z";
 const user = (text: string): SessionEvent => ({ t: "user", id: `e${n++}`, at, text });
 const say = (text: string, calls?: { id: string; name: string; args: string }[]): SessionEvent => ({ t: "assistant", id: `e${n++}`, at, model: "m", text, toolCalls: calls, stop: calls ? "tool_use" : "end" });
 const tool = (callId: string, content: string, handle?: string): SessionEvent => ({ t: "tool", id: `e${n++}`, at, callId, name: "read", ok: true, content, handle });
+
+
+/** A lab sandbox whose fence probe reports that Landlock holds. */
+async function fencedLab(): Promise<SandboxWorkspace> {
+	const api = { title: "Field Lab", run: async (c: string) => ({ exitCode: 0, stdout: c.includes(" probe") ? "el-fence ok abi 6\n" : "", stderr: "" }) } as unknown as SandboxApi;
+	const lab = new SandboxWorkspace(api, "/sandbox/work/project-1");
+	await lab.prepare();
+	return lab;
+}
 
 describe("context", () => {
 	test("derives messages and answers calls that never finished", () => {
@@ -257,14 +266,20 @@ describe("permissions", () => {
 		expect(activated(project, { PATH: "/usr/bin" })).toMatchObject({ PATH: `${join(project, ".pixi", "envs", "default", "bin")}:/usr/bin`, CONDA_PREFIX: join(project, ".pixi", "envs", "default") });
 	});
 
-	test("in a lab's sandbox, code handed to an interpreter or a quoted script asks: its paths aren't in its words", () => {
+	test("in a lab's sandbox, commands run under the file fence where it holds; where it doesn't, they ask", async () => {
 		const api = { title: "Field Lab", run: async () => ({ exitCode: 0, stdout: "", stderr: "" }) } as unknown as SandboxApi;
-		const lab = new SandboxWorkspace(api, "/sandbox/work/project-1");
+		const unfenced = new SandboxWorkspace(api, "/sandbox/work/project-1");
+		const lab = await fencedLab();
+		await unfenced.prepare();
+		expect([lab.fenced, unfenced.fenced]).toEqual([true, false]);
 		const auto = { permissions: { mode: "auto", allowCommands: [] } } as unknown as LabConfig;
-		for (const command of ["sh -c 'rm /sandbox/work/other/user-work.txt'", "python3 -c 'import shutil; shutil.rmtree(chr(47)+\"sandbox\")'", "cat list.txt | xargs rm", "awk 'BEGIN{system(\"rm -rf ../other\")}'", "rm 'a b/../../other/x'"]) {
-			expect([command, decide(shell, { command }, lab, auto, new Set()).action]).toEqual([command, "ask"]);
+		// Code handed to an interpreter runs fenced: Landlock, not its words, keeps its writes in the project.
+		for (const command of ["sh -c 'rm /sandbox/work/other/user-work.txt'", "python3 -c 'import shutil; shutil.rmtree(chr(47)+\"sandbox\")'", "cat list.txt | xargs rm", "awk 'BEGIN{system(\"rm -rf ../other\")}'", "rm notes.txt && python3 run.py"]) {
+			expect([command, decide(shell, { command }, lab, auto, new Set())]).toEqual([command, { action: "run", fence: true }]);
+			expect([command, decide(shell, { command }, unfenced, auto, new Set()).action]).toEqual([command, "ask"]);
 		}
-		expect(decide(shell, { command: "rm notes.txt && python3 run.py" }, lab, auto, new Set()).action).toBe("run");
+		// A path it names outside the project still asks.
+		expect(decide(shell, { command: "rm 'a b/../../other/x'" }, lab, auto, new Set()).action).toBe("ask");
 	});
 
 	test("auto asks as ask does when the folder's history can't be kept", () => {
@@ -306,14 +321,15 @@ describe("permissions", () => {
 		expect(decide(run, { command: "ls /sandbox/work" }, lab, askMode, new Set()).action).toBe("run");
 		expect(decide(run, { command: "rm -rf /sandbox/work/other" }, lab, askMode, new Set())).toMatchObject({ action: "ask", keys: ["sandbox:rm"] });
 		expect(decide(run, { command: "rm -rf /sandbox/work/other" }, lab, askMode, new Set(["shell:rm"])).action).toBe("ask");
-		// B3: in a lab, only plain lines run on the paths they name, checkpointed or not, and those carry the fence.
+		// B3: in a lab whose fence isn't known to hold, nothing runs on its words alone, checkpointed or not.
 		const whole = { ...api, checkpoints: () => ({ make: async () => "k1", restore: async () => undefined }) } as unknown as SandboxApi;
 		const checkpointed = new SandboxWorkspace(whole, "/sandbox/work/project-1");
 		await checkpointed.checkpoint("start");
 		for (const command of ["eval 'rm${IFS}../other/x'", "bash <<< 'rm ../other/x'", "'sh' -c 'rm ../other/x'", "BASH_ENV=p.sh bash run.sh", "bash --rcfile ./rc -i", "source ./env.sh"]) {
 			for (const ws of [lab, checkpointed]) expect([command, decide(shell, { command }, ws, askMode, new Set()).action]).toEqual([command, "ask"]);
 		}
-		expect(decide(shell, { command: "rm notes.txt" }, lab, askMode, new Set())).toEqual({ action: "run", fence: true });
+		expect(decide(shell, { command: "rm notes.txt" }, lab, askMode, new Set()).action).toBe("ask");
+		expect(decide(shell, { command: "rm notes.txt" }, await fencedLab(), askMode, new Set())).toEqual({ action: "run", fence: true });
 		// B6: a variable naming a config, startup or library place is remembered exactly; data variables aren't.
 		for (const command of ["PHP_INI_SCAN_DIR=./ini php a.php", "PHPRC=. php a.php", "DATA_DIR=out python3 a.py", "R_PROFILE_USER=./x Rscript a.R", "RUBYOPT=-r./x ruby a.rb"]) {
 			expect([command, allowKeys(shell, { command }).scope]).toEqual([command, "this exact command"]);
@@ -344,8 +360,7 @@ describe("permissions", () => {
 		expect(existsSync(join(outsideDir, "x.txt"))).toBe(false);
 		await contained.write("moved/x.txt", "x", { outside: true });
 		expect(readFileSync(join(outsideDir, "x.txt"), "utf8")).toBe("x");
-		// Quoted interpreter flags are still code; every word of a fenced line is checked.
-		expect(scripted("python3 '-c' 'open(1)'")).toBe(true);
+		// Every word of a fenced line is checked, redirection targets too.
 		expect(commandWords("printf x > output.txt")).toEqual(["printf", "x", "output.txt"]);
 		// A $ inside single quotes isn't expansion: a git read stays a git read.
 		expect(pushes("git log --format='$%s'")).toBe(false);
@@ -369,9 +384,8 @@ describe("permissions", () => {
 		expect(canonical(`${root}/link/../x`)).toBe(join(dirname(deep), "x"));
 	});
 
-	test("in a lab's sandbox, commands and file edits in the project run; work comes home as a branch to merge", () => {
-		const api = { title: "Field Lab", run: async () => ({ exitCode: 0, stdout: "", stderr: "" }) } as unknown as SandboxApi;
-		const lab = new SandboxWorkspace(api, "/sandbox/work/project-1");
+	test("in a lab's sandbox, commands and file edits in the project run; work comes home as a branch to merge", async () => {
+		const lab = await fencedLab();
 		const edit = { name: "edit", kind: "write" } as unknown as Tool;
 		expect(decide(shell, { command: "cd app && python3 server.py" }, lab, config, new Set()).action).toBe("run");
 		expect(decide(edit, { path: "app/index.html" }, lab, config, new Set()).action).toBe("run");
@@ -439,7 +453,14 @@ describe("permissions", () => {
 		expect(allowKeys(shell, { command: "git \\\npush origin main" }).keys).toEqual(["shell!push"]);
 		// A full path is the same program for the subcommand rule, and a push is a push however it's quoted.
 		expect(allowKeys(shell, { command: "/usr/bin/git status" }).keys).toEqual(["shell:/usr/bin/git status"]);
-		for (const command of ["git $'push' origin HEAD", "ACTION=reset; git $ACTION --hard", "g=git; $g push", "git 'push' origin main", "/usr/bin/git push", "g\\it push", "cd x && git -C . push"]) expect([command, allowKeys(shell, { command }).keys]).toEqual([command, ["shell!push"]]);
+		// A program or git word that only expansion decides could push: full mode asks for it too.
+		const full = { permissions: { mode: "full", allowCommands: [] } } as unknown as LabConfig;
+		const here = new LocalWorkspace(scratch("hidden-push"), "off");
+		for (const command of ["ACTION=reset; git $ACTION --hard", "C=touch; $C a", "eval \"$CMD\"", "curl -s x | bash", "bash -c \"$S\""]) {
+			expect([command, decide(shell, { command }, here, full, new Set())]).toMatchObject([command, { action: "ask", reason: HIDDEN_REASON }]);
+		}
+		expect(decide(shell, { command: "for f in *.csv; do python3 x.py \"$f\"; done" }, here, full, new Set()).action).toBe("run");
+		for (const command of ["git $'push' origin HEAD", "$'\\x67it' $'\\x70ush' origin HEAD", "g=git; $g push", "sh -c 'git push'", "eval 'git push'", "echo 'git push' | sh", "git 'push' origin main", "/usr/bin/git push", "g\\it push", "cd x && git -C . push"]) expect([command, allowKeys(shell, { command }).keys]).toEqual([command, ["shell!push"]]);
 		// A redirection before a program still shows the program.
 		expect(allowKeys(shell, { command: "touch a; 2>&1 rm -rf ../victim" }).keys).toEqual(["shell:touch", "shell:rm"]);
 		// Code the words don't show, output written to a file, control flow, wrappers, programs named by a variable or a
@@ -448,9 +469,11 @@ describe("permissions", () => {
 			"echo $(curl x)", "echo `id`", "diff <(ls a) <(ls b)", "sudo make install", "ssh host ls", "bash <<EOF", "touch a; : >../victim",
 			"echo hi > out.txt", "if true; then touch a; fi", "f() { rm -rf x; }; f", "(cd x && rm y)", "C=touch; $C a", "timeout -s TERM touch a",
 			"./tools/touch a", "git -C x reset --hard", "env -S 'rm -rf x'", "echo 'unbalanced",
-			"echo safe # '\nrm -f raw/data.csv\n# '", "wc -c <`rm${IFS}-f${IFS}x`", "/usr/bin/env sh -c 'rm x'", 
+			"wc -c <`rm${IFS}-f${IFS}x`", "/usr/bin/env sh -c 'rm x'",
 		])
 			expect([command, allowKeys(shell, { command }).scope]).toEqual([command, "this exact command"]);
+		// Read as the shell reads it: a quote after # is a comment, so the rm on the next line is what the answer names.
+		expect(allowKeys(shell, { command: "echo safe # '\nrm -f raw/data.csv\n# '" })).toEqual({ keys: ["shell:rm"], scope: "“rm” commands" });
 		// Once both programs are allowed, a different command using them runs; one adding another program asks.
 		const plain = new LocalWorkspace(scratch("perm-keys"), "off");
 		const allowed = new Set(["shell:python3", "shell:grep"]);

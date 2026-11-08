@@ -1054,6 +1054,8 @@ export class SessionRuntime {
 			return { ok: false, content: `The arguments were not valid JSON (${errorText(error)}). Send the call again with valid JSON.`, decision: "refused", tool };
 		}
 		let decision: Ev<"tool">["decision"] = "auto";
+		// A lab sandbox's fence probe runs once, before its first decision (what can run unasked depends on it).
+		await this.workspace.prepare?.().catch(() => undefined);
 		const verdict = decide(tool, args, this.workspace, this.deps.config(), this.allowed, this.discovering, this.permissionMode, !this.historyOff);
 		// A read-only subagent is read-only whatever the person's permission mode or sandbox would allow.
 		if (this.agentMode === "read" && !readOnlyCall(tool, args, this.workspace, this.deps.config().permissions.allowCommands)) {

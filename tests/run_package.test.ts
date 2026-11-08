@@ -56,6 +56,23 @@ describe("a run package", () => {
 		expect(crate["@graph"].find((e) => e["@id"] === "./")?.description).toContain("worked in the field sandbox");
 	});
 
+	test("export leaves out a changed file that is now a link elsewhere, and verify won't read linked metadata", () => {
+		const root = join(dir, "export-link");
+		mkdirSync(root);
+		writeFileSync(join(dir, "private.txt"), "private\n");
+		symlinkSync(join(dir, "private.txt"), join(root, "summary.csv"));
+		const out = join(dir, "pkg-link");
+		const made = writePackage(out, { summary: { ...summary(), cwd: root }, events: events.map((e) => (e.t === "header" ? { ...e, cwd: root } : e)), log: [], attachments: {}, version: "test" });
+		expect(made.files).toBe(0);
+		expect(existsSync(join(out, "files", "summary.csv"))).toBe(false);
+		const elsewhere = join(dir, "meta-elsewhere");
+		mkdirSync(elsewhere);
+		writeFileSync(join(elsewhere, "ro-crate-metadata.json"), readFileSync(join(out, "ro-crate-metadata.json")));
+		rmSync(join(out, "ro-crate-metadata.json"));
+		symlinkSync(join(elsewhere, "ro-crate-metadata.json"), join(out, "ro-crate-metadata.json"));
+		expect(verifyPackage(out)).toEqual([{ check: "metadata", ok: false, detail: "no ro-crate-metadata.json as a plain file in the package" }]);
+	});
+
 	test("verify reads only plain files inside the package: no .., absolute paths or links", () => {
 		const out = join(dir, "pkg-hostile");
 		writePackage(out, { summary: summary(), events, log: [], attachments: {}, version: "test" });

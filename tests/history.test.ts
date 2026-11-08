@@ -224,5 +224,9 @@ describe("step history", () => {
 		await expect(environmentTool.run({ action: "add", packages: ["python", "--tls-no-verify"] }, { workspace: ws, output: () => undefined } as never)).rejects.toThrow("isn't a package name");
 		expect((await environmentTool.run({ action: "list" }, { workspace: ws, output: () => undefined, tools: join(dir, "no-tools") } as never)).content).toContain("no environment yet");
 		expect(existsSync(join(dir, "no-tools"))).toBe(false);
+		// The environment's files must be the project's own, not links to somewhere else.
+		writeFileSync(join(dir, "elsewhere.toml"), "[workspace]\n");
+		symlinkSync(join(dir, "elsewhere.toml"), join(root, "pixi.toml"));
+		await expect(environmentTool.run({ action: "list" }, { workspace: ws, output: () => undefined, tools: join(dir, "no-tools") } as never)).rejects.toThrow("pixi.toml is a link");
 	});
 });

@@ -33,10 +33,17 @@ export interface Workspace {
 	write(path: string, data: string | Buffer, options?: { outside?: boolean }): Promise<void>;
 	stat(path: string): Promise<{ type: Entry["type"]; size: number } | undefined>;
 	list(path: string): Promise<Entry[]>;
-	/** `fence`: paths the command names, which must lead inside the project, links followed, or it doesn't run (lab sandboxes). */
+	/**
+	 * `fence` (lab sandboxes): the command runs under the sandbox's file fence (sandbox_fence.ts), and the paths it names
+	 * must lead inside the project, links followed, or it doesn't run.
+	 */
 	exec(command: string, options: { timeoutMs: number; signal: AbortSignal; onOutput?: (text: string) => void; unsandboxed?: boolean; env?: Record<string, string>; fence?: string[] }): Promise<ExecResult>;
 	/** Set when commands run contained: by the OS ("seatbelt", "bwrap") or in a site's sandbox ("site"). */
 	readonly sandboxed?: string;
+	/** Commands can run under an OS file fence here (a lab sandbox where Landlock holds): known once prepared. */
+	readonly fenced?: boolean;
+	/** Whatever a place checks before its first decision (a lab sandbox's fence probe). */
+	prepare?(): Promise<void>;
 	/** What the session's history can bring back here: "filesystem" (a lab's whole-disk checkpoints) or "folder". */
 	readonly checkpointed?: "filesystem" | "folder";
 	shellName: string;
@@ -164,7 +171,8 @@ function seatbeltProfile(writable: string[], network: NetworkAccess, readable: s
 /** The program and arguments that run `file args` contained by the OS: writes only to `writable` (and temp folders),
  * credential folders hidden, the network as given. Returned unchanged where this computer has no facility
  * (Windows today); `facility` says which one applied. */
-export function contained(file: string, args: string[], options: { writable: string[]; network: NetworkAccess; readable?: string[]; server?: boolean }): { file: string; args: string[]; facility?: Facility } {
+/** `temp: false` leaves the system's temp folders out of what may be written (a replay writes only its own folder). */
+export function contained(file: string, args: string[], options: { writable: string[]; network: NetworkAccess; readable?: string[]; server?: boolean; temp?: boolean }): { file: string; args: string[]; facility?: Facility } {
 	const facility = sandboxer();
 	if (!facility) return { file, args };
 	if (facility === "restricted-token") {
@@ -174,10 +182,10 @@ export function contained(file: string, args: string[], options: { writable: str
 		// This program runs the command under a write-restricted token (windows_contain.ts): the compiled binary
 		// itself, or bun with the CLI's source.
 		const self = selfCommand();
-		const writable = [...options.writable, tmpdir()].map((p) => resolve(p));
+		const writable = [...options.writable, ...(options.temp === false ? [] : [tmpdir()])].map((p) => resolve(p));
 		return { file: self[0]!, args: [...self.slice(1), "__contain", JSON.stringify(writable), "--", file, ...args], facility };
 	}
-	const writable = [...options.writable.map(real), real(tmpdir()), "/private/tmp", "/tmp"].filter((p, i, all) => existsSync(p) && all.indexOf(p) === i);
+	const writable = [...options.writable.map(real), ...(options.temp === false ? [] : [real(tmpdir()), "/private/tmp", "/tmp"])].filter((p, i, all) => existsSync(p) && all.indexOf(p) === i);
 	const readable = [...options.writable, ...(options.readable ?? [])].map(real).filter((p) => existsSync(p));
 	if (facility === "seatbelt") return { file: "/usr/bin/sandbox-exec", args: ["-p", seatbeltProfile(writable, options.network, readable), file, ...args], facility };
 	// Read-only root, the writable folders bound, a private /tmp, credential folders hidden, every namespace unshared

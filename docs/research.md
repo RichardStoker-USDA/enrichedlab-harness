@@ -113,10 +113,17 @@ Scientists validate everything, so every step has to be readable and repeatable.
     any file any step read or wrote can be checked out offline (`--no-history` leaves it out).
 
   `el session verify <folder>` checks every checksum, opens the history, and confirms every content id the steps
-  name is in it. `el session reproduce <folder> <step>` reruns a command step from the folder as it was just before
-  it, in a scratch folder, contained and offline. It then compares every file against what the step left, the same
-  or different, and names any file the rerun changed that the step didn't. A lab session's files stay in the lab;
-  its receipts are in the log.
+  name is in it (a malformed id fails). `el session reproduce <folder> <step>` reruns a command step from the folder
+  as it was just before it, in a scratch folder, contained and offline: it may write only that folder (not the
+  system's temp folders), gets a few plain variables (`PATH`, `HOME` and `TMPDIR` in the scratch folder, `LANG`,
+  `TZ`) and nothing else from the caller, and doesn't run at all where the computer can't contain it. It then
+  compares every file against what the step left, the same or different, names any file the rerun changed that the
+  step didn't, and fails when the command fails. A package may come from anyone, so both read it defensively: only
+  plain files inside the folder (metadata too), opened without following links and checked again once open, and
+  its history through git with no hooks, no system or global config, no inherited `GIT_*` settings, no replace
+  objects, and only the session refs fetched. Export copies a changed file only when it is a plain file inside the
+  project, so a file swapped for a link to somewhere else is left out. A lab session's files stay in the lab; its
+  receipts are in the log.
 
 ## Desktops
 

@@ -1,5 +1,6 @@
 // shell: one command through the workspace's shell, with a timeout, streamed output and a stored copy of long output.
 
+import { plainCommands } from "./shell_syntax.ts";
 import { num, str, type Tool, ToolError } from "./types.ts";
 
 const DEFAULT_TIMEOUT_S = 120;
@@ -36,75 +37,6 @@ const GIT_LIST_ONLY: Record<string, RegExp> = {
 };
 const VERSION_ONLY = /^(--version|-V|version)$/;
 
-type Token = { text: string; op?: undefined } | { op: string; text?: undefined };
-
-/** Split a command line the way a POSIX shell would, far enough to judge it: words with quotes removed and the
- * operators between them. Returns undefined when the line expands variables or runs a substitution. */
-export function tokenize(command: string): Token[] | undefined {
-	const tokens: Token[] = [];
-	let word = "";
-	let started = false;
-	let quote: "'" | '"' | undefined;
-	const flush = () => {
-		if (started) tokens.push({ text: word });
-		word = "";
-		started = false;
-	};
-	for (let i = 0; i < command.length; i++) {
-		const c = command[i]!;
-		if (quote === "'") {
-			if (c === "'") quote = undefined;
-			else word += c;
-			continue;
-		}
-		if (c === "`" || c === "$") return undefined; // single-quoted text was handled above
-		// A comment at the start of a word: its quotes aren't quotes, so a line holding one can't be judged here.
-		if (!quote && c === "#" && !started) return undefined;
-		// Unquoted ( ) { } run code: PowerShell subexpressions and script blocks, POSIX subshells and groups.
-		if (!quote && "(){}".includes(c)) return undefined;
-		if (quote === '"') {
-			if (c === '"') quote = undefined;
-			else if (c === "\\" && i + 1 < command.length) word += command[++i];
-			else word += c;
-			continue;
-		}
-		if (c === "'" || c === '"') {
-			quote = c;
-			started = true;
-			continue;
-		}
-		if (c === "\\") {
-			if (i + 1 < command.length) word += command[++i];
-			started = true;
-			continue;
-		}
-		if (c === " " || c === "\t") {
-			flush();
-			continue;
-		}
-		const two = command.slice(i, i + 2);
-		if (["&&", "||", ">>", "<<", "&>", "<(", ">("].includes(two)) {
-			flush();
-			tokens.push({ op: two });
-			i++;
-			continue;
-		}
-		if ("|;&<>\n\r".includes(c)) {
-			// "2>" and "1>": the digit belongs to the redirection.
-			if ((c === ">" || c === "<") && /^\d$/.test(word) && started) {
-				word = "";
-				started = false;
-			} else flush();
-			tokens.push({ op: c === "\r" ? "\n" : c });
-			continue;
-		}
-		word += c;
-		started = true;
-	}
-	if (quote) return undefined;
-	flush();
-	return tokens;
-}
 
 const looksLikePath = (t: string) => /^(~|\/|\\\\|[A-Za-z]:[\\/])/.test(t) || /(^|[\\/])\.\.([\\/]|$)/.test(t);
 
@@ -117,41 +49,21 @@ export function isReadOnlyCommand(command: string, extra: string[] = [], inside?
 	// The check below parses POSIX shell. PowerShell escapes with a backtick and treats \ as a path separator, so on
 	// Windows nothing runs unasked except the person's own allowCommands.
 	if (process.platform === "win32") return false;
-	const tokens = tokenize(text);
-	if (!tokens) return false;
-	const segments: string[][] = [[]];
-	for (let i = 0; i < tokens.length; i++) {
-		const t = tokens[i]!;
-		if (t.op === undefined) {
-			segments.at(-1)!.push(t.text);
-			continue;
-		}
-		if (t.op === "&&" || t.op === "||" || t.op === ";" || t.op === "|" || t.op === "\n") {
-			segments.push([]);
-			continue;
-		}
-		if (t.op === ">" || t.op === "&>" || t.op === ">>") {
-			// Only discarding output or merging streams is allowed: >/dev/null, 2>&1.
-			const next = tokens[i + 1];
-			if (next?.op === "&" && tokens[i + 2]?.text && /^[12]$/.test(tokens[i + 2]!.text!)) {
-				i += 2;
-				continue;
-			}
-			if (next?.text === "/dev/null" || next?.text === "NUL") {
-				i += 1;
-				continue;
-			}
+	// The words each command gets, as the shell reads the line (shell_syntax.ts): anything that isn't plain text asks.
+	const commands = plainCommands(text);
+	if (!commands) return false;
+	for (const c of commands) {
+		if (c.background || c.assigns.length) return false;
+		for (const r of c.redirects) {
+			// Only discarding output or merging streams (>/dev/null, 2>&1), and reading a file inside the project.
+			if ((r.op === ">&" || r.op === "<&") && /^[012]$/.test(r.target)) continue;
+			if ([">", ">>", "&>", "&>>", ">|"].includes(r.op) && (r.target === "/dev/null" || r.target === "NUL")) continue;
+			if (r.op === "<" && (!inside || inside(r.target))) continue;
 			return false;
 		}
-		if (t.op === "<") {
-			const next = tokens[i + 1];
-			if (!next?.text || (inside && !inside(next.text))) return false;
-			i += 1;
-			continue;
-		}
-		return false; // a background "&", here-documents, process substitution
 	}
-	return segments.filter((s) => s.length).every((words) => {
+	const segments = commands.map((c) => c.words);
+	return segments.length > 0 && segments.every((words) => {
 		const joined = words.join(" ");
 		if (extra.some((prefix) => joined === prefix || joined.startsWith(`${prefix} `))) return true;
 		const [cmd, ...args] = words;
@@ -187,21 +99,20 @@ export function isReadOnlyCommand(command: string, extra: string[] = [], inside?
 export function pathsInside(command: string, inside: (path: string) => boolean, posix = process.platform !== "win32", strict = false): boolean {
 	// Only POSIX shell words are read; a Windows shell's command asks.
 	if (!posix) return false;
-	const tokens = tokenize(command.trim());
-	if (!tokens) return false;
-	return tokens.every((t) => {
-		if (t.text === undefined) return true;
+	const words = commandWords(command);
+	if (!words.length) return false;
+	return words.every((text) => {
 		// Where named paths are the only fence, a quoted word holding several words and a path or shell syntax is code
 		// or a list, not one path: it can't be judged.
-		if (strict && /\s/.test(t.text) && /[/;|&$`(){}<>]|\.\./.test(t.text)) return false;
-		const value = t.text.startsWith("-") && t.text.includes("=") ? t.text.slice(t.text.indexOf("=") + 1) : t.text;
+		if (strict && /\s/.test(text) && /[/;|&$`(){}<>]|\.\./.test(text)) return false;
+		const value = text.startsWith("-") && text.includes("=") ? text.slice(text.indexOf("=") + 1) : text;
 		return !(looksLikePath(value) || value.includes("/")) || inside(value);
 	});
 }
 
 /** Every word of a command, quotes taken out (for naming the files a step read); empty when it can't be read. */
 export function commandWords(command: string): string[] {
-	return (tokenize(command.trim()) ?? []).flatMap((t) => (t.text === undefined ? [] : [t.text]));
+	return (plainCommands(command.trim()) ?? []).flatMap((c) => [...c.assigns.map((a) => a.value), ...c.words, ...c.redirects.map((r) => r.target)]);
 }
 
 /** Flags whose value (the next word) is a file or folder, for commands whose first word is a pattern. */

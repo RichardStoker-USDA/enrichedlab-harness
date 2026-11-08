@@ -13,6 +13,7 @@ import { lstatSync, readlinkSync, realpathSync, statSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import type { FolderAccess, LabConfig, PermissionMode } from "./config.ts";
 import { isReadOnlyCommand, pathsInside } from "./tools/shell.ts";
+import { everyCommand, plainCommands } from "./tools/shell_syntax.ts";
 import type { Tool } from "./tools/types.ts";
 import { isOpenPort } from "./sites/port_proxy.ts";
 import { FULL_CONTAINMENT, physical } from "./tools/workspace.ts";
@@ -144,71 +145,19 @@ function loads(name: string): boolean {
 }
 
 /**
- * The simple commands of a shell line, as their words, quote-aware. Undefined when the line holds anything whose effect
- * the words don't show: substitutions, process substitution, here-documents, subshells or groups, unbalanced quotes,
- * or output written to a file (descriptor copies like 2>&1 and writes to /dev/null are fine).
+ * The simple commands of a shell line, as their words, as the shell reads them (shell_syntax.ts). Undefined when the
+ * line holds anything whose effect the words don't show: substitutions, compound commands, here-documents, or output
+ * written to a file (descriptor copies like 2>&1 and writes to /dev/null are fine).
  */
 function simpleCommands(line: string): string[][] | undefined {
-	const commands: string[][] = [];
-	let words: string[] = [];
-	let word = "";
-	let quoted = false;
-	let quote: "'" | '"' | undefined;
-	const endWord = () => {
-		if (word || quoted) words.push(word);
-		word = "";
-		quoted = false;
-	};
-	const endCommand = () => {
-		endWord();
-		if (words.length) commands.push(words);
-		words = [];
-	};
-	for (let i = 0; i < line.length; i++) {
-		const c = line[i]!;
-		if (quote) {
-			if (c === quote) quote = undefined;
-			else if (quote === '"' && (c === "$" || c === "`")) return undefined;
-			else if (quote === '"' && c === "\\") word += line[++i] ?? "";
-			else word += c;
-			continue;
+	const commands = plainCommands(line);
+	if (!commands) return undefined;
+	for (const c of commands)
+		for (const r of c.redirects) {
+			const copy = /&$/.test(r.op) && /^(\d+|-)$/.test(r.target);
+			if (r.op.includes(">") && !copy && r.target !== "/dev/null") return undefined;
 		}
-		if (c === "#" && !word && !quoted) return undefined;
-		if (c === "'" || c === '"') {
-			quote = c;
-			quoted = true;
-		} else if (c === "\\") {
-			const next = line[++i];
-			if (next === "\n") continue;
-			word += next ?? "";
-		} else if (c === "`" || c === "(" || c === ")" || (c === "$" && line[i + 1] === "(")) return undefined;
-		else if (c === " " || c === "\t") endWord();
-		else if (c === ";" || c === "\n") endCommand();
-		else if (c === "|" || (c === "&" && line[i + 1] === "&")) {
-			endCommand();
-			if (line[i + 1] === c || line[i + 1] === "&") i++;
-		} else if (c === ">" || c === "<" || (c === "&" && line[i + 1] === ">")) {
-			// A redirection: an optional descriptor number before it, the operator, then its target.
-			const fd = /^\d+$/.test(word) ? word : "";
-			if (fd) word = "";
-			else endWord();
-			let op = c;
-			while (">&|<".includes(line[i + 1] ?? "x") && op.length < 3) op += line[++i];
-			if (op.startsWith("<<") || line[i + 1] === "(") return undefined;
-			let target = "";
-			while (line[i + 1] === " ") i++;
-			while (i + 1 < line.length && !" \t;|&<>()\n".includes(line[i + 1]!)) target += line[++i];
-			// A target that expands or quotes runs or hides something before the file opens.
-			if (/[`$'"\\#]/.test(target)) return undefined;
-			const copy = /&$/.test(op) && /^(\d+|-)$/.test(target);
-			const writes = op.includes(">") && !copy && target !== "/dev/null";
-			if (writes || (!copy && !target)) return undefined;
-		} else if (c === "&") endCommand();
-		else word += c;
-	}
-	if (quote) return undefined;
-	endCommand();
-	return commands;
+	return commands.map((c) => [...c.assigns.map((a) => `${a.name}=${a.value}`), ...c.words]).filter((words) => words.length);
 }
 
 /** The programs a shell line runs, keyed as an answer remembers them; undefined when it must be remembered exactly. */
@@ -241,18 +190,58 @@ function commandKeys(command: string): { keys: string[]; names: string[] } | und
 }
 
 /**
- * A line that may push: git ... push with quotes, escapes, $'..' quoting and continuations taken out, or a line where
- * git or a push could hide behind expansion or indirection ($, backquotes, eval, alias, source, functions), which
- * is treated as a push.
+ * Whether a line publishes. Read as the shell reads it (shell_syntax.ts), every command anywhere in it counts.
+ * "push": git and a push word in the same line, code handed to eval or a shell that pushes, or git or push near a
+ * function, alias or sourced file. "hidden": what runs depends on expansion (a program named by a variable or a
+ * substitution, git given an expanded word, eval or a shell handed code that expands or arrives on its input), so it
+ * could push. A line that doesn't parse pushes when it mentions git or push, and is hidden when it expands anything.
  */
-export function pushes(command: string): boolean {
-	const plain = command.replace(/\\\r?\n/g, "").replace(/\$(?=['"])/g, "").replace(/['"\\]/g, "");
-	if (/(^|[;&|\n(`]\s*|\/)git(\s+\S+)*\s+push\b/.test(plain)) return true;
-	// Single quotes hold text literally ($'..' aside, whose $ stays outside them), so a $ inside them hides nothing.
-	const unquoted = command.replace(/'[^']*'/g, "''");
-	const hidden = /[$`]|\b(eval|alias|source|function)\b|^\s*\.\s|[;&|]\s*\.\s|\(\s*\)/.test(unquoted);
-	return hidden && /\bgit\b|\bpush\b/.test(plain);
+function publishing(command: string, depth = 0): "push" | "hidden" | undefined {
+	const line = everyCommand(command);
+	if (!line || depth > 4) return /\bgit\b|\bpush\b/.test(command) ? "push" : /[$`]/.test(command) ? "hidden" : undefined;
+	const isGit = (w: string) => /(^|\/)git(\.exe)?$/.test(w);
+	const isPush = (w: string) => /(^|\s)push\b/.test(w);
+	const words: string[] = [];
+	let hidden = false;
+	for (const { words: argv } of line.commands) {
+		if (!argv.length) continue;
+		const [first, ...rest] = argv;
+		if (first === undefined) hidden = true;
+		else {
+			const name = first.replace(/^.*\//, "");
+			if (isGit(first) && rest.includes(undefined)) hidden = true;
+			if (name === "eval") {
+				const inner = rest.includes(undefined) ? "hidden" : publishing(rest.join(" "), depth + 1);
+				if (inner === "push") return "push";
+				if (inner) hidden = true;
+			}
+			if (SHELLS.has(name)) {
+				const flag = rest.findIndex((w) => w !== undefined && /^-[a-zA-Z]*c[a-zA-Z]*$/.test(w));
+				const script = flag >= 0 ? rest[flag + 1] : undefined;
+				const inner = flag >= 0 ? (script === undefined ? "hidden" : publishing(script, depth + 1)) : undefined;
+				if (inner === "push") return "push";
+				// No -c and no script file: it runs whatever arrives on its input.
+				if (inner || (flag < 0 && !rest.some((w) => w !== undefined && !w.startsWith("-")))) hidden = true;
+			}
+		}
+		for (const w of argv) if (w !== undefined) words.push(w);
+	}
+	words.push(...line.heredocs);
+	const text = words.join(" ");
+	// Functions, aliases and sourced files run what the line can't show: a push when git or push is in it at all.
+	if ((line.functions || words.some((w) => w === "alias" || w === "source" || w === ".")) && /\bgit\b|\bpush\b/.test(`${text} ${command}`)) return "push";
+	// Git and a push word, or a push word beside a program only expansion names ($g push).
+	if ((words.some(isGit) && words.some(isPush)) || words.some((w) => /\bgit\b[\s\S]*\bpush\b/.test(w)) || (hidden && words.some(isPush))) return "push";
+	return hidden ? "hidden" : undefined;
 }
+
+/** A line that pushes (publishing). */
+export function pushes(command: string): boolean {
+	return publishing(command) === "push";
+}
+
+/** The question for a line whose program only expansion names: in full mode it could push unseen. */
+export const HIDDEN_REASON = "What it runs depends on a variable or substitution, so it could push to a remote.";
 
 /** "a", "a and b", "a, b and c". */
 function list(items: string[]): string {
@@ -269,8 +258,8 @@ export function allowKeys(tool: Tool, args: Record<string, unknown>): { keys: st
 	}
 	if (tool.kind === "exec") {
 		const command = String(args.command ?? "").trim();
-		// Pushing publishes work: it asks every time, whatever was allowed before. Judged on the words with quotes and
-		// escapes taken out, so git 'push' and g\it push are pushes too.
+		// Pushing publishes work: it asks every time, whatever was allowed before. Judged on the words as the shell reads
+		// them, so git 'push', g\it push and $'\x67it' push are pushes too.
 		if (pushes(command)) return { keys: ["shell!push"], scope: "pushing" };
 		const found = commandKeys(command);
 		if (!found) return { keys: [`shell=${command}`], scope: "this exact command" };
@@ -377,7 +366,8 @@ export function decide(tool: Tool, args: Record<string, unknown>, workspace: Wor
 	// Pushing publishes work, and an unreviewed lab tool hasn't been checked by anyone: both ask in every mode, every time.
 	if (keys[0] === "shell!push") return ask(PUSH_REASON);
 	if (tool.unreviewed) return { action: "ask", reason: "The lab hasn't reviewed this tool yet, so it asks every time.", keys: [`unreviewed!${tool.name}`], scope: "this call" };
-	if (mode === "full") return { action: "run" };
+	// Full mode runs everything else, except a line that could push without showing it.
+	if (mode === "full") return tool.kind === "exec" && publishing(String(args.command ?? "")) === "hidden" ? ask(HIDDEN_REASON) : { action: "run" };
 	// Discovery mode: what acts inside the lab the session works at runs without asking (the lab's filters, checks and
 	// audit stay on there). Anything on this computer still asks.
 	if (discovery && (tool.site === discovery || (!tool.site && workspace.kind === "sandbox" && (IN_SANDBOX.has(tool.kind) || keys[0] === "write")))) return { action: "run" };
@@ -436,13 +426,11 @@ export function decide(tool: Tool, args: Record<string, unknown>, workspace: Wor
 			// Contained by the OS: writes stay in the project and temp folders, no network. Runs without asking unless it
 			// names a path outside the project or expands variables (the sandbox can still read most of the disk).
 			// Windows contains writes only, so there it still asks. A folder set to read only asks for everything.
-			// In a lab's sandbox the paths a command names are the only fence, so a command whose paths can't be read
-			// from its words (a script handed to an interpreter, arguments read from input) asks unless the whole
-			// sandbox can be taken back.
+			// In a lab's sandbox the OS fence is Landlock (sandbox_fence.ts): a sandbox where it doesn't hold asks.
 			const lab = workspace.kind === "sandbox";
-			const contained = workspace.sandboxed && FULL_CONTAINMENT.has(workspace.sandboxed) && args.unsandboxed !== true && !(lab && !plainLine(command));
+			const contained = workspace.sandboxed && FULL_CONTAINMENT.has(workspace.sandboxed) && args.unsandboxed !== true && (!lab || workspace.fenced === true);
 			// Without history (its store failed) a contained change can't be taken back either: it asks.
-			if (contained && recoverable && !(local && readOnlyWithin(config, workspace.root)) && pathsInside(command, (path) => workspace.inside(path), workspace.kind === "sandbox" || process.platform !== "win32", lab)) return lab ? { action: "run", fence: true } : { action: "run" };
+			if (contained && recoverable && !(local && readOnlyWithin(config, workspace.root)) && pathsInside(command, (path) => workspace.inside(path), lab || process.platform !== "win32")) return lab ? { action: "run", fence: true } : { action: "run" };
 			if (isReadOnlyCommand(command, config.permissions.allowCommands, (path) => workspace.inside(path))) return { action: "run" };
 			// In a lab's sandbox whose whole disk is checkpointed, any command can be taken back.
 			if (mode === "auto" && workspace.kind === "sandbox" && workspace.checkpointed === "filesystem" && args.unsandboxed !== true) return { action: "run" };
@@ -469,40 +457,10 @@ const WRITES: Record<string, string> = {
 	pdf_fill: "fills in a PDF form",
 };
 
-/** True when the session works in a worktree EnrichedLab made for it. */
-/**
- * A command whose paths aren't in its words: code handed to an interpreter (sh -c, python -c, node -e, Rscript -e),
- * an awk program, or arguments read from input (xargs, parallel).
- */
-export function scripted(command: string): boolean {
-	const start = String.raw`(^|[;&|(\s])(\S*/)?`;
-	const interpreters = "sh|bash|zsh|dash|ksh|mksh|fish|python[\\d.]*|node|deno|bun|perl|ruby|php|lua|Rscript|R|julia|pwsh|powershell|tclsh|osascript";
-	const code = new RegExp(String.raw`${start}(${interpreters})\s+(\S+\s+)*(-[a-zA-Z]*[ceE]|--command|--eval|--expr|-r)(\s|=|$)`);
-	// Judged with quotes and escapes taken out: '-c' and "python3" are what the shell passes on.
-	const plain = command.replace(/['"\\]/g, "");
-	return code.test(plain) || new RegExp(String.raw`${start}(awk|gawk|mawk|nawk|xargs|parallel)(\s|$)`).test(plain);
-}
-
-/** Shells: handed a script, a startup file or -c, they run what their words don't show. */
+/** Shells: handed a script or -c, they run what their words don't show. */
 const SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh", "mksh", "fish", "csh", "tcsh", "busybox", "rbash"]);
 
-/**
- * A line whose words are all there is to it, for a lab's sandbox, where the paths a command names are the fence: no
- * expansion of any kind ($, backquotes, even quoted), no here-documents or here-strings, no variables set in front,
- * no shell, eval, source or other program that runs what follows, and no code handed to an interpreter.
- */
-export function plainLine(command: string): boolean {
-	if (/[$`]|<</.test(command) || scripted(command)) return false;
-	for (const segment of command.split(/&&|\|\||[;|&\n]/)) {
-		const words = segment.trim().split(/\s+/).filter(Boolean).map((w) => w.replace(/['"\\]/g, ""));
-		if (!words.length) continue;
-		if (/^[A-Za-z_]\w*=/.test(words[0]!)) return false;
-		const name = words[0]!.replace(/^.*\//, "");
-		if (EXACT.has(name) || SHELLS.has(name)) return false;
-	}
-	return true;
-}
-
+/** True when the session works in a worktree EnrichedLab made for it. */
 function ownWorktree(workspace: Workspace): boolean {
 	return /[/\\]\.git[/\\]enrichedlab-worktrees[/\\]/.test(workspace.root);
 }

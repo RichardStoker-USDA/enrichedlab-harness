@@ -114,6 +114,6 @@ describe("files written into a lab's sandbox", () => {
 		commands.length = 0;
 		await new SandboxWorkspace(refuseLong(8_000), "/sandbox/work/p").write("app/index.html", page);
 		expect(uploads).toHaveLength(1);
-		expect(commands.at(-1)).toContain("mv -f -- '/sandbox/in/x' '/sandbox/work/p/app/index.html'");
+		expect(commands.at(-1)).toContain("mv -fT -- '/sandbox/in/x' '/sandbox/work/p/app/index.html'");
 	});
 });

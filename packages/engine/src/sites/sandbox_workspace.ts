@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { posix } from "node:path";
 import type { Entry, ExecResult, Workspace } from "../tools/workspace.ts";
+import { FENCE_PY } from "./sandbox_fence.ts";
 
 /** What a site's sandbox offers. Gate implements it; other lab adapters will too. */
 export interface SandboxApi {
@@ -83,11 +84,26 @@ export class SandboxWorkspace implements Workspace {
 		return made;
 	}
 
-	private async run(command: string, timeoutSeconds = 120, signal?: AbortSignal) {
-		this.ready ??= this.api.run(`mkdir -p ${shq(this.root)}`, 30).then((r) => {
-			if (r.exitCode !== 0) throw new Error(`Couldn't make ${this.root} in the ${this.api.title} sandbox: ${r.stderr || r.stdout}`);
+	private fenceHolds = false;
+
+	/** Commands can run under the file fence: a probe in this sandbox showed Landlock holds (sandbox_fence.ts). */
+	get fenced(): boolean {
+		return this.fenceHolds;
+	}
+
+	/** Make the project folder and see whether the file fence holds here; once. */
+	prepare(): Promise<void> {
+		this.ready ??= this.api.run(`mkdir -p ${shq(this.root)} && cd ${shq(this.root)} && { command -v python3 >/dev/null 2>&1 && python3 -I -c ${shq(FENCE_PY)} probe || echo "el-fence no"; }`, 60).then((r) => {
+			if (r.exitCode !== 0 && !/el-fence/.test(r.stdout)) throw new Error(`Couldn't make ${this.root} in the ${this.api.title} sandbox: ${r.stderr || r.stdout}`);
+			this.fenceHolds = /^el-fence ok\b/m.test(r.stdout);
 		});
-		await this.ready;
+		// A failed start is tried again next time.
+		this.ready.catch(() => (this.ready = undefined));
+		return this.ready;
+	}
+
+	private async run(command: string, timeoutSeconds = 120, signal?: AbortSignal) {
+		await this.prepare();
 		return this.api.run(`cd ${shq(this.root)} && ${command}`, timeoutSeconds, signal);
 	}
 
@@ -149,9 +165,14 @@ export class SandboxWorkspace implements Workspace {
 		return Buffer.concat(pieces);
 	}
 
-	async write(path: string, data: string | Buffer, _options?: { outside?: boolean }): Promise<void> {
+	async write(path: string, data: string | Buffer, options: { outside?: boolean } = {}): Promise<void> {
 		const full = this.resolve(path);
 		const bytes = typeof data === "string" ? Buffer.from(data, "utf8") : data;
+		// Where its folder leads once links are followed, checked before anything is made: a link on the way out of the
+		// project isn't followed unless the outside path was approved.
+		const guard = options.outside
+			? ""
+			: `__el_d=$(realpath -m -- ${shq(posix.dirname(full))}) && case "$__el_d/" in "$(pwd -P)/"*) ;; *) echo ${shq(`${this.display(full)} leads outside the project (a link on the way); nothing was written.`)} >&2; exit 3;; esac && `;
 		const dir = shq(posix.dirname(full));
 		const upload = async () => {
 			const scratch = await mkdtemp(join(tmpdir(), "enrichedlab-write-"));
@@ -159,7 +180,7 @@ export class SandboxWorkspace implements Workspace {
 				const local = join(scratch, `${randomBytes(4).toString("hex")}-${posix.basename(full)}`);
 				await writeFile(local, bytes);
 				const placed = await this.api.put(local);
-				const r = await this.run(`mkdir -p ${dir} && mv -f -- ${shq(placed.path)} ${shq(full)}`, 120);
+				const r = await this.run(`${guard}mkdir -p ${dir} && mv -fT -- ${shq(placed.path)} ${shq(full)}`, 120);
 				if (r.exitCode !== 0) throw new Error(r.stderr.trim() || `Can't write ${this.display(full)}.`);
 			} finally {
 				await rm(scratch, { recursive: true, force: true });
@@ -170,24 +191,31 @@ export class SandboxWorkspace implements Workspace {
 		for (let offset = 0, first = true; first || offset < bytes.length; offset += PIECE, first = false) {
 			const piece = bytes.subarray(offset, offset + PIECE).toString("base64");
 			// A lab that refuses the command itself (not the shell failing in it) gets the file by upload instead.
-			const r = await this.run(`mkdir -p ${dir} && printf %s ${shq(piece)} | base64 -d ${first ? ">" : ">>"} ${shq(temp)}`, 60).catch(() => undefined);
+			const r = await this.run(`${guard}mkdir -p ${dir} && printf %s ${shq(piece)} | base64 -d ${first ? ">" : ">>"} ${shq(temp)}`, 60).catch(() => undefined);
 			if (!r) {
 				await this.run(`rm -f -- ${shq(temp)}`, 30).catch(() => undefined);
 				return upload();
 			}
 			if (r.exitCode !== 0) throw new Error(r.stderr.trim() || `Can't write ${this.display(full)}.`);
 		}
-		const done = await this.run(`mv -f -- ${shq(temp)} ${shq(full)}`, 30);
+		const done = await this.run(`${guard}mv -fT -- ${shq(temp)} ${shq(full)}`, 30);
 		if (done.exitCode !== 0) throw new Error(done.stderr.trim() || `Can't write ${this.display(full)}.`);
 	}
 
 	async exec(command: string, options: { timeoutMs: number; signal: AbortSignal; onOutput?: (text: string) => void; fence?: string[] }): Promise<ExecResult> {
-		// The fence: each named path must lead inside the project once links are followed, or nothing runs.
-		const fence = options.fence?.length
+		// Fenced: under Landlock, writes land only in the project and temp folders (sandbox_fence.ts); a sandbox where the
+		// fence doesn't hold runs nothing fenced.
+		if (options.fence) {
+			await this.prepare();
+			if (!this.fenced) return { exitCode: 125, output: "This sandbox can't fence commands (it needs Landlock and python3), so it didn't run. Ask the person to run it.", timedOut: false };
+		}
+		// And each named path must lead inside the project once links are followed, or nothing runs.
+		const words = options.fence?.length
 			? `__el_root=$(pwd -P); for __el_p in ${options.fence.map(shq).join(" ")}; do __el_r=$(realpath -m -- "$__el_p" 2>/dev/null || readlink -f -- "$__el_p" 2>/dev/null); case "$__el_r" in "$__el_root"|"$__el_root"/*) ;; *) echo "EnrichedLab: $__el_p leads outside the project; a command that reaches there needs the person's yes." >&2; exit 126;; esac; done; `
 			: "";
+		const body = options.fence ? `python3 -I -c ${shq(FENCE_PY)} run "$(pwd -P)" bash -c ${shq(command)}` : command;
 		// One group after the cd, so nothing in it runs if the cd fails.
-		const r = await this.run(fence ? `{ ${fence}${command}\n}` : command, Math.max(1, Math.round(options.timeoutMs / 1000)), options.signal);
+		const r = await this.run(options.fence ? `{ ${words}${body}\n}` : command, Math.max(1, Math.round(options.timeoutMs / 1000)), options.signal);
 		const output = [r.stdout, r.stderr].filter(Boolean).join(r.stdout && r.stderr ? "\n" : "");
 		options.onOutput?.(output);
 		return { exitCode: r.exitCode, output, timedOut: r.timedOut };
