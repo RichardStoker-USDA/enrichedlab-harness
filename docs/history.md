@@ -38,7 +38,9 @@ is as the present has it, and never through a link, so a link the target brings 
 the folder. The model is told on its next request.
 
 Undo puts back files outside the folder from their per-file copies first, while links in the folder still lead where
-they did, and only where the path still leads to the file that was kept.
+they did, and only where the path still leads to the file that was kept; through a link, it acts on the file the link
+led to. After a move, undo touches nothing where the session was. If a snapshot's list of what it left out can't be
+read, going back stops rather than guess; folders emptied by going back give way to the file that comes back.
 
 With `retry`, a new session continues from just before that step: the conversation up to there, the same folder
 and model, titled "Retry: …". The original stays as it was, so both tries can be compared. On this computer for now;
@@ -54,6 +56,7 @@ can't be brought back where it works now.
 
 A lab sandbox keeps history with git inside the sandbox, through exec, for `/sandbox/work`. A lab that serves
 whole-disk checkpoints (`endpoints.checkpoints`, [labs.md](labs.md)) covers the rest of the sandbox too, and there
-`auto` runs any command, since all of it can be taken back. If the lab can't make a checkpoint (quota, an outage),
-the session says so and commands outside the project ask again until a checkpoint works. Going back from a go-back
+`auto` runs any command, since all of it can be taken back, once a checkpoint has been made and while the last one
+worked. If the lab can't make one (quota, an outage), the session says so and commands outside the project ask again
+until a checkpoint works. Checkpoints go on when git history fails. Going back from a go-back
 there returns to the checkpoint it made of the present (`rewind.whole`).

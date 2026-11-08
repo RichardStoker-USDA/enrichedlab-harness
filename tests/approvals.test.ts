@@ -3,7 +3,7 @@
 // for every later session; auto mode asks once per folder, then file changes there run.
 
 import { afterAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { PermissionDecision, PermissionRequest } from "../packages/protocol/src/index.ts";
@@ -160,5 +160,22 @@ describe("approvals", () => {
 		// Each step that changed files left a point to go back to, and the history is outside the folder.
 		expect(session.events.filter((e) => e.t === "checkpoint" && e.history).length).toBeGreaterThanOrEqual(3);
 		expect(existsSync(join(root, ".git"))).toBe(false);
+	});
+
+	test("undo after a move touches nothing where the session was", async () => {
+		const root = join(dir, "p4");
+		const other = join(dir, "p4-moved");
+		mkdirSync(root);
+		mkdirSync(other);
+		const full = { ...DEFAULT_CONFIG, permissions: { ...DEFAULT_CONFIG.permissions, mode: "full" as const } };
+		const { log } = SessionLog.create(join(dir, "logs"), root, model.ref, "You help.");
+		const { runtime: session } = runtime(log, root, () => full, () => "allow");
+		await turn(session, "write: notes.txt");
+		writeFileSync(join(root, "notes.txt"), "the person's later work\n");
+		session.moveTo(new LocalWorkspace(other, "off"), { place: "local", label: "p4-moved", root: other });
+		const undone = await session.undo();
+		expect(undone.ok).toBe(false);
+		expect(undone.detail).toContain("moved");
+		expect(readFileSync(join(root, "notes.txt"), "utf8")).toBe("the person's later work\n");
 	});
 });

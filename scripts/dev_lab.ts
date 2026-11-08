@@ -377,7 +377,7 @@ interface MacScene {
 	/** Open the newest step in the timeline. */
 	openStep?: boolean;
 	session?: "lab" | "local";
-	pane?: "files" | "terminal" | "browser" | "desktop" | "first";
+	pane?: "files" | "timeline" | "terminal" | "browser" | "desktop" | "first";
 	settings?: "general" | "models" | "labs" | "updates";
 	size?: string;
 	/** A size applied after the pane opens: narrowing a window with the workbench open. */

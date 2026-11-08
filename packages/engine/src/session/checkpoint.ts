@@ -53,10 +53,12 @@ export class Checkpoints {
 			for (const file of files) {
 				// A link on the way now leads somewhere else: that isn't the file that was kept.
 				if (file.real && physical(file.path) !== file.real) continue;
+				// Acts where the path leads: through a link to a file that didn't exist, the file made there goes, not the link.
+				const at = file.real ?? file.path;
 				if (file.existed && file.blob) {
-					mkdirSync(dirname(file.path), { recursive: true });
-					writeFileSync(file.path, readFileSync(join(this.dir, file.blob)));
-				} else if (!file.existed) rmSync(file.path, { force: true });
+					mkdirSync(dirname(at), { recursive: true });
+					writeFileSync(at, readFileSync(join(this.dir, file.blob)));
+				} else if (!file.existed) rmSync(at, { force: true });
 				restored.add(file.path);
 			}
 		}

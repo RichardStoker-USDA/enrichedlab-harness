@@ -30,7 +30,7 @@ import { DEFER_ABOVE, findTools, foundNames, offered } from "../catalog.ts";
 import { builtinSkillsDir } from "../builtin_skills.ts";
 import type { AgentResult } from "../tools/agents.ts";
 import { dirname, join } from "node:path";
-import { type History, localHistory, sandboxHistory } from "./history.ts";
+import { type History, localHistory, type Snapshot, sandboxHistory } from "./history.ts";
 import { canonical, decide } from "../permissions.ts";
 import type { CanvasPublisher, Tool, ToolContext } from "../tools/types.ts";
 import { ToolError } from "../tools/types.ts";
@@ -584,22 +584,29 @@ export class SessionRuntime {
 	/** Keep the folder as it is now in the step history, as a point the person or the agent can go back to. */
 	private async keepStep(label: string, callId: string, calls?: string[]): Promise<void> {
 		const history = this.stepHistory();
-		if (!history) return;
-		try {
-			const shot = await history.snapshot(label);
-			// A lab that checkpoints whole sandboxes keeps the rest of the disk too, changed in git's view or not.
-			const whole = this.workspace instanceof SandboxWorkspace ? this.workspace.checkpoints : undefined;
-			if (!shot.changed && callId !== "turn" && !whole) return;
-			const lab = whole && this.workspace instanceof SandboxWorkspace ? await this.workspace.checkpoint(label) : undefined;
-			if (whole && !lab) this.notice("warn", "The lab couldn't checkpoint the sandbox for this step, so commands outside the project ask until it can again.");
-			// For showing: the commit itself names everything it left out (history.ts keptOut).
-			const left = [...shot.skipped, ...shot.nested.map((path) => `${path}/ (its own repository)`)];
-			this.append({ t: "checkpoint", id: newId("e"), at: now(), callId, files: [], history: shot.commit, ...(lab ? { lab } : {}), ...(calls ? { calls } : {}), ...(left.length ? { skipped: left.slice(0, 200) } : {}) });
-		} catch (error) {
-			this.historyOff = true;
-			this.notice("warn", `Step history is off for this session, so its steps can't be taken back: ${redact(errorText(error))}`);
+		// A lab that checkpoints whole sandboxes keeps the whole disk too, changed in git's view or not, and goes on
+		// doing so if git history fails.
+		const sandbox = this.workspace instanceof SandboxWorkspace && this.workspace.checkpoints ? this.workspace : undefined;
+		if (!history && !sandbox) return;
+		let shot: Snapshot | undefined;
+		if (history) {
+			try {
+				shot = await history.snapshot(label);
+			} catch (error) {
+				this.historyOff = true;
+				this.notice("warn", `Step history is off for this session, so its steps can't be taken back: ${redact(errorText(error))}`);
+			}
 		}
+		if (shot && !shot.changed && callId !== "turn" && !sandbox) return;
+		const lab = sandbox ? await sandbox.checkpoint(label) : undefined;
+		if (sandbox && !lab && !this.labCheckpointWarned) this.notice("warn", "The lab couldn't checkpoint the sandbox for this step, so commands outside the project ask until it can again.");
+		if (sandbox) this.labCheckpointWarned = !lab;
+		if (!shot && !lab) return;
+		// For showing: the commit itself names everything it left out (history.ts keptOut).
+		const left = shot ? [...shot.skipped, ...shot.nested.map((path) => `${path}/ (its own repository)`)] : [];
+		this.append({ t: "checkpoint", id: newId("e"), at: now(), callId, files: [], ...(shot ? { history: shot.commit } : {}), ...(lab ? { lab } : {}), ...(calls ? { calls } : {}), ...(left.length ? { skipped: left.slice(0, 200) } : {}) });
 	}
+	private labCheckpointWarned = false;
 
 	/**
 	 * Put the folder back as it was before a step (an event in the log): the newest history point before it. The present
@@ -630,8 +637,6 @@ export class SessionRuntime {
 		if (!point?.history && !point?.lab) return { ok: false, files: [], detail: "This session kept no history before that step." };
 		// History belongs to the place it was kept in: a step before a move can't be brought back here.
 		if (this.events.slice(found ? this.events.indexOf(found) : at).some((e) => e.t === "place")) return { ok: false, files: [], detail: "The session moved since that step; its history is where it was then." };
-		const history = this.stepHistory();
-		if (!history) return { ok: false, files: [], detail: "Step history is off for this session." };
 		try {
 			// The whole sandbox at a lab that checkpoints it: the present is kept as a checkpoint first.
 			const whole = this.workspace instanceof SandboxWorkspace ? this.workspace.checkpoints : undefined;
@@ -643,6 +648,8 @@ export class SessionRuntime {
 				return { ok: true, whole: true, files: [], detail: `The ${this.workspace.label.replace(/^the /, "")} is back as it was before that step.` };
 			}
 			if (!point.history) return { ok: false, files: [], detail: "That step was kept as a lab checkpoint, and this sandbox can't use it now." };
+			const history = this.stepHistory();
+			if (!history) return { ok: false, files: [], detail: "Step history is off for this session." };
 			// Old points named what they left out only in the event; newer commits name it themselves.
 			const back = await history.restore(point.history, `before ${before}`, point.skipped?.filter((path) => !path.endsWith(" (its own repository)")) ?? []);
 			this.append({ t: "rewind", id: newId("e"), at: now(), before, to: point.history, saved: back.saved, restored: back.restored, removed: back.removed, ...(back.left.length ? { left: back.left.slice(0, 200) } : {}) });
@@ -662,6 +669,8 @@ export class SessionRuntime {
 		const start = this.events.findLast((e) => e.t === "checkpoint" && e.callId === "turn" && e.history) as Ev<"checkpoint"> | undefined;
 		const after = start ? this.events.slice(this.events.indexOf(start)) : [];
 		if (start && !after.some((e) => e.t === "undo" || e.t === "rewind")) {
+			// Moved since: the files are where it was then, and nothing here is touched.
+			if (after.some((e) => e.t === "place")) return { ok: false, files: [], detail: "The session moved since your last message; its history is where it was then." };
 			const first = after.find((e) => e.t !== "checkpoint");
 			// Files changed outside the folder were kept one by one. They come back first, while every link in the folder
 			// still leads where it did when they were kept (going back may change a link).

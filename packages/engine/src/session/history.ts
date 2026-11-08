@@ -12,7 +12,7 @@
 
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, lstatSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, rmdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 /** Files larger than this aren't kept (25 MB, as the per-file copies before). */
@@ -40,8 +40,10 @@ export interface GitPlace {
 	git(args: string[], env?: Record<string, string>): Promise<string>;
 	sizes(paths: string[]): Promise<Map<string, number>>;
 	remove(paths: string[]): Promise<void>;
-	/** Of these paths, the ones that are folders with something in them now (not links). */
+	/** Of these paths, the folders (not links) holding a file or link somewhere inside. */
 	occupied(paths: string[]): Promise<Set<string>>;
+	/** Remove these paths where they're folders holding only empty folders (never a file). */
+	clearEmpty(paths: string[]): Promise<void>;
 }
 
 export interface Snapshot {
@@ -160,16 +162,17 @@ export class History {
 		return { commit, changed: true, skipped, nested };
 	}
 
-	/** What a snapshot left out, from its own message. */
+	/**
+	 * What a snapshot left out, from its own message. A message that can't be read fails the caller: going back
+	 * without knowing what was left out could overwrite it.
+	 */
 	async keptOut(commit: string): Promise<string[]> {
-		const body = await this.place.git(["log", "-1", "--format=%B", commit]).catch(() => "");
+		const body = await this.place.git(["log", "-1", "--format=%B", commit]);
 		const line = body.split("\n").find((l) => l.startsWith(KEPT_OUT));
-		try {
-			const list = line ? JSON.parse(line.slice(KEPT_OUT.length)) : [];
-			return Array.isArray(list) ? list.filter((p): p is string => typeof p === "string") : [];
-		} catch {
-			return [];
-		}
+		if (!line) return [];
+		const list: unknown = JSON.parse(line.slice(KEPT_OUT.length));
+		if (!Array.isArray(list)) throw new Error(`snapshot ${commit.slice(0, 10)} names what it left out in a form this version can't read`);
+		return list.filter((p): p is string => typeof p === "string");
 	}
 
 	/** Of paths kept out before, the ones still on disk (a file or folder). */
@@ -199,7 +202,7 @@ export class History {
 		const saved = present.commit;
 		// What either snapshot couldn't hold stays as it is, with whatever holds it or sits inside it: those bytes were
 		// never kept, so neither overwritten nor removed.
-		const untouched = [...new Set([...keep, ...(await this.keptOut(target)), ...(await this.keptOut(saved))])];
+		const untouched = [...new Set([...keep, ...present.skipped, ...present.nested, ...(await this.keptOut(target)), ...(await this.keptOut(saved))])];
 		const lines = (await this.place.git(["diff", "--name-status", "--no-renames", "-z", target, saved])).split("\0").filter(Boolean);
 		const restored: string[] = [];
 		const removed: string[] = [];
@@ -222,6 +225,8 @@ export class History {
 		const blocked = await this.place.occupied(restored);
 		left.push(...blocked);
 		restored.splice(0, restored.length, ...restored.filter((path) => !blocked.has(path)));
+		// Folders left empty by the removals give way to the file coming back.
+		await this.place.clearEmpty(restored);
 		for (let i = 0; i < restored.length; i += 200) {
 			await this.place.git(["restore", `--source=${target}`, "--worktree", "--", ...restored.slice(i, i + 200).map((path) => `:(literal)${path}`)], this.env());
 		}
@@ -277,12 +282,26 @@ export function localHistory(storeRoot: string, folder: string, session: string)
 			}
 		},
 		async occupied(paths) {
+			// True when a folder holds anything but folders, however deep.
+			const holds = (dir: string): boolean => readdirSync(dir, { withFileTypes: true }).some((entry) => !entry.isDirectory() || holds(join(dir, entry.name)));
 			const found = new Set<string>();
 			for (const path of paths) {
 				const info = lstatSync(join(folder, path), { throwIfNoEntry: false });
-				if (info?.isDirectory() && readdirSync(join(folder, path)).length) found.add(path);
+				if (info?.isDirectory() && holds(join(folder, path))) found.add(path);
 			}
 			return found;
+		},
+		async clearEmpty(paths) {
+			// rmdir only: a folder that gained a file meanwhile stays.
+			const clear = (dir: string): void => {
+				for (const entry of readdirSync(dir, { withFileTypes: true })) if (entry.isDirectory()) clear(join(dir, entry.name));
+				try {
+					rmdirSync(dir);
+				} catch {
+					// Not empty after all.
+				}
+			};
+			for (const path of paths) if (lstatSync(join(folder, path), { throwIfNoEntry: false })?.isDirectory()) clear(join(folder, path));
 		},
 	};
 	return new History(store, place, session, async () => {
@@ -353,10 +372,15 @@ export function sandboxHistory(exec: (command: string) => Promise<{ exitCode: nu
 		async occupied(paths) {
 			const found = new Set<string>();
 			for (let i = 0; i < paths.length; i += 200) {
-				const out = await run(`cd ${quote(folder)} && for f in ${paths.slice(i, i + 200).map(quote).join(" ")}; do if [ -d "$f" ] && [ ! -L "$f" ] && [ -n "$(ls -A -- "$f" 2>/dev/null)" ]; then printf '%s\\0' "$f"; fi; done`);
+				const out = await run(`cd ${quote(folder)} && for f in ${paths.slice(i, i + 200).map(quote).join(" ")}; do if [ -d "$f" ] && [ ! -L "$f" ] && [ -n "$(find "./$f" -mindepth 1 ! -type d -print -quit 2>/dev/null)" ]; then printf '%s\\0' "$f"; fi; done`);
 				for (const path of out.split("\0")) if (path) found.add(path);
 			}
 			return found;
+		},
+		async clearEmpty(paths) {
+			for (let i = 0; i < paths.length; i += 200) {
+				await run(`cd ${quote(folder)} && for f in ${paths.slice(i, i + 200).map(quote).join(" ")}; do if [ -d "$f" ] && [ ! -L "$f" ]; then find "./$f" -depth -type d -empty -delete 2>/dev/null; fi; done; true`);
+			}
 		},
 	};
 	return new History(store, place, session, async () => {

@@ -3,7 +3,7 @@
 
 import { afterAll, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Checkpoints } from "../packages/engine/src/session/checkpoint.ts";
@@ -158,5 +158,33 @@ describe("step history", () => {
 		writeFileSync(join(a, "report.txt"), "not ours\n");
 		copies.restore([kept]);
 		expect(readFileSync(join(a, "report.txt"), "utf8")).toBe("not ours\n");
+	});
+
+	test("a file comes back where only empty folders were left", async () => {
+		const folder = join(dir, "emptied");
+		mkdirSync(folder);
+		writeFileSync(join(folder, "data"), "a file\n");
+		const history = localHistory(join(dir, "store"), folder, "s5");
+		const target = await history.snapshot("target");
+		rmSync(join(folder, "data"));
+		mkdirSync(join(folder, "data", "sub"), { recursive: true });
+		writeFileSync(join(folder, "data", "sub", "new.txt"), "made since\n");
+		const back = await history.restore(target.commit, "back");
+		expect(readFileSync(join(folder, "data"), "utf8")).toBe("a file\n");
+		expect(back.left).toEqual([]);
+	});
+
+	test("undo through a link to a file that didn't exist removes the file made there, not the link", () => {
+		const root = join(dir, "dangling");
+		const outside = join(dir, "dangling-outside");
+		mkdirSync(root);
+		mkdirSync(outside);
+		symlinkSync(join(outside, "new.txt"), join(root, "link"));
+		const copies = new Checkpoints(join(dir, "copies-2"));
+		const kept = copies.capture([join(root, "link")]);
+		writeFileSync(join(root, "link"), "written through the link\n");
+		copies.restore([kept]);
+		expect(existsSync(join(outside, "new.txt"))).toBe(false);
+		expect(lstatSync(join(root, "link")).isSymbolicLink()).toBe(true);
 	});
 });
