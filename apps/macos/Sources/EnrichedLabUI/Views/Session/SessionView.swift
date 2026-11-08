@@ -26,7 +26,7 @@ struct SessionView: View {
 			// Shown once the window has made room for it (wider, or the sidebar aside), never squeezed in.
 			.inspector(isPresented: Binding(get: { workbench.isOpen && app.workbenchRoom }, set: { workbench.isOpen = $0 })) {
 				WorkbenchView(session: session)
-					.inspectorColumnWidth(min: 380, ideal: 560, max: 1400)
+					.inspectorColumnWidth(min: AppModel.workbenchNarrowest, ideal: min(560, app.workbenchMax), max: app.workbenchMax)
 			}
 			.focusedSceneValue(\.session, session)
 	}

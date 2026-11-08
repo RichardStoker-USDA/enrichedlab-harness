@@ -100,6 +100,9 @@ public final class AppModel {
 
 	/// The run sheet's narrowest: the composer's place and model menus and buttons in one row.
 	public static let runSheetWidth: CGFloat = 470
+	/// The workbench's narrowest, and its widest right now: what's left beside the run sheet (kept by the main window).
+	public static let workbenchNarrowest: CGFloat = 380
+	public var workbenchMax: CGFloat = 1400
 
 	/// The person's appearance for every window, AppKit views (terminals, web views) and Settings included.
 	private func applyAppearance() {

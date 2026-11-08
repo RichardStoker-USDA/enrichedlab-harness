@@ -269,7 +269,8 @@ writeFileSync(
 );
 // A dashboard that lays itself out again at every width, as a Shiny or Plotly page does.
 writeFileSync(
-	join(project, "dashboard.html"),
+	// Its own name: the live scenes write dashboard.html.
+	join(project, "field_dashboard.html"),
 	`<!doctype html><meta charset="utf-8"><title>Field dashboard</title>
 <style>body{font:14px system-ui;margin:0;padding:16px}main{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}section{border:1px solid #ccc;border-radius:8px;padding:12px;min-height:140px}canvas{width:100%;height:160px}</style>
 <h1>Soil moisture, 2026</h1><main>${Array.from({ length: 6 }, (_, i) => `<section><h2>Plot ${i + 1}</h2><canvas></canvas></section>`).join("")}</main>
@@ -391,8 +392,8 @@ const MAC_SCENES: MacScene[] = [
 	{ name: "mac_desktop", session: "lab", pane: "desktop", after: 4000 },
 	{ name: "mac_narrow", session: "lab", pane: "desktop", size: "900x700", after: 3000 },
 	{ name: "mac_narrowed", session: "lab", pane: "desktop", resize: "900x700", after: 3000 },
-	{ name: "mac_dashboard_window", session: "local", open: "dashboard.html", drag: "window", after: 800 },
-	{ name: "mac_dashboard_divider", session: "local", open: "dashboard.html", drag: "divider", after: 800 },
+	{ name: "mac_dashboard_window", session: "local", open: "field_dashboard.html", drag: "window", after: 800 },
+	{ name: "mac_dashboard_divider", session: "local", open: "field_dashboard.html", drag: "divider", after: 800 },
 	{ name: "mac_plot_window", session: "local", plot: true, pane: "first", drag: "window", after: 800 },
 	{ name: "mac_plot_divider", session: "local", plot: true, pane: "first", drag: "divider", after: 800 },
 	{ name: "mac_live_streaming", prompt: "Write the big page", until: "streaming", after: 300 },

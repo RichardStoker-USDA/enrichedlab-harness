@@ -184,32 +184,40 @@ public struct RootView: View {
 	}
 }
 
-/// Keeps the window's smallest width at what the sidebar, the run sheet and the workbench need side by side. The
-/// columns' widths change during layout, so the minimum is set a moment after they settle, outside any layout pass and
-/// never mid-drag of the window's edge: a minimum written from inside layout fed back into it and crashed the window
-/// (November 7, a plot and a dashboard open while the window was resized). It never exceeds the window's current
-/// width, so setting it never resizes the window.
+/// Keeps the sidebar, the run sheet and the workbench from overlapping, without feeding back into layout:
+/// - the window's smallest width is what the three columns need side by side;
+/// - the workbench's widest is what's left beside the run sheet, so dragging its divider stops at the run sheet's
+///   floor, and a run sheet squeezed by a quick narrowing gets its room back from the workbench, not by moving the window.
+/// Both are set a moment after the window and the columns settle, outside any layout pass and never mid-drag of the
+/// window's edge. A minimum written from inside layout, from the window's live width, fed back into it and crashed
+/// the window (November 7: a plot and a dashboard open while the workbench was resized).
 private struct MinimumKeeper: View {
 	@Environment(AppModel.self) private var app
 	var workbenchShows: Bool
 	var sidebarShows: Bool
 	var window: NSWindow?
 	@Binding var minimum: CGFloat
+	@State private var windowWidth: CGFloat = 0
 
-	private var wanted: CGFloat {
-		guard workbenchShows else { return 720 }
-		return max(720, ((sidebarShows ? app.sidebarWidth : 0) + AppModel.runSheetWidth + app.workbenchWidth).rounded(.up))
-	}
+	private struct Settle: Equatable { var workbench, sidebar, window: CGFloat; var shows, side: Bool }
 
 	var body: some View {
-		Color.clear.task(id: wanted) {
-			let wanted = wanted
-			try? await Task.sleep(for: .milliseconds(150))
-			while window?.inLiveResize == true, !Task.isCancelled { try? await Task.sleep(for: .milliseconds(100)) }
-			guard !Task.isCancelled else { return }
-			let next = min(wanted, max(720, (window?.contentLayoutRect.width ?? wanted).rounded(.down)))
-			if abs(next - minimum) >= 2 { minimum = next }
-		}
+		Color.clear
+			.onReceive(NotificationCenter.default.publisher(for: NSWindow.didResizeNotification)) { note in
+				if let window, (note.object as? NSWindow) === window { windowWidth = window.contentLayoutRect.width.rounded() }
+			}
+			.task(id: Settle(workbench: app.workbenchWidth.rounded(), sidebar: app.sidebarWidth.rounded(), window: windowWidth, shows: workbenchShows, side: sidebarShows)) {
+				try? await Task.sleep(for: .milliseconds(150))
+				while window?.inLiveResize == true, !Task.isCancelled { try? await Task.sleep(for: .milliseconds(100)) }
+				guard !Task.isCancelled, let window else { return }
+				let width = window.contentLayoutRect.width
+				let side = sidebarShows ? app.sidebarWidth : 0
+				let widest = max(AppModel.workbenchNarrowest, (width - side - AppModel.runSheetWidth).rounded(.down))
+				if abs(app.workbenchMax - widest) >= 2 { app.workbenchMax = widest }
+				let wanted = workbenchShows ? max(720, (side + AppModel.runSheetWidth + min(app.workbenchWidth, widest)).rounded(.up)) : 720
+				let next = min(wanted, max(720, width.rounded(.down)))
+				if abs(next - minimum) >= 2 { minimum = next }
+			}
 	}
 }
 

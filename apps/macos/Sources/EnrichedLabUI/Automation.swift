@@ -79,7 +79,9 @@ enum Automation {
 	}
 
 	/// Wider to the screen's edge and back to the window's smallest width, 6 points at a time with a display cycle
-	/// between, or the workbench's divider 500 points left and back: what a person's drag does.
+	/// between, or the workbench's divider 500 points left and back: what a person's drag does. A script can't enter
+	/// AppKit's live resize (inLiveResize stays false), so the window drag checks each size, not the end of a drag; the
+	/// divider drag is the one that brought back the November 7 crash on the old code.
 	private static func drag(_ how: String, window: NSWindow, app: AppModel) async -> Int {
 		var steps = 0
 		func turn() async {
