@@ -35,8 +35,8 @@ export function elisionStub(event: Ev<"tool">): string {
 	return `[Earlier output of ${event.name} elided to save context (${kb} KB). recall with handle "${event.handle}" returns it.]`;
 }
 
-function conversational(e: SessionEvent): e is Ev<"user"> | Ev<"assistant"> | Ev<"tool"> | Ev<"undo"> | Ev<"place"> | Ev<"app_context"> | Ev<"discovery"> {
-	return e.t === "user" || e.t === "assistant" || e.t === "tool" || e.t === "undo" || e.t === "place" || e.t === "app_context" || e.t === "discovery";
+function conversational(e: SessionEvent): e is Ev<"user"> | Ev<"assistant"> | Ev<"tool"> | Ev<"undo"> | Ev<"rewind"> | Ev<"place"> | Ev<"app_context"> | Ev<"discovery"> {
+	return e.t === "user" || e.t === "assistant" || e.t === "tool" || e.t === "undo" || e.t === "rewind" || e.t === "place" || e.t === "app_context" || e.t === "discovery";
 }
 
 export function derive(events: SessionEvent[]): Derived {
@@ -106,6 +106,11 @@ export function derive(events: SessionEvent[]): Derived {
 		} else if (e.t === "undo") {
 			closeOpen(i);
 			const text = `(The person undid your changes since their last message. These files are back as they were before: ${e.files.join(", ")}.${e.all ? "" : " Changes made by shell commands were not undone."})`;
+			messages.push({ role: "user", content: [{ type: "text", text }] });
+		} else if (e.t === "rewind") {
+			closeOpen(i);
+			const files = [...e.restored, ...e.removed];
+			const text = `(The person put the folder back as it was before one of your earlier steps. ${files.length ? `These files changed: ${files.slice(0, 40).join(", ")}${files.length > 40 ? `, and ${files.length - 40} more` : ""}.` : "No files differed."} Work from the files as they are now.)`;
 			messages.push({ role: "user", content: [{ type: "text", text }] });
 		} else if (e.t === "app_context") {
 			if (staleContext.has(i)) continue;

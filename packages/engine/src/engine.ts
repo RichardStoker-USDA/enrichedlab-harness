@@ -436,7 +436,22 @@ export class Engine {
 			},
 			ask: (request, signal) => this.ask(request, signal),
 			grantFolder: (folder) => this.setFolderAccess(folder, "change"),
+			historyRoot: join(this.paths.home, "history"),
 		};
+	}
+
+	/**
+	 * A new session that continues from just before a step: the conversation up to there, in the same folder (already
+	 * put back by rewind). The original stays as it was, so both tries can be compared.
+	 */
+	private retryFrom(runtime: SessionRuntime, before: string): SessionRuntime {
+		if (runtime.workspace.kind !== "local") throw new RpcError(-32602, "Trying again in a new session works on this computer for now; at a lab, go back and continue in this session.");
+		const fork = this.createSession(runtime.cwd, runtime.modelRef, runtime.site);
+		fork.setPermissionMode(runtime.permissionMode ?? modeOf(this.config.permissions.mode));
+		const at = runtime.events.findIndex((e) => e.id === before);
+		for (const e of runtime.events.slice(0, at)) if (e.t !== "header" && e.t !== "title" && e.t !== "permissions") fork.append(e);
+		fork.append({ t: "title", id: newId("e"), at: new Date().toISOString(), title: `Retry: ${runtime.summary().title}`.slice(0, 120) });
+		return fork;
 	}
 
 	/** Save what EnrichedLab may do in a folder (asked once, when the person adds it); "none" forgets the folder. */
@@ -625,6 +640,9 @@ export class Engine {
 		if (pinned) session.moveTo(workspace, { place: pinned, label: workspace.label, root: workspace.root, initial: true });
 		this.sessions.set(session.id, session);
 		if (profile) session.setModel(profile.ref, this.config.model === profile.ref ? (this.config.effort ?? profile.defaultEffort) : profile.defaultEffort);
+		// Every session keeps the mode it started with (made here, imported or run headless): a later change to the
+		// default changes new sessions only. A subagent then takes its lead's (spawn).
+		session.setPermissionMode(modeOf(this.config.permissions.mode));
 		this.emit("session.updated", session.summary());
 		return session;
 	}
@@ -691,10 +709,7 @@ export class Engine {
 						if (!asked) throw new RpcError(-32602, `${model} isn't offered now. Choose another model.`);
 						if (!this.sites.allows(asked, site)) throw new RpcError(-32602, `${model} can't be used in ${site ? `a ${this.sites.title(site)} session` : "a session on this computer"}.`);
 					}
-					const made = this.createSession(need("cwd"), model, site, undefined, p.worktree === true);
-					// It keeps the mode it started with: changing the default later changes new sessions only.
-					made.setPermissionMode(modeOf(this.config.permissions.mode));
-					return made.summary();
+					return this.createSession(need("cwd"), model, site, undefined, p.worktree === true).summary();
 				}
 				case "session.open": {
 					const id = need("sessionId");
@@ -777,6 +792,13 @@ export class Engine {
 				}
 				case "session.undo":
 					return this.session(need("sessionId")).undo();
+				case "session.rewind": {
+					const runtime = this.session(need("sessionId"));
+					const before = need("before");
+					const result = await runtime.rewind(before);
+					if (!result.ok || p.retry !== true) return result;
+					return { ...result, session: this.retryFrom(runtime, before).summary() };
+				}
 				case "session.compact":
 					return this.session(need("sessionId")).compactNow();
 				case "session.rename": {

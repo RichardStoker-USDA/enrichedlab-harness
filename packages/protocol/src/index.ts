@@ -123,7 +123,15 @@ export type SessionEvent =
 			files: { path: string; existed: boolean; blob?: string }[];
 			/** In a git repository: the working tree before the turn, as a commit on refs/enrichedlab/checkpoints. */
 			git?: string;
+			/** The folder as it was at this point, in the session's step history (docs/history.md); "turn" marks a turn's start. */
+			history?: string;
+			/** The tool calls this snapshot follows. */
+			calls?: string[];
+			/** Files the snapshot left out (too large, or past one step's limit): going back leaves them as they are. */
+			skipped?: string[];
 	  })
+	/** The folder went back to how it was before a step. `saved` is the present just before, so it can come back too. */
+	| (EventBase & { t: "rewind"; before: string; to: string; saved: string; restored: string[]; removed: string[] })
 	/** File changes since the last message were put back. The model is told on its next request. */
 	| (EventBase & {
 			t: "undo";
@@ -571,6 +579,8 @@ export interface Requests {
 	"session.cancel": { params: { sessionId: string }; result: { ok: true; returned?: string[] } };
 	"session.model": { params: { sessionId: string; model?: string; effort?: string }; result: SessionStatus };
 	"session.compact": { params: { sessionId: string }; result: { ok: boolean; detail: string } };
+	/** Put the folder back as it was before a step (an event id in the log); with `retry`, a new session continues from there. */
+	"session.rewind": { params: { sessionId: string; before: string; retry?: boolean }; result: { ok: boolean; detail: string; files: string[]; session?: SessionSummary } };
 	"session.undo": { params: { sessionId: string }; result: { ok: boolean; files: string[]; detail: string } };
 	"session.rename": { params: { sessionId: string; title: string }; result: { ok: true } };
 	/** Move where the session's files and commands act. A git repository comes along when `carry` is set. */

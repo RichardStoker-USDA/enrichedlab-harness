@@ -21,7 +21,7 @@ import type { LabConfig, PermissionMode } from "../config.ts";
 import { adapterFor, type ModelRegistry, whereOf } from "../models/registry.ts";
 import { ModelHttpError, type ModelProfile, type ToolSchema } from "../models/types.ts";
 import { Checkpoints } from "./checkpoint.ts";
-import { changedSince, repoRoot, restoreSnapshot, snapshot } from "../git.ts";
+import { changedSince, restoreSnapshot } from "../git.ts";
 import { isReadOnlyCommand } from "../tools/shell.ts";
 import { runHooks } from "../hooks.ts";
 import { projectRoot } from "../prompt.ts";
@@ -29,8 +29,9 @@ import { findSkills, type Skill, skillDirs, skillTool } from "../skills.ts";
 import { DEFER_ABOVE, findTools, foundNames, offered } from "../catalog.ts";
 import { builtinSkillsDir } from "../builtin_skills.ts";
 import type { AgentResult } from "../tools/agents.ts";
-import { join } from "node:path";
-import { decide } from "../permissions.ts";
+import { dirname, join } from "node:path";
+import { type History, localHistory, sandboxHistory } from "./history.ts";
+import { canonical, decide } from "../permissions.ts";
 import type { CanvasPublisher, Tool, ToolContext } from "../tools/types.ts";
 import { ToolError } from "../tools/types.ts";
 import type { Workspace } from "../tools/workspace.ts";
@@ -47,6 +48,8 @@ const REASONING_SUMMARY_SYSTEM =
 const MAX_ATTEMPTS = 5;
 const DELTA_FLUSH_MS = 24;
 const PARALLEL_KINDS = new Set(["read", "net", "site-read"]);
+/** Tool kinds that may change the folder: a snapshot follows each step that used one. */
+const CHANGES = new Set(["write", "exec"]);
 
 export interface RuntimeDeps {
 	config(): LabConfig;
@@ -72,6 +75,8 @@ export interface RuntimeDeps {
 	ask(request: PermissionRequest, signal: AbortSignal): Promise<PermissionDecision | "cancelled">;
 	/** Let EnrichedLab change files in a folder from now on (the person answered allow_folder). */
 	grantFolder?(folder: string): void;
+	/** Where step history for folders on this computer is kept (`~/.el/history`). */
+	historyRoot?: string;
 }
 
 type Ev<T extends SessionEvent["t"]> = Extract<SessionEvent, { t: T }>;
@@ -102,6 +107,10 @@ export class SessionRuntime {
 	moving = false;
 	/** What the last turn changed, worked out when it ends; undo offers to put these back. */
 	private changed?: string[];
+	/** The step history of the place the session works in now (docs/history.md). */
+	private history?: History;
+	private historyPlace?: Workspace;
+	private historyOff = false;
 
 	constructor(
 		readonly log: SessionLog,
@@ -408,17 +417,6 @@ export class SessionRuntime {
 		return this.header?.cwd ?? "";
 	}
 
-	/** In a git repository, keep the whole working tree as it was before the turn, so undo covers shell changes. */
-	private snapshotTurn(): void {
-		if (this.workspace.kind !== "local" || !repoRoot(this.cwd)) return;
-		try {
-			const commit = snapshot(this.cwd, this.id, `before: ${clip(this.summary().title, 60)}`);
-			this.append({ t: "checkpoint", id: newId("e"), at: now(), callId: "turn", files: [], git: commit });
-		} catch (error) {
-			this.notice("warn", `Couldn't snapshot the working tree for undo: ${redact(errorText(error))}`);
-		}
-	}
-
 	/** What an open app reports (MCP Apps ui/update-model-context); the model reads the newest on its next request. */
 	appContext(app: string, title: string, text: string): void {
 		this.append({ t: "app_context", id: newId("e"), at: now(), app, title, text });
@@ -507,15 +505,18 @@ export class SessionRuntime {
 		return text.trim();
 	}
 
-	/** Files changed since the person's last message: from the turn's git snapshot, or the per-file copies. */
-	private changesSinceUser(): string[] {
-		if (this.workspace.kind !== "local") return [];
+	/** Files changed since the person's last message: from the step history, the turn's git snapshot, or file copies. */
+	private async changesSinceUser(): Promise<string[]> {
 		const since: Ev<"checkpoint">[] = [];
 		for (let i = this.events.length - 1; i >= 0; i--) {
 			const e = this.events[i]!;
-			if (e.t === "user" || e.t === "undo") break;
+			if (e.t === "user" || e.t === "undo" || e.t === "rewind") break;
 			if (e.t === "checkpoint") since.unshift(e);
 		}
+		const start = since.find((c) => c.callId === "turn" && c.history)?.history;
+		const last = since.findLast((c) => c.history)?.history;
+		if (start && last) return start === last ? [] : this.stepHistory()?.changes(start, last).catch(() => []) ?? [];
+		if (this.workspace.kind !== "local") return [];
 		const git = since.find((c) => c.git)?.git;
 		try {
 			if (git) return changedSince(this.cwd, git);
@@ -525,9 +526,72 @@ export class SessionRuntime {
 		return [...new Set(since.flatMap((c) => c.files.map((f) => this.workspace.display(f.path))))];
 	}
 
-	/** Put back the files this session changed since the person's last message (or the last undo). */
-	undo(): { ok: boolean; files: string[]; detail: string } {
+	/** The step history of where the session works now: git here, or in the lab's sandbox through its shell. */
+	private stepHistory(): History | undefined {
+		const place = this.workspace;
+		if (this.historyPlace !== place) {
+			this.historyPlace = place;
+			this.history =
+				place.kind === "local"
+					? localHistory(this.deps.historyRoot ?? join(dirname(dirname(this.log.dir)), "history"), canonical(place.root), this.id)
+					: sandboxHistory((command) => place.exec(command, { timeoutMs: 120_000, signal: AbortSignal.timeout(130_000) }), place.root, this.id);
+		}
+		return this.historyOff ? undefined : this.history;
+	}
+
+	/** Keep the folder as it is now in the step history, as a point the person or the agent can go back to. */
+	private async keepStep(label: string, callId: string, calls?: string[]): Promise<void> {
+		const history = this.stepHistory();
+		if (!history) return;
+		try {
+			const shot = await history.snapshot(label);
+			if (!shot.changed && callId !== "turn") return;
+			this.append({ t: "checkpoint", id: newId("e"), at: now(), callId, files: [], history: shot.commit, ...(calls ? { calls } : {}), ...(shot.skipped.length ? { skipped: shot.skipped.slice(0, 200) } : {}) });
+		} catch (error) {
+			this.historyOff = true;
+			this.notice("warn", `Step history is off for this session, so its steps can't be taken back: ${redact(errorText(error))}`);
+		}
+	}
+
+	/**
+	 * Put the folder back as it was before a step (an event in the log): the newest history point before it. The present
+	 * is kept first, so this can be taken back too. The model is told on its next request.
+	 */
+	async rewind(before: string): Promise<{ ok: boolean; files: string[]; detail: string }> {
 		if (this.running) return { ok: false, files: [], detail: "Wait for the current turn to finish, or cancel it." };
+		const at = this.events.findIndex((e) => e.id === before);
+		if (at < 0) return { ok: false, files: [], detail: "That step isn't in this session." };
+		const earlier = this.events.slice(0, at);
+		const point = earlier.findLast((e) => e.t === "checkpoint" && e.history) as Ev<"checkpoint"> | undefined;
+		if (!point?.history) return { ok: false, files: [], detail: "This session kept no history before that step." };
+		// History belongs to the place it was kept in: a step before a move can't be brought back here.
+		if (this.events.slice(this.events.indexOf(point)).some((e) => e.t === "place")) return { ok: false, files: [], detail: "The session moved since that step; its history is where it was then." };
+		const history = this.stepHistory();
+		if (!history) return { ok: false, files: [], detail: "Step history is off for this session." };
+		try {
+			const back = await history.restore(point.history, `before ${before}`);
+			this.append({ t: "rewind", id: newId("e"), at: now(), before, to: point.history, saved: back.saved, restored: back.restored, removed: back.removed });
+			this.changed = undefined;
+			const files = [...back.restored, ...back.removed];
+			return { ok: true, files, detail: files.length ? `Put back ${files.length} file${files.length === 1 ? "" : "s"} as they were before that step.` : "The files were already as they were before that step." };
+		} catch (error) {
+			return { ok: false, files: [], detail: `Couldn't go back: ${redact(errorText(error))}` };
+		}
+	}
+
+	/** Put back the files this session changed since the person's last message (or the last undo). */
+	async undo(): Promise<{ ok: boolean; files: string[]; detail: string }> {
+		if (this.running) return { ok: false, files: [], detail: "Wait for the current turn to finish, or cancel it." };
+		// With step history: back to the start of the last turn, shell changes included, here or at a lab.
+		const start = this.events.findLast((e) => e.t === "checkpoint" && e.callId === "turn" && e.history) as Ev<"checkpoint"> | undefined;
+		const after = start ? this.events.slice(this.events.indexOf(start)) : [];
+		if (start && !after.some((e) => e.t === "undo" || e.t === "rewind")) {
+			const first = after.find((e) => e.t !== "checkpoint");
+			const result = first ? await this.rewind(first.id) : { ok: false, files: [], detail: "" };
+			if (!result.ok || !result.files.length) return { ok: false, files: [], detail: result.ok ? "Nothing changed since your last message." : result.detail };
+			this.append({ t: "undo", id: newId("e"), at: now(), files: result.files, all: true });
+			return { ok: true, files: result.files, detail: `Restored ${result.files.length} file${result.files.length === 1 ? "" : "s"}: ${result.files.join(", ")}.` };
+		}
 		if (this.workspace.kind !== "local") return { ok: false, files: [], detail: "Undo works on this computer; in a lab sandbox, ask the agent to revert with git." };
 		const changes: Ev<"checkpoint">["files"][] = [];
 		for (let i = this.events.length - 1; i >= 0; i--) {
@@ -581,13 +645,13 @@ export class SessionRuntime {
 			this.abort = controller;
 			try {
 				for (const message of next) this.appendUser(message);
-				this.snapshotTurn();
+				await this.keepStep(`start of turn ${this.meta.turns + 1}`, "turn");
 				await this.turn(controller.signal);
 			} catch (error) {
 				if (!controller.signal.aborted) this.notice("error", errorText(error));
 			} finally {
 				this.abort = undefined;
-				this.changed = this.changesSinceUser();
+				this.changed = await this.changesSinceUser();
 				const first = this.meta.turns === 0;
 				this.touch({ turns: this.meta.turns + 1 });
 				if (first) this.naming = this.nameSession();
@@ -838,6 +902,8 @@ export class SessionRuntime {
 			this.setActivity("tool", group.map((c) => c.name).join(", "));
 			const results = await Promise.all(group.map((call) => this.runOne(call, tools.get(call.name), model, signal)));
 			results.forEach((result, i) => this.appendToolResult(group[i], result));
+			// Every step that may have changed files is kept, so it can be taken back.
+			if (group.some((call) => CHANGES.has(tools.get(call.name)?.kind ?? ""))) await this.keepStep(`after ${group.map((c) => c.name).join(", ")}`, group[0]!.id, group.map((c) => c.id));
 		}
 	}
 
