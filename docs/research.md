@@ -98,10 +98,25 @@ Scientists validate everything, so every step has to be readable and repeatable.
 - **Receipts.** A lab's tools return a receipt with each result (inputs, code version, parameters, seed, image
   digest, outputs). WHNRC's evidence records chain each step's receipt and seal a finished run
   (`enrichedlab-contracts`, `enrichedlab.evidence.v1`).
-- **A run package.** `el session package <id> [folder]` writes one RO-Crate 1.3 folder (Process Run Crate 0.6, the
-  versions WHNRC's evidence exports pin) with the shared session log and its images, the files a session on this
-  computer changed with their checksums, and every model step and tool call as an action with its tool, times,
-  outcome and reading summary. A lab session's files stay in the lab; its receipts are in the log.
+- **A run package.** `el session package <id> [folder]` (or Session ▸ Export Run Package… in the Mac app) writes one
+  RO-Crate 1.3 folder in the Process Run Crate 0.6 profile, the versions WHNRC's evidence exports pin. The engine
+  writes it (`session.package`), and it holds:
+  - the shared session log, with every message, model step and its full reasoning, and every tool call and output;
+  - its images;
+  - the files a session on this computer changed, with their checksums;
+  - the project's package environment (`environment/pixi.toml`, `pixi.lock`);
+  - EnrichedLab's version and where each model ran;
+  - every model step and tool call as an action: its tool, its arguments and command, the files it named (`object`),
+    the files it changed (`result`), times, outcome, who allowed it, and the reading summary. Files are named by
+    their content id in the step history.
+  - the step history itself, as `history/steps.bundle`: every kept state of the folder, one commit per point, so
+    any file any step read or wrote can be checked out offline (`--no-history` leaves it out).
+
+  `el session verify <folder>` checks every checksum, opens the history, and confirms every content id the steps
+  name is in it. `el session reproduce <folder> <step>` reruns a command step from the folder as it was just before
+  it, in a scratch folder, contained and offline. It then compares every file against what the step left, the same
+  or different, and names any file the rerun changed that the step didn't. A lab session's files stay in the lab;
+  its receipts are in the log.
 
 ## Desktops
 

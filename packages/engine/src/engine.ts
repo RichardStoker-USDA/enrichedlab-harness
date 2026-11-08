@@ -3,7 +3,7 @@
 // it in-process.
 
 import { createHash } from "node:crypto";
-import { cpSync, existsSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
 import type {
@@ -27,7 +27,7 @@ import { applyBundles, listBundles } from "./bundles.ts";
 import { DEFAULT_CONFIG, type LabConfig, loadConfig, type PermissionMode, type ProviderConfig, saveConfig } from "./config.ts";
 import { canonical, folderAccess, identity, modeOf } from "./permissions.ts";
 import { McpManager } from "./mcp.ts";
-import { ModelRegistry } from "./models/registry.ts";
+import { ModelRegistry, whereOf } from "./models/registry.ts";
 import { LocalModels } from "./models/local_service.ts";
 import { ensureHome, type Paths, paths as labPaths } from "./paths.ts";
 import { projectRoot, systemPrompt } from "./prompt.ts";
@@ -59,6 +59,7 @@ import { pdfFieldsTool, pdfFillTool } from "./tools/pdf.ts";
 import { forgetKey, PROVIDER_PRESETS, storeKey, testProvider } from "./models/providers.ts";
 import { RESOURCE as CHATGPT_API, signIn as chatgptSignIn, signOut as chatgptSignOut, summaries as chatgptAccounts, useAccount as useChatgpt } from "./models/chatgpt.ts";
 import { errorText, newId, readJson, sleep, VERSION, writeJson } from "./util.ts";
+import { verifyPackage, writePackage } from "./session/package.ts";
 
 export const BUILT_IN_TOOLS: Tool[] = [readTool, writeTool, editTool, lsTool, globTool, grepTool, shellTool, fetchTool, showTool, recallTool, planTool, agentStartTool, agentWaitTool, rememberTool, skillCreateTool, appCreateTool, appOpenTool, environmentTool, pdfFieldsTool, pdfFillTool, ...BROWSER_TOOLS];
 
@@ -878,6 +879,22 @@ export class Engine {
 					const session = this.session(need("sessionId"));
 					return toV1(session.log.read());
 				}
+				case "session.package": {
+					// A run package (docs/research.md): written here, where the step history and the project are.
+					const session = this.session(need("sessionId"));
+					const folder = resolve(need("folder"));
+					if (existsSync(folder) && readdirSync(folder).length) throw new RpcError(-32602, `${folder} already has files in it. Name a new folder.`);
+					const { events, attachments } = toV1(session.log.read());
+					const places: Record<string, string> = {};
+					for (const e of session.events) if (e.t === "assistant" && !places[e.model]) {
+						const model = this.registry.resolve(e.model);
+						if (model) places[e.model] = whereOf(model).name;
+					}
+					const made = writePackage(folder, { summary: session.summary(), events: session.events, log: events, attachments, history: session.historyHandle(), withoutHistory: p.history === false, modelPlaces: places, version: VERSION });
+					return { folder, ...made, checks: verifyPackage(folder) };
+				}
+				case "package.verify":
+					return { checks: verifyPackage(resolve(need("folder"))) };
 				case "session.import": {
 					if (!Array.isArray(p.events)) throw new RpcError(-32602, "events must be a list of v1 session events.");
 					return this.importLog(p.events, (p.attachments ?? {}) as Attachments, typeof p.cwd === "string" ? p.cwd : undefined, typeof p.model === "string" ? p.model : undefined);

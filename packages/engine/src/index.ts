@@ -14,3 +14,4 @@ export { readManifest, describePermissions } from "./apps/manifest.ts";
 export { type Template, TEMPLATES, templateFiles } from "./apps/templates.ts";
 export { applyUpdate, checkForUpdate, installKind, newer, releaseFile, verifyManifest, type Manifest } from "./update.ts";
 export { runContained, quoteArg } from "./tools/windows_contain.ts";
+export { verifyPackage, reproduceStep, type CheckRow, type Reproduced } from "./session/package.ts";

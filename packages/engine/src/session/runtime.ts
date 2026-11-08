@@ -30,7 +30,7 @@ import { DEFER_ABOVE, findTools, foundNames, offered } from "../catalog.ts";
 import { builtinSkillsDir } from "../builtin_skills.ts";
 import type { AgentResult } from "../tools/agents.ts";
 import { dirname, join } from "node:path";
-import { type History, localHistory, type Snapshot, sandboxHistory } from "./history.ts";
+import { type History, localHistory, type Snapshot, sandboxHistory, storeFor } from "./history.ts";
 import { canonical, decide } from "../permissions.ts";
 import type { CanvasPublisher, Tool, ToolContext } from "../tools/types.ts";
 import { ToolError } from "../tools/types.ts";
@@ -583,6 +583,12 @@ export class SessionRuntime {
 					: sandboxHistory((command) => place.exec(command, { timeoutMs: 120_000, signal: AbortSignal.timeout(130_000) }), place.root, this.id);
 		}
 		return this.historyOff ? undefined : this.history;
+	}
+
+	/** Where this session's step history is on this computer, for a run package; absent at a lab. */
+	historyHandle(): { store: string; ref: string } | undefined {
+		if (this.workspace.kind !== "local") return undefined;
+		return { store: storeFor(this.deps.historyRoot ?? join(dirname(dirname(this.log.dir)), "history"), canonical(this.workspace.root)), ref: `refs/sessions/${this.id}` };
 	}
 
 	/** Keep the folder as it is now in the step history, as a point the person or the agent can go back to. */

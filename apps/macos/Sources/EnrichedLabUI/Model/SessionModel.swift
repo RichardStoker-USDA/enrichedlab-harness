@@ -239,6 +239,29 @@ public final class SessionModel {
 		do { app.say(try await app.connection.compact(id).detail) } catch { app.said(error, prefix: "Summarizing didn't work") }
 	}
 
+	/// Choose where, then write a run package: the log, the files, the environment, every step with what it read and
+	/// changed, and the step history, checked once written (docs/research.md).
+	public func exportPackage() async {
+		let panel = NSSavePanel()
+		panel.title = "Export Run Package"
+		panel.message = "A folder others can check and rerun from: the log with full reasoning, every step, the files and their history."
+		panel.nameFieldStringValue = "\(summary.title.isEmpty ? "session" : summary.title.replacingOccurrences(of: "/", with: "-")) run package"
+		panel.canCreateDirectories = true
+		guard panel.runModal() == .OK, let url = panel.url else { return }
+		do {
+			let made = try await app.connection.package(id, folder: url.path)
+			let failed = made.checks.filter { !$0.ok }
+			if failed.isEmpty {
+				app.say("Exported \(made.actions) steps\(made.history ? " with the step history" : ""); every checksum and content id checks out.")
+				NSWorkspace.shared.activateFileViewerSelecting([url])
+			} else {
+				app.say("Exported, but a check failed: \(failed.map { "\($0.check): \($0.detail)" }.joined(separator: "; "))")
+			}
+		} catch {
+			app.said(error, prefix: "Couldn't export the run package")
+		}
+	}
+
 	public func undo() async {
 		do { app.say(try await app.connection.undo(id).detail) } catch { app.said(error, prefix: "Undo didn't work") }
 	}

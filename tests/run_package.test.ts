@@ -6,7 +6,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { writePackage } from "../packages/cli/src/package.ts";
+import { writePackage } from "../packages/engine/src/session/package.ts";
 import type { SessionEvent, SessionSummary } from "../packages/protocol/src/index.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "el-package-"));
@@ -28,8 +28,8 @@ describe("a run package", () => {
 	test("holds the log, the changed files with checksums, and every step as an action", () => {
 		writeFileSync(join(dir, "summary.csv"), "plot,moisture\nP1,0.31\n");
 		const out = join(dir, "pkg");
-		const made = writePackage(out, { summary: summary(), events, log: [{ v: 1, seq: 1, kind: "user", data: { text: "Summarize the plots." } }], attachments: {} });
-		expect(made).toEqual({ files: 1, actions: 3 });
+		const made = writePackage(out, { summary: summary(), events, log: [{ v: 1, seq: 1, kind: "user", data: { text: "Summarize the plots." } }], attachments: {}, version: "test" });
+		expect(made).toEqual({ files: 1, actions: 3, history: false });
 		const crate = JSON.parse(readFileSync(join(out, "ro-crate-metadata.json"), "utf8")) as { "@context": string; "@graph": Record<string, unknown>[] };
 		expect(crate["@context"]).toBe("https://w3id.org/ro/crate/1.3/context");
 		const byId = new Map(crate["@graph"].map((e) => [e["@id"] as string, e]));
@@ -49,7 +49,7 @@ describe("a run package", () => {
 	test("a lab session's files stay in the lab; the package holds its log and steps", () => {
 		const out = join(dir, "pkg-lab");
 		mkdirSync(out);
-		const made = writePackage(out, { summary: summary("field"), events, log: [], attachments: {} });
+		const made = writePackage(out, { summary: summary("field"), events, log: [], attachments: {}, version: "test" });
 		expect(made.files).toBe(0);
 		expect(existsSync(join(out, "files"))).toBe(false);
 		const crate = JSON.parse(readFileSync(join(out, "ro-crate-metadata.json"), "utf8")) as { "@graph": { "@id": string; description?: string }[] };

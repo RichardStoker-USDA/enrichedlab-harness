@@ -198,6 +198,11 @@ export function pathsInside(command: string, inside: (path: string) => boolean, 
 	});
 }
 
+/** Every word of a command, quotes taken out (for naming the files a step read); empty when it can't be read. */
+export function commandWords(command: string): string[] {
+	return (tokenize(command.trim()) ?? []).flatMap((t) => (t.text === undefined ? [] : [t.text]));
+}
+
 /** The words of a command that name paths (as pathsInside judges them), for the lab sandbox's fence. */
 export function pathWords(command: string): string[] {
 	return (tokenize(command.trim()) ?? []).flatMap((t) => {

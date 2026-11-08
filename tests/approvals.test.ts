@@ -12,6 +12,7 @@ import type { ModelRegistry } from "../packages/engine/src/models/registry.ts";
 import type { ModelProfile } from "../packages/engine/src/models/types.ts";
 import { identity } from "../packages/engine/src/permissions.ts";
 import { SessionLog } from "../packages/engine/src/session/log.ts";
+import { reproduceStep, verifyPackage, writePackage } from "../packages/engine/src/session/package.ts";
 import { type RuntimeDeps, SessionRuntime } from "../packages/engine/src/session/runtime.ts";
 import { writeTool } from "../packages/engine/src/tools/files.ts";
 import { shellTool } from "../packages/engine/src/tools/shell.ts";
@@ -195,5 +196,30 @@ describe("approvals", () => {
 		expect(undone.files).toEqual(["second.txt"]);
 		expect(existsSync(join(root, "first.txt"))).toBe(true);
 		expect(existsSync(join(root, "second.txt"))).toBe(false);
+	});
+
+	test("a run package carries the step history: it verifies, a command step reproduces, and a changed file is caught", async () => {
+		const root = join(dir, "p6");
+		mkdirSync(root);
+		const full = { ...DEFAULT_CONFIG, permissions: { ...DEFAULT_CONFIG.permissions, mode: "full" as const } };
+		const { log } = SessionLog.create(join(dir, "logs"), root, model.ref, "You help.");
+		const { runtime: session } = runtime(log, root, () => full, () => "allow");
+		await turn(session, "write: notes.txt");
+		await turn(session, "shell: cp notes.txt copy.txt");
+		const out = join(dir, "p6-package");
+		const made = writePackage(out, { summary: session.summary(), events: session.events, log: [], attachments: {}, history: session.historyHandle(), version: "test" });
+		expect(made.history).toBe(true);
+		expect(verifyPackage(out).filter((row) => !row.ok)).toEqual([]);
+		// The command step names what it read and what it changed, by content id.
+		const graph = (JSON.parse(readFileSync(join(out, "ro-crate-metadata.json"), "utf8")) as { "@graph": Record<string, unknown>[] })["@graph"];
+		const call = graph.find((e) => (e["@id"] as string).startsWith("#call-") && typeof e["https://enrichedlab.org/contract/2026-11/terms#command"] === "string")!;
+		const named = (refs: unknown) => (refs as { "@id": string }[]).map((r) => graph.find((e) => e["@id"] === r["@id"])?.name);
+		expect(named(call.object)).toEqual(["notes.txt"]);
+		expect(named(call.result)).toEqual(["copy.txt"]);
+		const again = await reproduceStep(out, call["@id"] as string);
+		expect(again).toMatchObject({ same: ["copy.txt"], differ: [], extra: [], exitCode: 0 });
+		// A file changed after packaging fails its checksum.
+		writeFileSync(join(out, "files", "copy.txt"), "changed\n");
+		expect(verifyPackage(out).find((row) => row.check === "files")?.ok).toBe(false);
 	});
 });

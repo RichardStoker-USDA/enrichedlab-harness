@@ -84,7 +84,10 @@ const HELP = `EnrichedLab ${VERSION}
   el sessions                     recent sessions in this folder (--all for every folder)
   el session export <id> [folder] a session in the shared log format (v1), to open elsewhere
   el session import <folder>      a new session from a v1 log [--cwd <folder>]
-  el session package <id> [dir]   the session as an RO-Crate: its log, changed files and every step, to check or rerun
+  el session package <id> [dir]   the session as an RO-Crate: log, changed files, environment, every step with what
+                                 it read and changed, and the step history (--no-history leaves it out)
+  el session verify <dir>        check a run package: checksums, history, every content id its steps name
+  el session reproduce <dir> <step>  rerun a command step from the package's history and compare the files
   el session push <id> <lab>      send a session to the lab's Rein, to go on in the browser [--title <title>]
   el session pull <lab> <id>      a Rein session back here as a new session [--cwd <folder>]
   el service add chatgpt          use your ChatGPT plan (sign in in the browser; --new adds another account)
@@ -648,17 +651,40 @@ async function main(): Promise<void> {
 				return out(`Exported ${events.length} events to ${folder}`);
 			}
 			if (verb === "package") {
-				// A run package: one RO-Crate folder a scientist can inspect and rerun from (docs/research.md).
-				const id = target ?? fail("el session package <session id> [folder]");
+				// A run package: one RO-Crate folder a scientist can inspect, check and rerun from (docs/research.md).
+				const id = target ?? fail("el session package <session id> [folder] [--no-history]");
 				const folder = resolve(rest[2] ?? `${id}-package`);
 				if (existsSync(folder) && readdirSync(folder).length) fail(`${folder} already has files in it. Name a new folder.`);
 				const client = await connect();
-				const opened = await client.call("session.open", { sessionId: id });
-				const { events, attachments } = await client.call("session.export", { sessionId: id });
+				await client.call("session.open", { sessionId: id });
+				const made = await client.call("session.package", { sessionId: id, folder, history: flags["no-history"] !== true });
 				client.close();
-				const { writePackage } = await import("./package.ts");
-				const made = writePackage(folder, { summary: opened.summary, events: opened.events, log: events, attachments });
-				return out(`Packaged ${made.actions} steps${made.files ? ` and ${made.files} changed file${made.files === 1 ? "" : "s"}` : ""} as an RO-Crate in ${folder}`);
+				out(`Packaged ${made.actions} steps${made.files ? `, ${made.files} changed file${made.files === 1 ? "" : "s"}` : ""}${made.history ? " and the step history" : ""} as an RO-Crate in ${folder}`);
+				for (const row of made.checks) out(`  ${row.ok ? "ok  " : "FAIL"}  ${row.check}: ${row.detail}`);
+				return;
+			}
+			if (verb === "verify") {
+				// Check a run package: every checksum, the history bundle, every content id its steps name.
+				const folder = resolve(target ?? fail("el session verify <package folder>"));
+				const { verifyPackage } = await import("@enrichedlab/engine");
+				const checks = verifyPackage(folder);
+				for (const row of checks) out(`${row.ok ? "ok  " : "FAIL"}  ${row.check}: ${row.detail}`);
+				if (checks.some((row) => !row.ok)) process.exitCode = 1;
+				return;
+			}
+			if (verb === "reproduce") {
+				// Rerun a command step from the package's history, contained and offline, and compare the files it changes.
+				const folder = resolve(target ?? fail("el session reproduce <package folder> <step id>"));
+				const step = rest[2] ?? fail("el session reproduce <package folder> <step id>  (step ids are the #call-… entries)");
+				const { reproduceStep } = await import("@enrichedlab/engine");
+				const r = await reproduceStep(folder, step);
+				out(`Reran: ${r.command}\nExit code: ${r.exitCode ?? "none (timed out or stopped)"}`);
+				for (const path of r.same) out(`  same     ${path}`);
+				for (const d of r.differ) out(`  DIFFERS  ${d.path}${d.expected ? "" : " (the step removed it)"}${d.got ? "" : " (the rerun removed it)"}`);
+				for (const path of r.extra) out(`  EXTRA    ${path} (changed by the rerun, not by the step)`);
+				out(r.differ.length || r.extra.length ? "Not reproduced: the files differ." : `Reproduced: ${r.same.length} file${r.same.length === 1 ? "" : "s"} came out the same.`);
+				if (r.differ.length || r.extra.length) process.exitCode = 1;
+				return;
 			}
 			if (verb === "push") {
 				// A session to a lab's Rein, its web harness, to go on with it in the browser.

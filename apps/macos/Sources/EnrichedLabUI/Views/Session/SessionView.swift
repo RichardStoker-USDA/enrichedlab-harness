@@ -58,6 +58,8 @@ struct SessionView: View {
 					.disabled(session.status?.undoable?.isEmpty ?? true)
 				Button("Summarize Older Turns") { Task { await session.compact() } }
 					.disabled(session.busy)
+				Button("Export Run Package…") { Task { await session.exportPackage() } }
+					.disabled(session.busy)
 				Divider()
 				Button("Show in Finder") { revealInFinder(session.summary.cwd) }
 				Button("Copy Folder Path") { copyText(session.summary.cwd, what: "the folder path", app: app) }

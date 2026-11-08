@@ -674,6 +674,14 @@ export interface Requests {
 	"session.moveplan": { params: { sessionId: string }; result: { repo?: string } };
 	/** The session in the shared log format v1 (docs/session-log.md), with the bytes of the images it refers to. */
 	"session.export": { params: { sessionId: string }; result: { events: LogV1Event[]; attachments: Record<string, { mime: string; data: string }> } };
+	/**
+	 * A run package (RO-Crate) written to `folder` by the engine: the log, changed files, the environment, every step with
+	 * what it read and changed, and (on this computer, unless `history` is false) the step history as a git bundle.
+	 * `checks` is verifyPackage's answer for the folder just written.
+	 */
+	"session.package": { params: { sessionId: string; folder: string; history?: boolean }; result: { folder: string; files: number; actions: number; history: boolean; checks: PackageCheck[] } };
+	/** Check a run package: every file's checksum, the history bundle, and the content ids its steps name. */
+	"package.verify": { params: { folder: string }; result: { checks: PackageCheck[] } };
 	/** A new session from a v1 log: its context rebuilt as the format says. `cwd` overrides the folder it names. */
 	"session.import": { params: { events: LogV1Event[]; attachments?: Record<string, { mime: string; data: string }>; cwd?: string; model?: string }; result: SessionSummary };
 	/** A surface's answer to surface.call. */
@@ -751,6 +759,12 @@ export interface Partial_ {
 	tools: { index: number; name: string; args: string }[];
 	/** Output so far of tools still running, by call id. */
 	output: Record<string, string>;
+}
+
+export interface PackageCheck {
+	check: string;
+	ok: boolean;
+	detail: string;
 }
 
 export interface UiPrefs {

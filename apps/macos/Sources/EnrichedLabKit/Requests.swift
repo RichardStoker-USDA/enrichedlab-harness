@@ -229,6 +229,26 @@ extension EngineConnection {
 		return try await call("ui.set", P(theme: theme, showReasoning: showReasoning, permissions: permissions?.rawValue, summaryModel: summaryModel, reasoningSummaries: reasoningSummaries))
 	}
 
+	public struct PackageCheck: Decodable, Sendable, Hashable {
+		public var check: String
+		public var ok: Bool
+		public var detail: String
+	}
+
+	public struct Packaged: Decodable, Sendable {
+		public var folder: String
+		public var files: Int
+		public var actions: Int
+		public var history: Bool
+		public var checks: [PackageCheck]
+	}
+
+	/// A run package (RO-Crate) of the session, written by the engine into a new folder, then checked.
+	public func package(_ id: String, folder: String, history: Bool = true) async throws -> Packaged {
+		struct P: Encodable, Sendable { var sessionId: String; var folder: String; var history: Bool }
+		return try await call("session.package", P(sessionId: id, folder: folder, history: history))
+	}
+
 	/// The files a step changed, from step history.
 	public struct StepFiles: Decodable, Sendable, Hashable {
 		public var files: [String]

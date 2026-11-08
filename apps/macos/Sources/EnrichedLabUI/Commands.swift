@@ -47,6 +47,8 @@ public struct EnrichedLabCommands: Commands {
 				.disabled(session?.status?.undoable?.isEmpty ?? true)
 			Button("Summarize Older Turns") { if let session { Task { await session.compact() } } }
 				.disabled(session == nil || session?.busy == true)
+			Button("Export Run Package…") { if let session { Task { await session.exportPackage() } } }
+				.disabled(session == nil || session?.busy == true)
 			Divider()
 			Button("Show in Finder") { if let session { revealInFinder(session.summary.cwd) } }
 				.keyboardShortcut("r", modifiers: [.command, .shift])
