@@ -222,7 +222,10 @@ export class LocalWorkspace implements Workspace {
 
 	resolve(path: string): string {
 		const expanded = path === "~" ? homedir() : path.startsWith("~/") ? join(homedir(), path.slice(2)) : path;
-		return isAbsolute(expanded) ? resolve(expanded) : resolve(this.root, expanded);
+		const joined = isAbsolute(expanded) ? expanded : `${this.root}${sep}${expanded}`;
+		// A ".." goes where the system takes it (after following the link before it), the same way inside() judges it,
+		// so what was allowed and what is opened are one place.
+		return /(^|[\\/])\.\.([\\/]|$)/.test(expanded) ? physical(joined) : resolve(joined);
 	}
 
 	/** Credential folders (PRIVATE_DIRS) stay closed to the file tools, whatever was allowed, symlinks followed. */

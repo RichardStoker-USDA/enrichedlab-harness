@@ -360,6 +360,8 @@ describe("permissions", () => {
 		const local = new LocalWorkspace(root);
 		expect(local.inside("link/../x")).toBe(false);
 		expect(local.inside("sub/../x")).toBe(true);
+		// What is opened is where inside() judged: through the link, then up.
+		expect(local.resolve("link/../x")).toBe(join(dirname(deep), "x"));
 		expect(canonical(`${root}/link/../x`)).toBe(join(dirname(deep), "x"));
 	});
 
