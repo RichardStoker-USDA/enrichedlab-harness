@@ -182,7 +182,7 @@ public struct Place: Sendable, Hashable, Identifiable {
 }
 
 public func places(_ sites: [SiteSummary], computer: String = "This Mac") -> [Place] {
-	let local = Place(id: "local", title: computer, detail: "contained", index: 0, ready: true, site: nil, missing: false)
+	let local = Place(id: "local", title: computer, detail: "local sandbox", index: 0, ready: true, site: nil, missing: false)
 	let labs = sites.enumerated().map { i, site in
 		Place(
 			id: site.name,

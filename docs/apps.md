@@ -24,6 +24,25 @@ macOS, Windows and Linux, and `pixi.lock` records exactly what was installed, so
 environment into a sandbox image. The consent card lists the packages. `command` and `serve` backends then run
 inside that environment, contained; `$PORT` in a served app's command is its port.
 
+## A project's own environment
+
+The agent's `environment` tool gives a project its own pixi environment: `pixi.toml` and `pixi.lock` in the project,
+the packages in its `.pixi` folder. It can list, add (conda-forge, or PyPI with `pypi: true`), remove, update and
+sync, for the project or for one app's folder (`folder: "apps/<name>"`). The install is contained the same way as an
+app's: it may write the project and pixi's own caches under `~/.el/tools`, and it gets no keys or tokens. Shell
+commands then run inside that environment: its programs come first on PATH and `CONDA_PREFIX` is set. Each project
+is kept apart from the system and from other projects. The system prompt tells the model to use the tool rather than
+brew, sudo, `pip install --user` or `install.packages`. Installs ask unless the session allowed them or runs Allow
+Everything; listing doesn't ask.
+
+Updating names its packages (`update` with `packages: ["shiny"]`) or updates everything the manifest allows. The
+result lists every version that changed. `pixi.toml` and `pixi.lock` are project files, so step history keeps each
+version: going back to before an update and running `sync` puts the previous versions back.
+
+When the session works with a lab whose descriptor names vetted package sources (`packages`, docs/labs.md), a new
+environment uses the lab's conda channels, plus conda-forge unless the lab says `only`, and its PyPI index. A lab's
+sandbox has no network, so there the tool explains that packages come from the lab's image.
+
 ## From a lab
 
 A lab can offer apps to people by group (`GET /v1/apps`, docs/labs.md). They show under *From <lab>* in the Apps

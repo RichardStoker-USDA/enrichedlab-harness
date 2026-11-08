@@ -99,6 +99,10 @@ export interface RuntimeDeps {
 	grantFolder?(folder: string): void;
 	/** Where step history for folders on this computer is kept (`~/.el/history`). */
 	historyRoot?: string;
+	/** Where shared tools (pixi) are kept. */
+	toolsDir?: string;
+	/** A lab's vetted package sources (its descriptor's `packages`). */
+	packageSources?: (site?: string) => { conda?: string[]; pypi?: string; only?: boolean } | undefined;
 }
 
 type Ev<T extends SessionEvent["t"]> = Extract<SessionEvent, { t: T }>;
@@ -1064,6 +1068,8 @@ export class SessionRuntime {
 				place: this.place,
 				project: projectRoot(this.cwd),
 				sealed: this.deps.sealed?.(this.site),
+				tools: this.deps.toolsDir,
+				packages: this.deps.packageSources?.(this.site),
 				apps: this.deps.apps?.(this.id),
 				surface: this.deps.surface?.(this.id),
 				browser: this.deps.browser?.(this.id),

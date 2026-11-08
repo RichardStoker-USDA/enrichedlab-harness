@@ -5,7 +5,7 @@ import { spawn } from "node:child_process";
 import { existsSync, lstatSync, readlinkSync, realpathSync } from "node:fs";
 import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { withoutSecrets } from "../util.ts";
 
 export interface Entry {
@@ -294,7 +294,8 @@ export class LocalWorkspace implements Workspace {
 		return new Promise((done) => {
 			const child = spawn(file, args, {
 				cwd: this.root,
-				env: { ...env, LAB_AGENT: "1", PAGER: "cat", GIT_PAGER: "cat", TERM: "dumb", NO_COLOR: "1" },
+				// Inside the project's own package environment when it has one (tools/environment.ts).
+				env: { ...activated(this.root, env), LAB_AGENT: "1", PAGER: "cat", GIT_PAGER: "cat", TERM: "dumb", NO_COLOR: "1" },
 				stdio: ["ignore", "pipe", "pipe"],
 				windowsHide: true,
 				detached: process.platform !== "win32",
@@ -390,4 +391,18 @@ export function physical(path: string, depth = 0): string {
 		at = link === undefined ? next : physical(isAbsolute(link) ? link : `${at}${sep}${link}`, depth + 1);
 	}
 	return at;
+}
+
+/** The project's environment, when it has one built: its folder of programs. */
+export function projectEnvironment(root: string): string | undefined {
+	const prefix = join(root, ".pixi", "envs", "default");
+	return existsSync(join(root, "pixi.toml")) && existsSync(join(prefix, "conda-meta")) ? prefix : undefined;
+}
+
+/** Commands run inside the project's environment: its programs first on PATH, as `pixi shell` would set. */
+export function activated(root: string, env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+	const prefix = projectEnvironment(root);
+	if (!prefix) return env;
+	const bins = process.platform === "win32" ? [prefix, join(prefix, "Library", "bin"), join(prefix, "Scripts")] : [join(prefix, "bin")];
+	return { ...env, PATH: [...bins, env.PATH ?? ""].filter(Boolean).join(delimiter), CONDA_PREFIX: prefix, PIXI_PROJECT_ROOT: root, PIXI_ENVIRONMENT_NAME: "default" };
 }

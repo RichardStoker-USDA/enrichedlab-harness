@@ -1,5 +1,18 @@
 # Security
 
+## The local sandbox
+
+"Local sandbox" is what the app calls the containment on this computer (This Mac ▸ About the Local Sandbox explains
+it in the app). The agent's commands, app backends and package installs run inside it. It needs no administrator
+setup.
+- Writes go to the project and temporary folders only.
+- The network is off unless a command is allowed to use it.
+- Credential folders stay hidden, and keys and tokens are left out of its environment.
+
+Packages go into each project's own environment (pixi, docs/apps.md), not the system. Step history
+(docs/history.md) keeps every step, so changes in the project can be taken back. The table below has the details
+for each operating system.
+
 ## What contains the agent
 
 | | macOS | Linux | Windows |

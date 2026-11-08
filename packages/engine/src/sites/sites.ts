@@ -605,6 +605,12 @@ export class Sites {
 	}
 
 	/** Whether a lab keeps its sessions to itself: joined that way, or the lab says it keeps data inside. */
+	/** The lab's vetted package sources, when its descriptor names them. */
+	packages(name: string): { conda?: string[]; pypi?: string; only?: boolean } | undefined {
+		const p = this.adapters.get(name)?.descriptor?.packages;
+		return p && (p.conda?.length || p.pypi) ? { conda: p.conda, pypi: p.pypi, only: p.only } : undefined;
+	}
+
 	isolated(name: string): boolean {
 		return this.configs().find((c) => c.name === name)?.isolated === true || this.adapters.get(name)?.descriptor?.policy?.keep_data_inside === true;
 	}

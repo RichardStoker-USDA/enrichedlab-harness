@@ -9,9 +9,10 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { LabConfig } from "../packages/engine/src/config.ts";
 import { allowKey, allowKeys, canonical, decide, folderAccess, identity } from "../packages/engine/src/permissions.ts";
+import { manifest } from "../packages/engine/src/tools/environment.ts";
 import { isReadOnlyCommand } from "../packages/engine/src/tools/shell.ts";
 import type { Tool } from "../packages/engine/src/tools/types.ts";
-import { LocalWorkspace } from "../packages/engine/src/tools/workspace.ts";
+import { activated, LocalWorkspace } from "../packages/engine/src/tools/workspace.ts";
 import { type SandboxApi, SandboxWorkspace } from "../packages/engine/src/sites/sandbox_workspace.ts";
 import { openPort } from "../packages/engine/src/sites/port_proxy.ts";
 import { unifiedDiff } from "../packages/engine/src/tools/diff.ts";
@@ -233,6 +234,25 @@ describe("permissions", () => {
 		works = true;
 		expect(await lab.checkpoint("next step")).toBe("k2");
 		expect(decide(shell, { command: "rm -rf /sandbox/data/raw" }, lab, auto, new Set()).action).toBe("run");
+	});
+
+	test("package installs ask unless allowed or Allow Everything; listing runs; the environment's channels follow the lab", () => {
+		const env = { name: "environment", kind: "packages" } as unknown as Tool;
+		const mode = (m: string) => ({ permissions: { mode: m, allowCommands: [] }, folders: { [home]: { access: "change", at: "" } } }) as unknown as LabConfig;
+		expect(decide(env, { action: "list" }, ws, mode("ask"), new Set()).action).toBe("run");
+		expect(decide(env, { action: "add", packages: ["r-shiny"] }, ws, mode("auto"), new Set())).toMatchObject({ action: "ask", keys: ["tool:environment"], scope: "package installs in this project's environment" });
+		expect(decide(env, { action: "update" }, ws, mode("auto"), new Set(["tool:environment"])).action).toBe("run");
+		expect(decide(env, { action: "add", packages: ["r-shiny"] }, ws, mode("full"), new Set()).action).toBe("run");
+		expect(manifest("field", { conda: ["https://conda.lab.example/vetted"], pypi: "https://pypi.lab.example/simple", only: true })).toContain('channels = ["https://conda.lab.example/vetted"]');
+		expect(manifest("field", { conda: ["https://conda.lab.example/vetted"] })).toContain('channels = ["https://conda.lab.example/vetted","conda-forge"]');
+		expect(manifest("field", { pypi: "https://pypi.lab.example/simple" })).toContain('index-url = "https://pypi.lab.example/simple"');
+		expect(manifest("field")).toContain('channels = ["conda-forge"]');
+		// Commands run inside the project's environment once it's built.
+		const project = realpathSync(scratch("env"));
+		expect(activated(project, { PATH: "/usr/bin" }).PATH).toBe("/usr/bin");
+		writeFileSync(join(project, "pixi.toml"), manifest("p"));
+		mkdirSync(join(project, ".pixi", "envs", "default", "conda-meta"), { recursive: true });
+		expect(activated(project, { PATH: "/usr/bin" })).toMatchObject({ PATH: `${join(project, ".pixi", "envs", "default", "bin")}:/usr/bin`, CONDA_PREFIX: join(project, ".pixi", "envs", "default") });
 	});
 
 	test("in a lab's sandbox, code handed to an interpreter or a quoted script asks: its paths aren't in its words", () => {

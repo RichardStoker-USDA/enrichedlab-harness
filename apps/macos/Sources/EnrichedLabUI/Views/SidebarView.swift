@@ -91,6 +91,7 @@ private struct PlaceRow: View {
 	@Environment(AppModel.self) private var app
 	var place: Place
 	@State private var busy = false
+	@State private var explaining = false
 
 	var body: some View {
 		Button {
@@ -114,6 +115,7 @@ private struct PlaceRow: View {
 		.help(help)
 		.contextMenu { menu }
 		.accessibilityLabel("\(place.title), \(place.detail)")
+		.popover(isPresented: $explaining, arrowEdge: .trailing) { LocalSandboxNote() }
 	}
 
 	private var statusStyle: some ShapeStyle {
@@ -123,7 +125,7 @@ private struct PlaceRow: View {
 
 	private var help: String {
 		if let site = place.site, !site.signedIn { return "Sign in to \(place.title)" }
-		return place.isLocal ? "New session on this Mac" : "New session in the \(place.title) sandbox"
+		return place.isLocal ? "New session on this Mac, in its local sandbox: commands change only the project and temp folders, without the network or your credential folders" : "New session in the \(place.title) sandbox"
 	}
 
 	private func primary() async {
@@ -139,6 +141,7 @@ private struct PlaceRow: View {
 	@ViewBuilder private var menu: some View {
 		Button(place.isLocal ? "New Session on This Mac" : "New Session in \(place.title)") { app.beginNew(place: place.id) }
 			.disabled(!place.ready && !place.isLocal)
+		if place.isLocal { Button("About the Local Sandbox") { explaining = true } }
 		if let site = place.site {
 			Divider()
 			if site.signedIn {
@@ -233,5 +236,35 @@ struct SessionRow: View {
 		let wanted = title
 		app.renaming = nil
 		if wanted != session.title { _ = await app.rename(session.id, to: wanted) }
+	}
+}
+
+/// What "local sandbox" means, in the person's terms (docs/security.md, "The local sandbox").
+private struct LocalSandboxNote: View {
+	var body: some View {
+		VStack(alignment: .leading, spacing: 10) {
+			Text("The local sandbox").font(.headline)
+			Text("On this Mac, the agent's commands run inside a sandbox macOS enforces. No administrator setup.")
+				.foregroundStyle(.secondary)
+			VStack(alignment: .leading, spacing: 6) {
+				fact("Changes", "Only the project folder and temporary folders.")
+				fact("Network", "Off, unless you allow a command to use it.")
+				fact("Private folders", "~/.ssh, key stores and browser profiles stay hidden; keys and tokens are left out of its environment.")
+				fact("Packages", "Each project gets its own environment (pixi, in the project's .pixi folder), kept apart from the system and other projects.")
+				fact("Going back", "Every step is kept, so changes in the project can be taken back.")
+			}
+			Text("It can still read files elsewhere that aren't hidden. A command you approve to run outside the sandbox can do anything you can.")
+				.font(.caption)
+				.foregroundStyle(.secondary)
+		}
+		.padding(16)
+		.frame(width: 340, alignment: .leading)
+	}
+
+	private func fact(_ label: String, _ text: String) -> some View {
+		VStack(alignment: .leading, spacing: 1) {
+			Text(label).font(.caption.weight(.semibold))
+			Text(text).font(.callout).fixedSize(horizontal: false, vertical: true)
+		}
 	}
 }

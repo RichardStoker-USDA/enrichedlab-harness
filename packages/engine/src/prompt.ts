@@ -102,6 +102,7 @@ export function systemPrompt(input: PromptInput): string {
 		"- Use show for anything better seen than read: charts, tables, previews, diagrams, small interactive tools. Update a view by passing its id.",
 		"- Long outputs come back clipped with a handle; earlier large outputs may be elided to save context. recall with the handle returns the exact text.",
 		"- Never print secrets. Refer to credentials by their file path.",
+		`- Packages: on this computer, add R, Python and command-line tools with environment, into this project's own environment (pixi; R packages are r-<name>), and shell commands run inside it. Don't install into the system or another project (brew, sudo, pip install --user, install.packages). In a lab's sandbox, use what the lab's image has, and say what's missing.${existsSync(join(input.cwd, "pixi.toml")) ? " This project already has an environment (pixi.toml): list it before assuming a package is missing." : ""}`,
 		"- Write answers in plain, direct language. Lead with the result.",
 		"- When you learn something durable about this project or how the person works (how to build or test it, a convention, a correction), save one line with remember. After a multi-step task they are likely to repeat, offer to save it as a skill.",
 	);

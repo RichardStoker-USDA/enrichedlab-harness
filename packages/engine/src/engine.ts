@@ -47,6 +47,7 @@ import { editTool, globTool, grepTool, lsTool, readTool, writeTool } from "./too
 import { fetchTool, planTool, recallTool, showTool } from "./tools/harness.ts";
 import { shellTool } from "./tools/shell.ts";
 import { appCreateTool, appOpenTool } from "./tools/apps.ts";
+import { environmentTool } from "./tools/environment.ts";
 import type { Tool } from "./tools/types.ts";
 import { readNotes, rememberTool, skillCreateTool } from "./memory.ts";
 import { Terminals } from "./terminal.ts";
@@ -59,7 +60,7 @@ import { forgetKey, PROVIDER_PRESETS, storeKey, testProvider } from "./models/pr
 import { RESOURCE as CHATGPT_API, signIn as chatgptSignIn, signOut as chatgptSignOut, summaries as chatgptAccounts, useAccount as useChatgpt } from "./models/chatgpt.ts";
 import { errorText, newId, readJson, sleep, VERSION, writeJson } from "./util.ts";
 
-export const BUILT_IN_TOOLS: Tool[] = [readTool, writeTool, editTool, lsTool, globTool, grepTool, shellTool, fetchTool, showTool, recallTool, planTool, agentStartTool, agentWaitTool, rememberTool, skillCreateTool, appCreateTool, appOpenTool, pdfFieldsTool, pdfFillTool, ...BROWSER_TOOLS];
+export const BUILT_IN_TOOLS: Tool[] = [readTool, writeTool, editTool, lsTool, globTool, grepTool, shellTool, fetchTool, showTool, recallTool, planTool, agentStartTool, agentWaitTool, rememberTool, skillCreateTool, appCreateTool, appOpenTool, environmentTool, pdfFieldsTool, pdfFillTool, ...BROWSER_TOOLS];
 
 export class RpcError extends Error {
 	constructor(
@@ -438,6 +439,8 @@ export class Engine {
 			ask: (request, signal) => this.ask(request, signal),
 			grantFolder: (folder) => this.setFolderAccess(folder, "change"),
 			historyRoot: join(this.paths.home, "history"),
+			toolsDir: join(this.paths.home, "tools"),
+			packageSources: (site) => (site ? this.sites.packages(site) : undefined),
 		};
 	}
 

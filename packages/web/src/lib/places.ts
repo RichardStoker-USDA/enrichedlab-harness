@@ -36,7 +36,7 @@ export function computerName(): string {
 const LAB_COLORS = ["--place-1", "--place-2", "--place-3", "--place-4"];
 
 export function places(sites: SiteSummary[]): Place[] {
-	const local: Place = { id: "local", title: computerName(), detail: "contained", color: "--place-local", ready: true };
+	const local: Place = { id: "local", title: computerName(), detail: "local sandbox", color: "--place-local", ready: true };
 	const labs = sites.map((site, i) => ({
 		id: site.name,
 		title: site.title || site.name,

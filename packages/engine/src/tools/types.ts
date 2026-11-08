@@ -14,7 +14,8 @@ export type ToolKind =
 	| "local" // harness-only effects (canvas, plan, recall): runs
 	| "site-read" // a site tool marked read-only: runs
 	| "site-write" // any other site tool: asks
-	| "sandbox"; // runs in an isolated site sandbox: runs
+	| "sandbox" // runs in an isolated site sandbox: runs
+	| "packages"; // installs packages into the project's own environment: asks unless allowed
 
 export interface ToolContext {
 	sessionId: string;
@@ -40,6 +41,10 @@ export interface ToolContext {
 	surface?: { call(capability: string, op: string, args: Record<string, unknown>, signal: AbortSignal): Promise<SurfaceAnswer> };
 	/** Starting and collecting subagents; absent inside a subagent. */
 	agents?: AgentHost;
+	/** Where shared tools (pixi and its caches) are kept on this computer. */
+	tools?: string;
+	/** The vetted package sources of the session's lab, when it names them (its descriptor's `packages`). */
+	packages?: { conda?: string[]; pypi?: string; only?: boolean };
 }
 
 export type CanvasInput = { sessionId: string; id?: string; title: string; kind: CanvasSummary["kind"]; content: string; sealed?: boolean } & Pick<CanvasSummary, "source" | "plot" | "href">;

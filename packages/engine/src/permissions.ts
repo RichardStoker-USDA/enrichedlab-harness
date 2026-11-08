@@ -254,7 +254,7 @@ export function allowKeys(tool: Tool, args: Record<string, unknown>): { keys: st
 		const name = tool.host?.(args) ?? host(args);
 		return { keys: [`net:${name}`], scope: `requests to ${name}` };
 	}
-	return { keys: [`tool:${tool.name}`], scope: tool.name };
+	return { keys: [`tool:${tool.name}`], scope: SCOPES[tool.name] ?? tool.name };
 }
 
 /** The one key for a call, for callers that keep a single key (kept for the web window's older answers). */
@@ -267,6 +267,7 @@ const SCOPES: Record<string, string> = {
 	browser_click: "clicks in the browser",
 	browser_type: "typing in the browser",
 	app_create: "new apps",
+	environment: "package installs in this project's environment",
 	remember: "notes to memory",
 	skill_create: "new skills",
 	pdf_fill: "filling PDF forms",
@@ -414,6 +415,10 @@ export function decide(tool: Tool, args: Record<string, unknown>, workspace: Wor
 		}
 		case "site-write":
 			return ask("The lab doesn't mark this tool read-only.");
+		case "packages":
+			// Listing reads; the rest downloads packages whose install scripts run here (contained, into the project only).
+			if (args.action === "list") return { action: "run" };
+			return ask("It installs packages into this project's own environment. Their install scripts run on this computer, contained to the project.");
 	}
 }
 
