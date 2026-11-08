@@ -616,13 +616,13 @@ export class SessionRuntime {
 	 * Put the folder back as it was before a step (an event in the log): the newest history point before it. The present
 	 * is kept first, so this can be taken back too. The model is told on its next request.
 	 */
-	async rewind(before: string): Promise<{ ok: boolean; files: string[]; detail: string; whole?: boolean }> {
+	async rewind(before: string, wholeSandbox = false): Promise<{ ok: boolean; files: string[]; detail: string; whole?: boolean }> {
 		if (this.running) return { ok: false, files: [], detail: "Wait for the current turn to finish, or cancel it." };
 		// Held like a turn while it works: no prompt or second rewind starts meanwhile.
 		let release = () => {};
 		this.running = new Promise<void>((done) => (release = done));
 		try {
-			return await this.goBack(before);
+			return await this.goBack(before, wholeSandbox);
 		} finally {
 			this.running = undefined;
 			release();
@@ -630,28 +630,39 @@ export class SessionRuntime {
 		}
 	}
 
-	private async goBack(before: string): Promise<{ ok: boolean; files: string[]; detail: string; whole?: boolean }> {
+	/**
+	 * By default the project folder goes back, from its own history. `wholeSandbox` puts a lab's whole sandbox back from
+	 * its checkpoint, which the person chooses knowing it takes every folder there back, other sessions' too.
+	 */
+	private async goBack(before: string, wholeSandbox: boolean): Promise<{ ok: boolean; files: string[]; detail: string; whole?: boolean }> {
 		const at = this.events.findIndex((e) => e.id === before);
 		if (at < 0) return { ok: false, files: [], detail: "That step isn't in this session." };
 		const chosen = this.events[at]!;
 		// Going back from a go-back returns to the present it kept: a lab checkpoint or a history commit, as it says.
 		const fromRewind = chosen.t === "rewind" ? chosen : undefined;
-		const found = fromRewind ? undefined : (this.events.slice(0, at).findLast((e) => e.t === "checkpoint" && (e.history || e.lab)) as Ev<"checkpoint"> | undefined);
+		if (fromRewind?.whole && !wholeSandbox) return { ok: false, files: [], detail: "That go-back put the whole sandbox back, so going back from it does too: choose Go Back the Whole Sandbox." };
+		const found = fromRewind ? undefined : (this.events.slice(0, at).findLast((e) => e.t === "checkpoint" && (wholeSandbox ? e.lab : e.history)) as Ev<"checkpoint"> | undefined);
 		const point: { history?: string; lab?: string; skipped?: string[] } | undefined = fromRewind ? (fromRewind.whole ? { lab: fromRewind.saved } : { history: fromRewind.saved }) : found;
-		if (!point?.history && !point?.lab) return { ok: false, files: [], detail: "This session kept no history before that step." };
+		if (!point) return { ok: false, files: [], detail: "This session kept no history before that step." };
+		if (wholeSandbox && !point.lab) return { ok: false, files: [], detail: "There's no whole-sandbox checkpoint before that step." };
+		if (!wholeSandbox && !point.history) {
+			const lab = this.events.slice(0, at).some((e) => e.t === "checkpoint" && e.lab);
+			return { ok: false, files: [], detail: lab ? "The project's own history has nothing before that step; the lab kept a whole-sandbox checkpoint. Go Back the Whole Sandbox puts every folder there back, other sessions' projects included." : "This session kept no history before that step." };
+		}
 		// History belongs to the place it was kept in: a step before a move can't be brought back here.
 		if (this.events.slice(found ? this.events.indexOf(found) : at).some((e) => e.t === "place")) return { ok: false, files: [], detail: "The session moved since that step; its history is where it was then." };
 		try {
 			// The whole sandbox at a lab that checkpoints it: the present is kept as a checkpoint first.
 			const whole = this.workspace instanceof SandboxWorkspace ? this.workspace.checkpoints : undefined;
-			if (point.lab && whole) {
+			if (wholeSandbox && point.lab && whole) {
 				const saved = await whole.make(`before going back: ${before}`);
 				await whole.restore(point.lab);
 				this.append({ t: "rewind", id: newId("e"), at: now(), before, to: point.lab, saved, whole: true, restored: [], removed: [] });
 				this.changed = undefined;
 				return { ok: true, whole: true, files: [], detail: `The ${this.workspace.label.replace(/^the /, "")} is back as it was before that step.` };
 			}
-			if (!point.history) return { ok: false, files: [], detail: "That step was kept as a lab checkpoint, and this sandbox can't use it now." };
+			if (wholeSandbox) return { ok: false, files: [], detail: "This sandbox can't use the lab's checkpoints now." };
+			if (!point.history) return { ok: false, files: [], detail: "This session kept no history before that step." };
 			const history = this.stepHistory();
 			if (!history) return { ok: false, files: [], detail: "Step history is off for this session." };
 			// Old points named what they left out only in the event; newer commits name it themselves.
@@ -678,16 +689,18 @@ export class SessionRuntime {
 			const first = after.find((e) => e.t !== "checkpoint");
 			// Files changed outside the folder were kept one by one. They come back first, while every link in the folder
 			// still leads where it did when they were kept (going back may change a link).
-			const outside = after.filter((e): e is Ev<"checkpoint"> => e.t === "checkpoint" && e.files.some((f) => !this.workspace.inside(f.path))).map((e) => e.files.filter((f) => !this.workspace.inside(f.path)));
-			const elsewhere = outside.length ? this.checkpoints.restore(outside).map((path) => this.workspace.display(path)) : [];
+			// Records from before they named where their path led can't be checked that way, so they stay as they are.
+			const outside = after.filter((e): e is Ev<"checkpoint"> => e.t === "checkpoint").map((e) => e.files.filter((f) => f.real !== undefined && !this.workspace.inside(f.path))).filter((files) => files.length);
+			const put = outside.length ? this.checkpoints.restore(outside) : { restored: [], kept: [] };
+			const elsewhere = put.restored.map((path) => this.workspace.display(path));
 			const result: { ok: boolean; files: string[]; detail: string; whole?: boolean } = first ? await this.rewind(first.id) : { ok: false, files: [], detail: "" };
 			if (!result.ok) {
-				if (elsewhere.length) this.append({ t: "undo", id: newId("e"), at: now(), files: elsewhere });
+				if (elsewhere.length) this.append({ t: "undo", id: newId("e"), at: now(), files: elsewhere, kept: put.kept });
 				return { ok: elsewhere.length > 0, files: elsewhere, detail: `${result.detail}${elsewhere.length ? ` Put back outside the folder: ${elsewhere.join(", ")}.` : ""}`.trim() };
 			}
 			const files = [...result.files, ...elsewhere];
 			if (!files.length && !result.whole) return { ok: false, files: [], detail: "Nothing changed since your last message." };
-			this.append({ t: "undo", id: newId("e"), at: now(), files, all: true });
+			this.append({ t: "undo", id: newId("e"), at: now(), files, all: true, ...(put.kept.length ? { kept: put.kept } : {}) });
 			return { ok: true, files, detail: result.whole ? result.detail : `Restored ${files.length} file${files.length === 1 ? "" : "s"}: ${files.join(", ")}.` };
 		}
 		if (this.workspace.kind !== "local") return { ok: false, files: [], detail: "Undo works on this computer; in a lab sandbox, ask the agent to revert with git." };
@@ -707,8 +720,9 @@ export class SessionRuntime {
 			return { ok: true, files, detail: `Restored ${files.length} file${files.length === 1 ? "" : "s"}: ${files.join(", ")}.` };
 		}
 		if (!changes.length) return { ok: false, files: [], detail: "No file changes to undo since your last message." };
-		const files = this.checkpoints.restore(changes).map((path) => this.workspace.display(path));
-		this.append({ t: "undo", id: newId("e"), at: now(), files });
+		const put = this.checkpoints.restore(changes);
+		const files = put.restored.map((path) => this.workspace.display(path));
+		this.append({ t: "undo", id: newId("e"), at: now(), files, ...(put.kept.length ? { kept: put.kept } : {}) });
 		this.changed = undefined;
 		return { ok: true, files, detail: `Restored ${files.length} file${files.length === 1 ? "" : "s"}: ${files.join(", ")}.` };
 	}
@@ -1060,6 +1074,10 @@ export class SessionRuntime {
 		const touched = this.workspace.kind === "local" ? (tool.touches?.(args).filter(Boolean).map((path) => this.workspace.resolve(path)) ?? []) : [];
 		const before = touched.length ? this.checkpoints.capture(touched) : [];
 		if (before.length) this.append({ t: "checkpoint", id: newId("e"), at: now(), callId: call.id, files: before });
+		// Decided again just before it runs: a path that now leads elsewhere (a link changed meanwhile) isn't followed.
+		if (verdict.action === "run" && decide(tool, args, this.workspace, this.deps.config(), this.allowed, this.discovering, this.permissionMode, !this.historyOff).action !== "run") {
+			return { ok: false, content: "Refused: where this call acts changed while it waited (a link may have moved). Send it again.", decision: "refused", tool, args };
+		}
 		try {
 			const result = await tool.run(args, {
 				sessionId: this.id,
@@ -1068,6 +1086,7 @@ export class SessionRuntime {
 				place: this.place,
 				project: projectRoot(this.cwd),
 				sealed: this.deps.sealed?.(this.site),
+				fence: verdict.action === "run" && verdict.fence === true,
 				tools: this.deps.toolsDir,
 				packages: this.deps.packageSources?.(this.site),
 				apps: this.deps.apps?.(this.id),

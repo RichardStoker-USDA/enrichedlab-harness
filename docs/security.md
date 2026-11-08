@@ -58,24 +58,36 @@ event), so it outlasts a restart. A command is remembered per program it runs (`
 by that path. A line is remembered exactly when its words don't show everything it runs: substitutions, process
 substitution, here-documents, subshells, groups and functions, control flow, a program named by a variable or a
 relative path, options before a subcommand (`git -C dir reset`), output written to a file, a program that runs
-what follows it (`sudo`, `ssh`, `env`, `timeout`, `xargs`), or a variable set in front that changes which program
-runs or what it loads (`PATH`, `LD_*`, `DYLD_*`, `NODE_OPTIONS`, `PYTHON*`, `GIT_*`, `CC`, names ending in `PATH`,
-`OPTS`, `FLAGS` or `LIBS`, and the like). Other variables in front (`SEED=42 python3 run.py`) pass data and share the
-program's answer. File edits share one answer; each other kind of change (a
+what follows it (`sudo`, `ssh`, `env`, `timeout`, `xargs`, `eval`, `source`), or a variable set in front that could
+change which program runs or what it loads. That is judged broadly: a toolchain's own prefix (`PHP*`, `PYTHON*`,
+`GIT_*`, `LD_*`, `DYLD_*`, `NODE*`), or any part of the name that says path, folder, library, config, startup or
+command (`PATH`, `DIR`, `LIB`, `INI`, `RC`, `CONFIG`, `OPTS`, `PRELOAD`, `CMD`). Data variables in front
+(`SEED=42 python3 run.py`) share the program's answer. A push asks every time, however it's quoted (`git 'push'`,
+`git $'push'`, a continued line), and so does any line where git or a push could hide behind expansion or indirection
+(`$`, backquotes, `eval`, `alias`, `source`, functions). File edits share one answer; each other kind of change (a
 click or typing in the browser, a new app, a memory or skill, a filled PDF, a sandbox download) has its own, and asks
 in every mode until allowed. Session answers hold where they were given: a move to a lab or back, or a "Try Again"
 session, starts them over. Folder answers apply to what a change lands on, by the folder's real path (symlinks
-followed one part at a time, so `link/..` is where the system takes it, and the disk's own letter case), so a
-read-only folder inside one that may change stays read only. An answer to allow changes is saved with the folder's
-identity on disk; if a part of its path later becomes a link, or another folder takes its place, the answer no
-longer applies there and the question comes back. A session
+followed one part at a time, so `link/..` is where the system takes it; a backslash is part of a name except on
+Windows; and the disk's own letter case), so a read-only folder inside one that may change stays read only. An
+answer to allow changes is saved with the folder's identity on disk. If a part of its path later becomes a link, or
+another folder takes its place, the answer no longer applies there and the question comes back; answers saved
+before identities (0.2.30) ask once more. Every call is decided again just before it runs, and a file write lands
+on the real path it was judged for, never following a link at the end, checked again once the file is open.
+Without step history (its store failed), a contained command that changes things asks too. A session
 keeps the mode it started with; a subagent asks as much as the session that started it. A session's own worktree
 runs file edits. In a lab's sandbox, commands and file
 edits inside the project run without asking: the sandbox is a separate machine with no network, and its work comes
-home as a branch the person merges. There the paths a command names are the fence, so a command whose paths aren't
-in its words asks: code handed to an interpreter (`sh -c`, `python3 -c`, `Rscript -e`), an awk program, arguments
-read from input (`xargs`, `parallel`), or a quoted word holding a script or a list. A program or script file the
-agent wrote still runs; it can reach the sandbox's other projects, which the project's history doesn't cover.
+home as a branch the person merges. There the paths a command names are the fence, so only a plain line runs on
+them. A plain line has no expansion of any kind (`$` or backquotes, even quoted), no here-documents or here-strings,
+no variables set in front, and no shell, `eval`, `source` or other program that runs what follows. It hands no code
+to an interpreter (`python3 -c`, `Rscript -e`), runs no awk program, reads no arguments from input (`xargs`), and has
+no quoted word holding a script or a list. Before a plain line runs, the sandbox checks where each named path leads,
+links followed (`realpath -m`), and refuses one that leads outside the project. Anything else asks, checkpointed lab
+or not. A program or script file the agent wrote still runs; it can reach the sandbox's other projects, which the
+project's history doesn't cover. A lab's own command tools (`<lab>_sandbox_run`, `<lab>_sandbox_job_start`) run
+outside any project: read-only commands run, and the rest ask, remembered per program apart from this computer's
+answers.
 Commands that change lab data outside the project ask, unless the lab checkpoints the whole sandbox disk
 (`endpoints.checkpoints`) and the session is in `auto`. An answer about a path
 outside the project covers that path. Pushes and unreviewed lab tools ask every time, in every mode.

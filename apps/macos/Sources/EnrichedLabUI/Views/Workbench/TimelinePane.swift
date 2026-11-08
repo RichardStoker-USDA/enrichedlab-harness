@@ -156,6 +156,9 @@ private struct TimelineRow: View {
 		.contextMenu {
 			Button("Go Back to Before This Step") { session.confirmRewind(before: step.id, retry: false) }.disabled(session.busy)
 			Button("Try Again From Here…") { session.confirmRewind(before: step.id, retry: true) }.disabled(session.busy || !session.place.isLocal)
+			if !session.place.isLocal {
+				Button("Go Back the Whole Sandbox…") { session.confirmRewind(before: step.id, retry: false, whole: true) }.disabled(session.busy)
+			}
 			Divider()
 			Button("Copy Input") { copyText(step.input, what: "the input", app: app) }
 			Button("Copy Output") { copyText(step.tool.content, what: "the output", app: app) }

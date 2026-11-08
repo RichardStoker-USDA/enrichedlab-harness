@@ -198,6 +198,15 @@ export function pathsInside(command: string, inside: (path: string) => boolean, 
 	});
 }
 
+/** The words of a command that name paths (as pathsInside judges them), for the lab sandbox's fence. */
+export function pathWords(command: string): string[] {
+	return (tokenize(command.trim()) ?? []).flatMap((t) => {
+		if (t.text === undefined) return [];
+		const value = t.text.startsWith("-") && t.text.includes("=") ? t.text.slice(t.text.indexOf("=") + 1) : t.text;
+		return looksLikePath(value) || value.includes("/") ? [value] : [];
+	});
+}
+
 /** Flags whose value (the next word) is a file or folder, for commands whose first word is a pattern. */
 const PATH_FLAGS: Record<string, Set<string>> = {
 	grep: new Set(["-f", "--file", "--exclude-from"]),
@@ -255,7 +264,7 @@ export const shellTool: Tool = {
 		if (!command.trim()) throw new ToolError("The command is empty.");
 		const timeout = Math.min(MAX_TIMEOUT_S, Math.max(1, num(args, "timeout") ?? DEFAULT_TIMEOUT_S));
 		const started = Date.now();
-		const result = await ctx.workspace.exec(command, { timeoutMs: timeout * 1_000, signal: ctx.signal, onOutput: ctx.output, unsandboxed: args.unsandboxed === true });
+		const result = await ctx.workspace.exec(command, { timeoutMs: timeout * 1_000, signal: ctx.signal, onOutput: ctx.output, unsandboxed: args.unsandboxed === true, ...(ctx.fence ? { fence: pathWords(command) } : {}) });
 		const seconds = ((Date.now() - started) / 1000).toFixed(1);
 		const status = result.timedOut ? `stopped after ${timeout}s` : ctx.signal.aborted ? "cancelled" : `exit ${result.exitCode ?? "?"}`;
 		const output = result.output.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "");

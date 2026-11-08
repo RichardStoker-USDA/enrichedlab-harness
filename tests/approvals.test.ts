@@ -10,6 +10,7 @@ import type { PermissionDecision, PermissionRequest } from "../packages/protocol
 import { DEFAULT_CONFIG, type LabConfig } from "../packages/engine/src/config.ts";
 import type { ModelRegistry } from "../packages/engine/src/models/registry.ts";
 import type { ModelProfile } from "../packages/engine/src/models/types.ts";
+import { identity } from "../packages/engine/src/permissions.ts";
 import { SessionLog } from "../packages/engine/src/session/log.ts";
 import { type RuntimeDeps, SessionRuntime } from "../packages/engine/src/session/runtime.ts";
 import { writeTool } from "../packages/engine/src/tools/files.ts";
@@ -127,7 +128,7 @@ describe("approvals", () => {
 		expect(session.asked[0]!.folder).toBe(root);
 		expect(granted).toEqual([root]);
 		// The engine saves the grant to config (folder.access); then the next change runs without asking.
-		config = { ...config, folders: { [realpathSync(root)]: { access: "change", at: new Date().toISOString() } } };
+		config = { ...config, folders: { [realpathSync(root)]: { access: "change", at: new Date().toISOString(), id: identity(realpathSync(root)) } } };
 		await turn(session.runtime, "write: more.txt");
 		expect(session.asked).toHaveLength(1);
 		// A session's own "ask" mode still asks there.

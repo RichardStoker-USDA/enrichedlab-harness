@@ -148,6 +148,8 @@ export type SessionEvent =
 	| (EventBase & {
 			t: "undo";
 			files: string[];
+			/** Files undo wrote over, as they were just before: kept beside the log, so undo can itself be taken back. */
+			kept?: { path: string; existed: boolean; blob?: string; real?: string }[];
 			/** True when a git snapshot restored the whole working tree, shell changes included. */
 			all?: boolean;
 	  })
@@ -592,7 +594,8 @@ export interface Requests {
 	"session.model": { params: { sessionId: string; model?: string; effort?: string }; result: SessionStatus };
 	"session.compact": { params: { sessionId: string }; result: { ok: boolean; detail: string } };
 	/** Put the folder back as it was before a step (an event id in the log); with `retry`, a new session continues from there. */
-	"session.rewind": { params: { sessionId: string; before: string; retry?: boolean }; result: { ok: boolean; detail: string; files: string[]; session?: SessionSummary } };
+	/** `whole`: put a lab's whole sandbox back from its checkpoint (every folder there, other sessions' too). */
+	"session.rewind": { params: { sessionId: string; before: string; retry?: boolean; whole?: boolean }; result: { ok: boolean; detail: string; files: string[]; session?: SessionSummary } };
 	/**
 	 * The files a step (a tool event) changed, from step history. `with` counts the calls that ran together with it
 	 * (their changes can't be told apart); `history` is false when the session kept none for that step here.

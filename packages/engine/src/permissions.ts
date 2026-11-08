@@ -19,7 +19,8 @@ import { FULL_CONTAINMENT, physical } from "./tools/workspace.ts";
 import type { Workspace } from "./tools/workspace.ts";
 
 export type Verdict =
-	| { action: "run" }
+	/** `fence`: it runs because of the paths it names, in a lab's sandbox, so the sandbox checks where they lead first. */
+	| { action: "run"; fence?: boolean }
 	| {
 			action: "ask";
 			reason: string;
@@ -82,7 +83,8 @@ export function identity(path: string): string | undefined {
 function grantFolders(saved: string, grant: { access: FolderAccess; id?: string }): string[] {
 	const now = canonical(saved);
 	if (grant.access === "read") return now === saved ? [saved] : [saved, now];
-	if (now !== saved || (grant.id && identity(saved) !== grant.id)) return [];
+	// A grant saved before identities (0.2.30) asks once more and is saved again with one.
+	if (now !== saved || !grant.id || identity(saved) !== grant.id) return [];
 	return [saved];
 }
 
@@ -128,12 +130,18 @@ const EXACT = new Set([
 ]);
 
 /**
- * Variables that change which program runs or what code it loads (PATH=./bin, LD_PRELOAD, NODE_OPTIONS, CC, GIT_*):
- * set in front of a command, it's remembered exactly. Others (SEED=42, OMP_NUM_THREADS=8) only pass data to the
- * program the answer named.
+ * Variables that change which program runs or what code it loads, set in front of a command: the command is then
+ * remembered exactly. Judged broadly: a toolchain's own prefix (PHP*, PYTHON*, GIT_*, LD_*), or any part of the name
+ * that says path, folder, library, config, startup or command (PATH, DIR, LIB, INI, RC, CONFIG, OPTS, PRELOAD, CMD).
+ * Data variables (SEED=42, OMP_NUM_THREADS=8, LOG_LEVEL=debug) share the program's answer.
  */
-const LOADS =
-	/^(ENV|BASH_ENV|IFS|HOME|SHELL|SHELLOPTS|BASHOPTS|PS4|PROMPT_COMMAND|ZDOTDIR|TMPDIR|EDITOR|VISUAL|PAGER|BROWSER|CC|CXX|CPP|LD|AR|AS|FC|MAKE|PYTHON\w*|PERL5\w*|RUBY\w*)$|^(LD|DYLD|GIT|BASH|NODE|NPM|JAVA|_JAVA|R|CONDA|PIXI|UV|PIP|CARGO|RUSTUP|GO|LUA|JULIA|DOTNET|DOCKER|KUBE|SSH|GPG|XDG|MAKE)_|(PATH|OPTS?|OPTIONS|FLAGS|LIBS?|HOME|ROOT|PRELOAD|LIBRARIES|STARTUP|PROFILE|PROFILE_USER|ENVIRON|ENVIRON_USER|CONFIG|COMMAND|CMD|RC|USERBASE|PREFIX)$/;
+const LOADER_NAMES = /^(IFS|PS4|PROMPT_COMMAND|ENV|SHELLOPTS|BASHOPTS|CC|CXX|CPP|LD|AR|AS|FC|NM|RANLIB|STRIP|MAKE|TMPDIR|SHELL|EDITOR|VISUAL|PAGER|BROWSER|HOME|TERMINFO)$/;
+const LOADER_PREFIXES = /^(PHP|PYTHON|PERL|RUBY|GEM|BUNDLE|NODE|NPM|YARN|PNPM|BUN|DENO|JAVA|_JAVA|JDK|MAVEN|GRADLE|JULIA|LUA|TCL|GUILE|ERL|ELIXIR|CONDA|MAMBA|PIXI|PIP|CARGO|RUSTUP|RUSTC|DOTNET|COMPOSER|DYLD|ZDOT)|^(LD|GIT|BASH|ZSH|KSH|R|RSTUDIO|MIX|UV|GO|SSH|GPG|XDG|KUBE|DOCKER|MAKE|CMAKE)_/;
+const LOADER_PARTS = new Set(["PATH", "DIR", "HOME", "ROOT", "LIB", "LIBS", "LIBRARY", "LIBRARIES", "INI", "RC", "CONF", "CONFIG", "CFG", "OPT", "OPTS", "OPTIONS", "FLAGS", "PRELOAD", "INSERT", "PROFILE", "ENV", "ENVIRON", "STARTUP", "HOOK", "HOOKS", "PLUGIN", "PLUGINS", "MODULE", "MODULES", "INCLUDE", "LOAD", "INIT", "SITE", "EXEC", "CMD", "COMMAND", "SHELL", "PREFIX", "USERBASE", "PROGRAM", "BIN", "TOOL", "TOOLCHAIN", "SCAN", "PAGER", "EDITOR"]);
+function loads(name: string): boolean {
+	const upper = name.toUpperCase();
+	return LOADER_NAMES.test(upper) || LOADER_PREFIXES.test(upper) || upper.split("_").some((part) => LOADER_PARTS.has(part)) || /(PATH|RC|DIR|HOME|LIBS?|OPTS?|INI)$/.test(upper);
+}
 
 /**
  * The simple commands of a shell line, as their words, quote-aware. Undefined when the line holds anything whose effect
@@ -211,7 +219,7 @@ function commandKeys(command: string): { keys: string[]; names: string[] } | und
 	const names = new Set<string>();
 	for (const all of commands) {
 		const words = [...all];
-		for (; words.length && /^[A-Za-z_]\w*=/.test(words[0]!); words.shift()) if (LOADS.test(words[0]!.slice(0, words[0]!.indexOf("=")))) return undefined;
+		for (; words.length && /^[A-Za-z_]\w*=/.test(words[0]!); words.shift()) if (loads(words[0]!.slice(0, words[0]!.indexOf("=")))) return undefined;
 		const first = words[0];
 		if (!first) continue;
 		// A program named by a variable, a pattern or a relative path depends on more than the words: exact. A full path
@@ -232,6 +240,18 @@ function commandKeys(command: string): { keys: string[]; names: string[] } | und
 	return keys.size ? { keys: [...keys], names: [...names] } : undefined;
 }
 
+/**
+ * A line that may push: git ... push with quotes, escapes, $'..' quoting and continuations taken out, or a line where
+ * git or a push could hide behind expansion or indirection ($, backquotes, eval, alias, source, functions), which
+ * is treated as a push.
+ */
+export function pushes(command: string): boolean {
+	const plain = command.replace(/\\\r?\n/g, "").replace(/\$(?=['"])/g, "").replace(/['"\\]/g, "");
+	if (/(^|[;&|\n(`]\s*|\/)git(\s+\S+)*\s+push\b/.test(plain)) return true;
+	const hidden = /[$`]|\b(eval|alias|source|function)\b|^\s*\.\s|[;&|]\s*\.\s|\(\s*\)/.test(command);
+	return hidden && /\bgit\b|\bpush\b/.test(plain);
+}
+
 /** "a", "a and b", "a, b and c". */
 function list(items: string[]): string {
 	return items.length <= 1 ? (items[0] ?? "") : `${items.slice(0, -1).join(", ")} and ${items.at(-1)}`;
@@ -239,12 +259,17 @@ function list(items: string[]): string {
 
 /** What an "allow for this session" answer remembers for this call, and what that covers in words. */
 export function allowKeys(tool: Tool, args: Record<string, unknown>): { keys: string[]; scope: string } {
+	if (tool.kind === "sandbox" && typeof args.command === "string") {
+		// Remembered per program like a shell command, apart from this computer's answers.
+		const found = commandKeys(args.command.trim());
+		if (!found) return { keys: [`sandbox=${args.command.trim()}`], scope: "this exact command in the lab's sandbox" };
+		return { keys: found.keys.map((key) => key.replace(/^shell:/, "sandbox:")), scope: `${list(found.names.map((n) => `“${n}”`))} commands in the lab's sandbox` };
+	}
 	if (tool.kind === "exec") {
 		const command = String(args.command ?? "").trim();
 		// Pushing publishes work: it asks every time, whatever was allowed before. Judged on the words with quotes and
 		// escapes taken out, so git 'push' and g\it push are pushes too.
-		const plain = command.replace(/\\\r?\n/g, "").replace(/['"\\]/g, "");
-		if (/(^|[;&|\n(`]\s*|\/)git(\s+\S+)*\s+push\b/.test(plain)) return { keys: ["shell!push"], scope: "pushing" };
+		if (pushes(command)) return { keys: ["shell!push"], scope: "pushing" };
 		const found = commandKeys(command);
 		if (!found) return { keys: [`shell=${command}`], scope: "this exact command" };
 		return { keys: found.keys, scope: `${list(found.names.map((n) => `“${n}”`))} commands` };
@@ -373,10 +398,19 @@ export function decide(tool: Tool, args: Record<string, unknown>, workspace: Wor
 			const name = tool.host?.(args) ?? host(args);
 			return ask(localHost(name) ? `It reaches ${name}, an address on this computer or your network.` : `It sends a request to ${name}.`);
 		}
+		case "sandbox": {
+			const command = typeof args.command === "string" ? args.command : undefined;
+			if (!command) return extra ? askOutside(extra) : { action: "run" };
+			// A lab tool that runs a command in the person's sandbox, outside any session's project folder (where other
+			// sessions' projects live): read-only commands run; in auto, a sandbox whose whole disk is checkpointed runs
+			// anything; the rest asks, remembered per program.
+			if (isReadOnlyCommand(command, config.permissions.allowCommands, () => true)) return { action: "run" };
+			if (mode === "auto" && workspace.kind === "sandbox" && workspace.checkpointed === "filesystem") return { action: "run" };
+			return ask("It runs a command in the lab's sandbox, outside this session's project folder, where other sessions' work can be.");
+		}
 		case "read":
 		case "local":
 		case "site-read":
-		case "sandbox":
 			return extra ? askOutside(extra) : { action: "run" };
 		case "write": {
 			if (extra) return askOutside(extra);
@@ -403,9 +437,10 @@ export function decide(tool: Tool, args: Record<string, unknown>, workspace: Wor
 			// In a lab's sandbox the paths a command names are the only fence, so a command whose paths can't be read
 			// from its words (a script handed to an interpreter, arguments read from input) asks unless the whole
 			// sandbox can be taken back.
-			const lab = workspace.kind === "sandbox" && workspace.checkpointed !== "filesystem";
-			const contained = workspace.sandboxed && FULL_CONTAINMENT.has(workspace.sandboxed) && args.unsandboxed !== true && !(lab && scripted(command));
-			if (contained && !(local && readOnlyWithin(config, workspace.root)) && pathsInside(command, (path) => workspace.inside(path), workspace.kind === "sandbox" || process.platform !== "win32", lab)) return { action: "run" };
+			const lab = workspace.kind === "sandbox";
+			const contained = workspace.sandboxed && FULL_CONTAINMENT.has(workspace.sandboxed) && args.unsandboxed !== true && !(lab && !plainLine(command));
+			// Without history (its store failed) a contained change can't be taken back either: it asks.
+			if (contained && recoverable && !(local && readOnlyWithin(config, workspace.root)) && pathsInside(command, (path) => workspace.inside(path), workspace.kind === "sandbox" || process.platform !== "win32", lab)) return lab ? { action: "run", fence: true } : { action: "run" };
 			if (isReadOnlyCommand(command, config.permissions.allowCommands, (path) => workspace.inside(path))) return { action: "run" };
 			// In a lab's sandbox whose whole disk is checkpointed, any command can be taken back.
 			if (mode === "auto" && workspace.kind === "sandbox" && workspace.checkpointed === "filesystem" && args.unsandboxed !== true) return { action: "run" };
@@ -442,6 +477,26 @@ export function scripted(command: string): boolean {
 	const interpreters = "sh|bash|zsh|dash|ksh|mksh|fish|python[\\d.]*|node|deno|bun|perl|ruby|php|lua|Rscript|R|julia|pwsh|powershell|tclsh|osascript";
 	const code = new RegExp(String.raw`${start}(${interpreters})\s+(\S+\s+)*(-[a-zA-Z]*[ceE]|--command|--eval|--expr|-r)(\s|=|$)`);
 	return code.test(command) || new RegExp(String.raw`${start}(awk|gawk|mawk|nawk|xargs|parallel)(\s|$)`).test(command);
+}
+
+/** Shells: handed a script, a startup file or -c, they run what their words don't show. */
+const SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh", "mksh", "fish", "csh", "tcsh", "busybox", "rbash"]);
+
+/**
+ * A line whose words are all there is to it, for a lab's sandbox, where the paths a command names are the fence: no
+ * expansion of any kind ($, backquotes, even quoted), no here-documents or here-strings, no variables set in front,
+ * no shell, eval, source or other program that runs what follows, and no code handed to an interpreter.
+ */
+export function plainLine(command: string): boolean {
+	if (/[$`]|<</.test(command) || scripted(command)) return false;
+	for (const segment of command.split(/&&|\|\||[;|&\n]/)) {
+		const words = segment.trim().split(/\s+/).filter(Boolean).map((w) => w.replace(/['"\\]/g, ""));
+		if (!words.length) continue;
+		if (/^[A-Za-z_]\w*=/.test(words[0]!)) return false;
+		const name = words[0]!.replace(/^.*\//, "");
+		if (EXACT.has(name) || SHELLS.has(name)) return false;
+	}
+	return true;
 }
 
 function ownWorktree(workspace: Workspace): boolean {

@@ -2,8 +2,8 @@
 // without changing its tools. The local workspace acts in the project folder with the person's own rights.
 
 import { spawn } from "node:child_process";
-import { existsSync, lstatSync, readlinkSync, realpathSync } from "node:fs";
-import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
+import { closeSync, constants, existsSync, fstatSync, ftruncateSync, lstatSync, openSync, readlinkSync, realpathSync, rmSync, writeSync } from "node:fs";
+import { mkdir, readdir, readFile, stat } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { withoutSecrets } from "../util.ts";
@@ -32,7 +32,8 @@ export interface Workspace {
 	write(path: string, data: string | Buffer): Promise<void>;
 	stat(path: string): Promise<{ type: Entry["type"]; size: number } | undefined>;
 	list(path: string): Promise<Entry[]>;
-	exec(command: string, options: { timeoutMs: number; signal: AbortSignal; onOutput?: (text: string) => void; unsandboxed?: boolean; env?: Record<string, string> }): Promise<ExecResult>;
+	/** `fence`: paths the command names, which must lead inside the project, links followed, or it doesn't run (lab sandboxes). */
+	exec(command: string, options: { timeoutMs: number; signal: AbortSignal; onOutput?: (text: string) => void; unsandboxed?: boolean; env?: Record<string, string>; fence?: string[] }): Promise<ExecResult>;
 	/** Set when commands run contained: by the OS ("seatbelt", "bwrap") or in a site's sandbox ("site"). */
 	readonly sandboxed?: string;
 	/** What the session's history can bring back here: "filesystem" (a lab's whole-disk checkpoints) or "folder". */
@@ -258,10 +259,28 @@ export class LocalWorkspace implements Workspace {
 		return readFile(this.open(path));
 	}
 
+	/**
+	 * Written where the path leads, links followed once here, never following a link at the end, and checked again
+	 * after opening: a link changed meanwhile can't send the bytes somewhere else.
+	 */
 	async write(path: string, data: string | Buffer): Promise<void> {
 		const full = this.open(path);
 		await mkdir(dirname(full), { recursive: true });
-		await writeFile(full, data);
+		const real = physical(full);
+		const existed = lstatSync(real, { throwIfNoEntry: false }) !== undefined;
+		const fd = openSync(real, constants.O_WRONLY | constants.O_CREAT | constants.O_NOFOLLOW, 0o666);
+		try {
+			const opened = fstatSync(fd);
+			const there = lstatSync(real, { throwIfNoEntry: false });
+			if (physical(full) !== real || !there || there.ino !== opened.ino || there.dev !== opened.dev) {
+				if (!existed && opened.size === 0) rmSync(real, { force: true });
+				throw new Error(`${this.display(full)} changed while it was being written (a link may have moved); nothing was written.`);
+			}
+			ftruncateSync(fd, 0);
+			writeSync(fd, typeof data === "string" ? Buffer.from(data) : data, 0, undefined, 0);
+		} finally {
+			closeSync(fd);
+		}
 	}
 
 	async stat(path: string) {
@@ -371,7 +390,8 @@ export class LocalWorkspace implements Workspace {
  * means the link target's parent, not the link's folder. Parts that don't exist yet are joined as written.
  */
 export function physical(path: string, depth = 0): string {
-	const parts = path.split(/[/\\]+/).filter((p) => p && p !== ".");
+	// A backslash separates folders on Windows only; elsewhere it's part of a name.
+	const parts = path.split(process.platform === "win32" ? /[/\\]+/ : /\/+/).filter((p) => p && p !== ".");
 	let at = isAbsolute(path) ? (path.match(/^[A-Za-z]:/)?.[0] ?? "") + sep : process.cwd();
 	for (let i = 0; i < parts.length; i++) {
 		const part = parts[i]!;

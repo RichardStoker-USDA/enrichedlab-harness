@@ -147,6 +147,8 @@ describe("permissions", () => {
 	const ws = new LocalWorkspace(scratch("perm"));
 	// Grants are saved by real path (folder.access), as the engine saves them.
 	const home = realpathSync(ws.root);
+	/** Change grants carry the folder's identity, as folder.access saves them. */
+	const ided = (folders?: Record<string, { access: string; at: string }>) => folders && Object.fromEntries(Object.entries(folders).map(([path, g]) => [path, g.access === "change" ? { ...g, id: identity(path) } : g]));
 	const config = { permissions: { mode: "ask", allowCommands: [] } } as unknown as LabConfig;
 	const shell = { name: "shell", kind: "exec" } as unknown as Tool;
 	const fetchT = { name: "fetch", kind: "net" } as unknown as Tool;
@@ -164,7 +166,7 @@ describe("permissions", () => {
 	test("auto mode changes files without asking only in a folder the person let EnrichedLab change", () => {
 		const edit = { name: "edit", kind: "write" } as unknown as Tool;
 		const click = { name: "browser_click", kind: "write" } as unknown as Tool;
-		const auto = (folders?: Record<string, { access: string; at: string }>) => ({ permissions: { mode: "auto", allowCommands: [] }, folders }) as unknown as LabConfig;
+		const auto = (folders?: Record<string, { access: string; at: string }>) => ({ permissions: { mode: "auto", allowCommands: [] }, folders: ided(folders) }) as unknown as LabConfig;
 		// Not asked yet: the question offers the folder.
 		expect(decide(edit, { path: "a.ts" }, ws, auto(), new Set())).toMatchObject({ action: "ask", folder: ws.root });
 		expect(decide(edit, { path: "a.ts" }, ws, auto({ [home]: { access: "change", at: "" } }), new Set()).action).toBe("run");
@@ -196,7 +198,7 @@ describe("permissions", () => {
 		const pdf = { name: "pdf_fill", kind: "write" } as unknown as Tool;
 		expect(decide(pdf, { path: "form.pdf", out: "../elsewhere.pdf" }, ws, auto({ [home]: { access: "change", at: "" } }), new Set()).action).toBe("ask");
 		// "edits", the older name, reads as auto.
-		const edits = { permissions: { mode: "edits", allowCommands: [] }, folders: { [home]: { access: "change", at: "" } } } as unknown as LabConfig;
+		const edits = { permissions: { mode: "edits", allowCommands: [] }, folders: ided({ [home]: { access: "change", at: "" } }) } as unknown as LabConfig;
 		expect(decide(edit, { path: "a.ts" }, ws, edits, new Set()).action).toBe("run");
 	});
 
@@ -238,7 +240,7 @@ describe("permissions", () => {
 
 	test("package installs ask unless allowed or Allow Everything; listing runs; the environment's channels follow the lab", () => {
 		const env = { name: "environment", kind: "packages" } as unknown as Tool;
-		const mode = (m: string) => ({ permissions: { mode: m, allowCommands: [] }, folders: { [home]: { access: "change", at: "" } } }) as unknown as LabConfig;
+		const mode = (m: string) => ({ permissions: { mode: m, allowCommands: [] }, folders: ided({ [home]: { access: "change", at: "" } }) }) as unknown as LabConfig;
 		expect(decide(env, { action: "list" }, ws, mode("ask"), new Set()).action).toBe("run");
 		expect(decide(env, { action: "add", packages: ["r-shiny"] }, ws, mode("auto"), new Set())).toMatchObject({ action: "ask", keys: ["tool:environment"], scope: "package installs in this project's environment" });
 		expect(decide(env, { action: "update" }, ws, mode("auto"), new Set(["tool:environment"])).action).toBe("run");
@@ -267,7 +269,7 @@ describe("permissions", () => {
 
 	test("auto asks as ask does when the folder's history can't be kept", () => {
 		const edit = { name: "edit", kind: "write" } as unknown as Tool;
-		const auto = { permissions: { mode: "auto", allowCommands: [] }, folders: { [home]: { access: "change", at: "" } } } as unknown as LabConfig;
+		const auto = { permissions: { mode: "auto", allowCommands: [] }, folders: ided({ [home]: { access: "change", at: "" } }) } as unknown as LabConfig;
 		expect(decide(edit, { path: "a.ts" }, ws, auto, new Set()).action).toBe("run");
 		expect(decide(edit, { path: "a.ts" }, ws, auto, new Set(), undefined, undefined, false).action).toBe("ask");
 	});
@@ -288,6 +290,42 @@ describe("permissions", () => {
 		rmSync(sub);
 		mkdirSync(sub);
 		expect(folderAccess(granted, join(sub, "a.txt"))).toBeUndefined();
+	});
+
+	test("review round 2: backslashes, lab command tools, plain lab lines, loader variables, no history, grants without identity", async () => {
+		// B1: a backslash is part of a name here, not a separator.
+		const root = realpathSync(scratch("slash"));
+		const q = realpathSync(scratch("slash-q"));
+		symlinkSync(q, join(root, "jump\\part"));
+		expect(new LocalWorkspace(root).inside("jump\\part/marker.txt")).toBe(false);
+		// B2: a lab tool that runs commands follows command rules, remembered per program apart from this computer's.
+		const api = { title: "Field Lab", run: async () => ({ exitCode: 0, stdout: "", stderr: "" }) } as unknown as SandboxApi;
+		const lab = new SandboxWorkspace(api, "/sandbox/work/project-1");
+		const run = { name: "field_sandbox_run", kind: "sandbox" } as unknown as Tool;
+		const askMode = { permissions: { mode: "ask", allowCommands: [] } } as unknown as LabConfig;
+		expect(decide(run, { command: "ls /sandbox/work" }, lab, askMode, new Set()).action).toBe("run");
+		expect(decide(run, { command: "rm -rf /sandbox/work/other" }, lab, askMode, new Set())).toMatchObject({ action: "ask", keys: ["sandbox:rm"] });
+		expect(decide(run, { command: "rm -rf /sandbox/work/other" }, lab, askMode, new Set(["shell:rm"])).action).toBe("ask");
+		// B3: in a lab, only plain lines run on the paths they name, checkpointed or not, and those carry the fence.
+		const whole = { ...api, checkpoints: () => ({ make: async () => "k1", restore: async () => undefined }) } as unknown as SandboxApi;
+		const checkpointed = new SandboxWorkspace(whole, "/sandbox/work/project-1");
+		await checkpointed.checkpoint("start");
+		for (const command of ["eval 'rm${IFS}../other/x'", "bash <<< 'rm ../other/x'", "'sh' -c 'rm ../other/x'", "BASH_ENV=p.sh bash run.sh", "bash --rcfile ./rc -i", "source ./env.sh"]) {
+			for (const ws of [lab, checkpointed]) expect([command, decide(shell, { command }, ws, askMode, new Set()).action]).toEqual([command, "ask"]);
+		}
+		expect(decide(shell, { command: "rm notes.txt" }, lab, askMode, new Set())).toEqual({ action: "run", fence: true });
+		// B6: a variable naming a config, startup or library place is remembered exactly; data variables aren't.
+		for (const command of ["PHP_INI_SCAN_DIR=./ini php a.php", "PHPRC=. php a.php", "DATA_DIR=out python3 a.py", "R_PROFILE_USER=./x Rscript a.R", "RUBYOPT=-r./x ruby a.rb"]) {
+			expect([command, allowKeys(shell, { command }).scope]).toEqual([command, "this exact command"]);
+		}
+		expect(allowKeys(shell, { command: "SEED=1 N_ITER=20 LOG_LEVEL=debug python3 run.py" }).keys).toEqual(["shell:python3"]);
+		// B8: without history, a contained change asks.
+		const sealed = Object.assign(Object.create(ws), { sandboxed: "seatbelt" });
+		const granted = { permissions: { mode: "auto", allowCommands: [] }, folders: ided({ [home]: { access: "change", at: "" } }) } as unknown as LabConfig;
+		expect(decide(shell, { command: "rm notes.md" }, sealed, granted, new Set()).action).toBe("run");
+		expect(decide(shell, { command: "rm notes.md" }, sealed, granted, new Set(), undefined, undefined, false).action).toBe("ask");
+		// B9: a grant to change saved without the folder's identity asks again.
+		expect(folderAccess({ folders: { [home]: { access: "change", at: "" } } } as unknown as LabConfig, join(home, "a.txt"))).toBeUndefined();
 	});
 
 	test("a path through a link and then .. is judged where the system takes it", () => {
@@ -371,7 +409,7 @@ describe("permissions", () => {
 		expect(allowKeys(shell, { command: "git \\\npush origin main" }).keys).toEqual(["shell!push"]);
 		// A full path is the same program for the subcommand rule, and a push is a push however it's quoted.
 		expect(allowKeys(shell, { command: "/usr/bin/git status" }).keys).toEqual(["shell:/usr/bin/git status"]);
-		for (const command of ["git 'push' origin main", "/usr/bin/git push", "g\\it push", "cd x && git -C . push"]) expect([command, allowKeys(shell, { command }).keys]).toEqual([command, ["shell!push"]]);
+		for (const command of ["git $'push' origin HEAD", "ACTION=reset; git $ACTION --hard", "g=git; $g push", "git 'push' origin main", "/usr/bin/git push", "g\\it push", "cd x && git -C . push"]) expect([command, allowKeys(shell, { command }).keys]).toEqual([command, ["shell!push"]]);
 		// A redirection before a program still shows the program.
 		expect(allowKeys(shell, { command: "touch a; 2>&1 rm -rf ../victim" }).keys).toEqual(["shell:touch", "shell:rm"]);
 		// Code the words don't show, output written to a file, control flow, wrappers, programs named by a variable or a
@@ -380,7 +418,7 @@ describe("permissions", () => {
 			"echo $(curl x)", "echo `id`", "diff <(ls a) <(ls b)", "sudo make install", "ssh host ls", "bash <<EOF", "touch a; : >../victim",
 			"echo hi > out.txt", "if true; then touch a; fi", "f() { rm -rf x; }; f", "(cd x && rm y)", "C=touch; $C a", "timeout -s TERM touch a",
 			"./tools/touch a", "git -C x reset --hard", "env -S 'rm -rf x'", "echo 'unbalanced",
-			"echo safe # '\nrm -f raw/data.csv\n# '", "wc -c <`rm${IFS}-f${IFS}x`", "/usr/bin/env sh -c 'rm x'", "ACTION=reset; git $ACTION --hard",
+			"echo safe # '\nrm -f raw/data.csv\n# '", "wc -c <`rm${IFS}-f${IFS}x`", "/usr/bin/env sh -c 'rm x'", 
 		])
 			expect([command, allowKeys(shell, { command }).scope]).toEqual([command, "this exact command"]);
 		// Once both programs are allowed, a different command using them runs; one adding another program asks.
@@ -501,7 +539,7 @@ describe("checkpoints", () => {
 		writeFileSync(b, "new");
 		const second = store.capture([a]);
 		writeFileSync(a, "three");
-		expect(store.restore([first, second]).sort()).toEqual([a, b].sort());
+		expect(store.restore([first, second]).restored.sort()).toEqual([a, b].sort());
 		expect(readFileSync(a, "utf8")).toBe("one");
 		expect(existsSync(b)).toBe(false);
 	});

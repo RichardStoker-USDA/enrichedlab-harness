@@ -197,6 +197,9 @@ struct StepRow: View {
 				.disabled(session.busy)
 			Button("Try Again From Here…") { session.confirmRewind(before: tool.id, retry: true) }
 				.disabled(session.busy || !session.place.isLocal)
+			if !session.place.isLocal {
+				Button("Go Back the Whole Sandbox…") { session.confirmRewind(before: tool.id, retry: false, whole: true) }.disabled(session.busy)
+			}
 		}
 	}
 

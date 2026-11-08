@@ -252,9 +252,10 @@ extension EngineConnection {
 	}
 
 	/// Put the session's folder back as it was before a step; with `retry`, a new session continues from there.
-	public func rewind(_ id: String, before: String, retry: Bool) async throws -> RewindResult {
-		struct P: Encodable, Sendable { var sessionId: String; var before: String; var retry: Bool }
-		return try await call("session.rewind", P(sessionId: id, before: before, retry: retry))
+	/// `whole`: a lab's whole sandbox goes back from its checkpoint, every folder there included.
+	public func rewind(_ id: String, before: String, retry: Bool, whole: Bool = false) async throws -> RewindResult {
+		struct P: Encodable, Sendable { var sessionId: String; var before: String; var retry: Bool; var whole: Bool }
+		return try await call("session.rewind", P(sessionId: id, before: before, retry: retry, whole: whole))
 	}
 
 	/// Set how much a session asks; nil returns it to the default for new sessions.

@@ -804,7 +804,7 @@ export class Engine {
 				case "session.rewind": {
 					const runtime = this.session(need("sessionId"));
 					const before = need("before");
-					const result = await runtime.rewind(before);
+					const result = await runtime.rewind(before, p.whole === true);
 					if (!result.ok || p.retry !== true) return result;
 					return { ...result, session: this.retryFrom(runtime, before).summary() };
 				}

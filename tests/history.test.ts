@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Checkpoints } from "../packages/engine/src/session/checkpoint.ts";
 import { localHistory, MAX_FILE } from "../packages/engine/src/session/history.ts";
+import { LocalWorkspace } from "../packages/engine/src/tools/workspace.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "el-history-"));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
@@ -186,5 +187,24 @@ describe("step history", () => {
 		copies.restore([kept]);
 		expect(existsSync(join(outside, "new.txt"))).toBe(false);
 		expect(lstatSync(join(root, "link")).isSymbolicLink()).toBe(true);
+	});
+
+	test("undo keeps what it writes over, and writes land where the path leads", async () => {
+		const root = join(dir, "kept-bytes");
+		mkdirSync(root);
+		const file = join(root, "notes.txt");
+		writeFileSync(file, "before\n");
+		const copies = new Checkpoints(join(dir, "copies-3"));
+		const kept = copies.capture([file]);
+		writeFileSync(file, "the person's later work\n");
+		const back = copies.restore([kept]);
+		expect(readFileSync(file, "utf8")).toBe("before\n");
+		expect(back.kept).toHaveLength(1);
+		copies.restore([back.kept]);
+		expect(readFileSync(file, "utf8")).toBe("the person's later work\n");
+		// A workspace write replaces the bytes in place.
+		const ws = new LocalWorkspace(root);
+		await ws.write("notes.txt", "short\n");
+		expect(readFileSync(file, "utf8")).toBe("short\n");
 	});
 });

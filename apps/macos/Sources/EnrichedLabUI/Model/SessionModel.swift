@@ -201,23 +201,30 @@ public final class SessionModel {
 	}
 
 	/// Ask, then put the folder back as it was before a step; with `retry`, open a new session that continues from there.
-	public func confirmRewind(before: String, retry: Bool) {
-		app.confirmation = Confirmation(
-			title: retry ? "Try again from before this step?" : "Go back to before this step?",
-			facts: [
+	/// `whole`: put a lab's whole sandbox back from its checkpoint, every folder there included.
+	public func confirmRewind(before: String, retry: Bool, whole: Bool = false) {
+		let facts: [(label: String, text: String)] = whole
+			? [
+				(label: "Everything in the sandbox", text: "Every folder in the \(place.title) sandbox goes back to before this step, other sessions' projects included."),
+				(label: "Nothing is lost", text: "The sandbox as it is now is kept as a checkpoint first, so you can come back to it."),
+			]
+			: [
 				(label: "Files", text: "The folder goes back to how it was before this step. Files changed since come back as they were; files made since go."),
 				(label: "Nothing is lost", text: "The present is kept in history first, so you can come back to it."),
-			] + (retry ? [(label: "Conversation", text: "A new session continues from just before this step. This one stays as it is.")] : [(label: "Conversation", text: "The agent is told, and continues from the files as they are.")]),
-			action: retry ? "Try Again" : "Go Back",
-			destructive: false
+			] + (retry ? [(label: "Conversation", text: "A new session continues from just before this step. This one stays as it is.")] : [(label: "Conversation", text: "The agent is told, and continues from the files as they are.")])
+		app.confirmation = Confirmation(
+			title: whole ? "Go back the whole sandbox to before this step?" : retry ? "Try again from before this step?" : "Go back to before this step?",
+			facts: facts,
+			action: whole ? "Go Back the Whole Sandbox" : retry ? "Try Again" : "Go Back",
+			destructive: whole
 		) { [weak self] in
-			await self?.rewind(before: before, retry: retry)
+			await self?.rewind(before: before, retry: retry, whole: whole)
 		}
 	}
 
-	func rewind(before: String, retry: Bool) async {
+	func rewind(before: String, retry: Bool, whole: Bool = false) async {
 		do {
-			let result = try await app.connection.rewind(id, before: before, retry: retry)
+			let result = try await app.connection.rewind(id, before: before, retry: retry, whole: whole)
 			app.say(result.detail)
 			if let fork = result.session {
 				app.upsert(fork)

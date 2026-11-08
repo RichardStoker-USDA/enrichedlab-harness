@@ -181,8 +181,13 @@ export class SandboxWorkspace implements Workspace {
 		if (done.exitCode !== 0) throw new Error(done.stderr.trim() || `Can't write ${this.display(full)}.`);
 	}
 
-	async exec(command: string, options: { timeoutMs: number; signal: AbortSignal; onOutput?: (text: string) => void }): Promise<ExecResult> {
-		const r = await this.run(command, Math.max(1, Math.round(options.timeoutMs / 1000)), options.signal);
+	async exec(command: string, options: { timeoutMs: number; signal: AbortSignal; onOutput?: (text: string) => void; fence?: string[] }): Promise<ExecResult> {
+		// The fence: each named path must lead inside the project once links are followed, or nothing runs.
+		const fence = options.fence?.length
+			? `__el_root=$(pwd -P); for __el_p in ${options.fence.map(shq).join(" ")}; do __el_r=$(realpath -m -- "$__el_p" 2>/dev/null || readlink -f -- "$__el_p" 2>/dev/null); case "$__el_r" in "$__el_root"|"$__el_root"/*) ;; *) echo "EnrichedLab: $__el_p leads outside the project; a command that reaches there needs the person's yes." >&2; exit 126;; esac; done; `
+			: "";
+		// One group after the cd, so nothing in it runs if the cd fails.
+		const r = await this.run(fence ? `{ ${fence}${command}\n}` : command, Math.max(1, Math.round(options.timeoutMs / 1000)), options.signal);
 		const output = [r.stdout, r.stderr].filter(Boolean).join(r.stdout && r.stderr ? "\n" : "");
 		options.onOutput?.(output);
 		return { exitCode: r.exitCode, output, timedOut: r.timedOut };

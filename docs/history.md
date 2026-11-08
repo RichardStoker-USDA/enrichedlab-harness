@@ -37,7 +37,8 @@ the session's line goes on from there, and a `rewind` event records what changed
 is as the present has it, and never through a link, so a link the target brings back can't carry a removal outside
 the folder. The model is told on its next request.
 
-Undo puts back files outside the folder from their per-file copies first, while links in the folder still lead where
+Undo keeps each file it writes over as it is just before (`undo.kept`, beside the session log), so undo can be
+taken back too. It puts back files outside the folder from their per-file copies first, while links in the folder still lead where
 they did, and only where the path still leads to the file that was kept; through a link, it acts on the file the link
 led to. After a move, undo touches nothing where the session was. If a snapshot's list of what it left out can't be
 read, going back stops rather than guess; folders emptied by going back give way to the file that comes back.
@@ -57,6 +58,8 @@ can't be brought back where it works now.
 A lab sandbox keeps history with git inside the sandbox, through exec, for `/sandbox/work`. A lab that serves
 whole-disk checkpoints (`endpoints.checkpoints`, [labs.md](labs.md)) covers the rest of the sandbox too, and there
 `auto` runs any command, since all of it can be taken back, once a checkpoint has been made and while the last one
-worked. If the lab can't make one (quota, an outage), the session says so and commands outside the project ask again
+worked. Going back at a lab uses the project's own history by default. Putting the whole sandbox back from its
+checkpoint is a separate choice ("Go Back the Whole Sandbox…", `session.rewind` with `whole`), because every
+folder in the sandbox goes back with it, other sessions' projects included. If the lab can't make one (quota, an outage), the session says so and commands outside the project ask again
 until a checkpoint works. Checkpoints go on when git history fails. Going back from a go-back
 there returns to the checkpoint it made of the present (`rewind.whole`).
