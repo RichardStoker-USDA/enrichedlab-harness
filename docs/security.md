@@ -46,7 +46,10 @@ Safety comes from containment, not from reading commands: nothing runs outside t
 without a yes, except what the person listed in `allowCommands`. The engine's own git work on a project's repository
 (worktrees, snapshots, sending a project to a lab) runs contained too, because the repository's settings and
 attributes are project content and can name programs (filter and diff drivers): it may write that repository and
-the temp folders, with hooks and fsmonitor off and no network. Reading a command's words decides only what may
+the temp folders, with hooks and fsmonitor off and no network. What it may write widens past the folder only in
+layouts git makes itself (the folder's own `.git`, a repository above it whose `.git` sits in its top folder, or an
+EnrichedLab worktree inside `.git`), so a `.git` file or `core.worktree` pointing elsewhere grants nothing. Where
+this computer has no facility, the engine's git turns every configured filter driver off instead. Reading a command's words decides only what may
 run unasked inside containment and what an answer covers. Inside containment a command can still read most of the
 disk (credential folders aren't readable) and has no network, so it can't push, whatever its words say.
 

@@ -4,9 +4,9 @@
 
 import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, resolve, sep } from "node:path";
 import { contained, trustedGit } from "./tools/workspace.ts";
 import { SECRET_NAME } from "./util.ts";
 
@@ -25,16 +25,42 @@ function git(cwd: string, args: string[], env?: Record<string, string>): string 
 	const options = { cwd, env: { ...process.env, ...env, GIT_TERMINAL_PROMPT: "0" }, encoding: "utf8" as const, stdio: ["ignore", "pipe", "pipe"] as ["ignore", "pipe", "pipe"] };
 	let writable = writableFor.get(cwd);
 	if (!writable) {
-		// Asked once per folder, contained to writing nothing: where the repository's folders are.
-		const probe = contained(full[0]!, ["rev-parse", "--show-toplevel", "--absolute-git-dir", "--git-common-dir"], { writable: [], network: "none" });
-		let found: string[] = [cwd];
+		// Asked once per folder, contained to writing nothing: where the repository's folders are. Those answers come
+		// from project content (a .git file, core.worktree), so they widen what git may write only in the layouts git
+		// makes itself: the folder's own .git, a repository above it whose .git sits directly in its top folder, or an
+		// EnrichedLab worktree inside the repository's .git.
+		const probe = contained(full[0]!, ["rev-parse", "--show-toplevel", "--git-common-dir"], { writable: [], network: "none" });
+		const real = (p: string) => {
+			try {
+				return realpathSync(p);
+			} catch {
+				return resolve(p);
+			}
+		};
+		const within = (p: string, dir: string) => p === dir || p.startsWith(dir.endsWith(sep) ? dir : `${dir}${sep}`);
+		const here = real(cwd);
+		writable = [cwd];
 		try {
-			found = [cwd, ...execFileSync(probe.file, probe.args, options).trim().split("\n").map((p) => resolve(cwd, p))];
+			const [top = "", common = ""] = execFileSync(probe.file, probe.args, options).trim().split("\n").map((p) => real(resolve(cwd, p)));
+			if (common === join(top, ".git") && within(here, top)) writable = [cwd, top, common];
+			else if (within(common, here) || within(here, common)) writable = [cwd, common];
 		} catch {
 			// Not a repository yet (git init comes next): the folder itself.
 		}
-		writable = [...new Set(found)];
 		writableFor.set(cwd, writable);
+	}
+	// Where nothing contains it, the repository's filter drivers are turned off instead: none of them runs.
+	if (!contained(full[0]!, [], { writable: [], network: "none" }).facility) {
+		const names = (() => {
+			try {
+				return execFileSync(program, ["config", "--name-only", "--get-regexp", "^filter\\."], options).split("\n");
+			} catch {
+				return [];
+			}
+		})();
+		const drivers = [...new Set(names.map((n) => /^filter\.(.+)\.[^.]+$/.exec(n.trim())?.[1]).filter((d): d is string => Boolean(d)))];
+		const off = drivers.flatMap((d) => ["-c", `filter.${d}.clean=`, "-c", `filter.${d}.smudge=`, "-c", `filter.${d}.process=`, "-c", `filter.${d}.required=false`]);
+		return execFileSync(program, [...full.slice(1, 5), ...off, ...full.slice(5)], options).trim();
 	}
 	const launch = contained(full[0]!, full.slice(1), { writable, network: "none" });
 	return execFileSync(launch.file, launch.args, options).trim();
