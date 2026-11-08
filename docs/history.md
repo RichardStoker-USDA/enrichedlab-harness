@@ -14,7 +14,7 @@ command (`packages/engine/src/session/history.ts`). Each point is a `checkpoint`
   person's own repository in that folder is never touched: no commits, refs, index or stash. In a lab's sandbox, the
   same store sits at `/sandbox/.el-history`, run through the sandbox's shell, and lives as long as the sandbox's files.
 - **Sessions apart.** Each session keeps its own index and its own line of commits (`refs/sessions/<id>`); the
-  objects are shared, so a file kept once is kept once, and two sessions in one folder never wait on each other.
+  objects are shared, so a file kept once is kept once.
 - **Fast after the first.** The index remembers each file's size and time, so a snapshot hashes only what changed.
 - **Everything the person made.** Ignore files don't apply: a data folder a repository ignores is what a person
   would want back.
