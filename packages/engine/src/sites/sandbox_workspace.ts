@@ -31,6 +31,14 @@ export interface SandboxApi {
 	browser?(): SandboxBrowserLane | undefined;
 	/** A DevTools connection to that browser. */
 	cdp?(signal?: AbortSignal): Promise<Cdp>;
+	/** Whole-disk checkpoints of the sandbox, when the lab serves them (endpoints.checkpoints). */
+	checkpoints?(): SandboxCheckpoints | undefined;
+}
+
+/** Make a whole-disk checkpoint of the sandbox, or bring the sandbox back to one (docs/history.md). */
+export interface SandboxCheckpoints {
+	make(label: string, signal?: AbortSignal): Promise<string>;
+	restore(id: string, signal?: AbortSignal): Promise<void>;
 }
 
 /** Quote for the sandbox's POSIX shell. */
@@ -54,6 +62,15 @@ export class SandboxWorkspace implements Workspace {
 		readonly root: string,
 	) {
 		this.label = `the ${api.title} sandbox, in ${root} (Linux, no network)`;
+	}
+
+	/** The lab's whole-disk checkpoints, when it serves them. */
+	get checkpoints(): SandboxCheckpoints | undefined {
+		return this.api.checkpoints?.();
+	}
+
+	get checkpointed(): "filesystem" | undefined {
+		return this.checkpoints ? "filesystem" : undefined;
 	}
 
 	private async run(command: string, timeoutSeconds = 120, signal?: AbortSignal) {

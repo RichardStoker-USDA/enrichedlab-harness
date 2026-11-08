@@ -127,6 +127,8 @@ export type SessionEvent =
 			history?: string;
 			/** The tool calls this snapshot follows. */
 			calls?: string[];
+			/** At a lab that checkpoints whole sandboxes: that checkpoint's id. */
+			lab?: string;
 			/** Files the snapshot left out (too large, or past one step's limit): going back leaves them as they are. */
 			skipped?: string[];
 	  })

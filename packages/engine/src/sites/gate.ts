@@ -26,7 +26,7 @@ import { num, str, type Tool, ToolError } from "../tools/types.ts";
 import { errorText, redact, SECRET_NAME, sleep } from "../util.ts";
 import type { SiteAdapter } from "./adapter.ts";
 import { fetchRepo, sendRepo } from "./repo_handoff.ts";
-import type { SandboxApi } from "./sandbox_workspace.ts";
+import type { SandboxApi, SandboxCheckpoints } from "./sandbox_workspace.ts";
 import type { SiteConfig, SiteRoute } from "./sites.ts";
 import { type DesktopAction, type DesktopApi, type DesktopFrame, type DesktopResult, type DesktopStreamHandlers, desktopTools, frameIn } from "./desktop.ts";
 import { type CheckRow, CONTRACT, contractProblem, DESCRIPTOR_PATH, type DesktopInfo, type Endpoint, type LabAppEntry, type LabDescriptor, type LabEvent, type LabSigner, type SandboxAgents, SCHEMAS, validate } from "./contract.ts";
@@ -1045,6 +1045,24 @@ export class GateSite implements SiteAdapter, SandboxApi, DesktopApi {
 						const right = said === createHash("sha256").update(bytes).digest("hex");
 						add("file download", right ? "pass" : "fail", right ? "same bytes, and Repr-Digest matches them" : said ? "Repr-Digest doesn't match the bytes" : "no Repr-Digest header");
 					});
+					// Whole-disk checkpoints: one made, listed, brought back (a file written after it is gone), then removed.
+					if (has("checkpoints")) {
+						await attempt("sandbox checkpoints", async () => {
+							const at = `/v1/containers/${encodeURIComponent(made.id)}`;
+							const point = await this.json<{ id: string; container?: string; at?: string }>("POST", `${at}/checkpoints`, { json: { label: "el lab check" }, signal: t() });
+							if (!point.id || !point.at) return add("sandbox checkpoints", "fail", "the answer has no id or time");
+							await this.json("POST", `${at}/exec`, { json: { command: "echo after > /sandbox/work/el-after.txt", timeout_seconds: 30 }, signal: t() });
+							const listed = await this.json<{ checkpoints?: { id: string }[] }>("GET", `${at}/checkpoints`, { signal: t() });
+							if (!listed.checkpoints?.some((c) => c.id === point.id)) return add("sandbox checkpoints", "fail", "the list doesn't show the checkpoint just made");
+							await this.json("POST", `${at}/checkpoints/${encodeURIComponent(point.id)}/restore`, { json: {}, signal: t() });
+							let status = "";
+							for (const end = Date.now() + 180_000; Date.now() < end && status !== "running"; await sleep(1_000)) status = await this.containerStatus(made.id, t(), true);
+							if (status !== "running") return add("sandbox checkpoints", "fail", `not running 3 minutes after restore (${status})`);
+							const left = await this.json<{ exit_code?: number }>("POST", `${at}/exec`, { json: { command: "test ! -e /sandbox/work/el-after.txt", timeout_seconds: 30 }, signal: t() });
+							await this.call("DELETE", `${at}/checkpoints/${encodeURIComponent(point.id)}`, { signal: t() }).then((r) => r.arrayBuffer(), () => undefined);
+							add("sandbox checkpoints", left.exit_code === 0 ? "pass" : "fail", left.exit_code === 0 ? "made, listed, and restored: a file written after it is gone" : "a file written after the checkpoint is still there after restore");
+						});
+					}
 					if (has("attach")) {
 						const url = `${this.route.base}/v1/containers/${encodeURIComponent(made.id)}/attach`;
 						const process = await attachSocket(url.replace(/^http/, "ws"), await this.authHeaders("GET", url), { argv: ["sh", "-c", "read line; echo got:$line; read more; echo also:$more; echo note >&2; exit 3"], timeout_seconds: 60 }, this.route.ca);
@@ -1300,6 +1318,14 @@ export class GateSite implements SiteAdapter, SandboxApi, DesktopApi {
 				});
 			}
 		}
+		// The package sources a lab vets: each an https address; sandboxes and local environments point at them.
+		if (d?.packages) {
+			const p = d.packages;
+			const urls = [...(p.conda ?? []), p.pypi, p.cran, p.npm].filter((u): u is string => typeof u === "string");
+			const bad = urls.filter((u) => !/^https:\/\/[^/\s]+/.test(u));
+			const parts = [p.conda?.length ? `${p.conda.length} conda channel${p.conda.length === 1 ? "" : "s"}` : "", p.pypi ? "a PyPI index" : "", p.cran ? "a CRAN repository" : "", p.npm ? "an npm registry" : ""].filter(Boolean);
+			add("package sources", urls.length && !bad.length ? "pass" : "fail", bad.length ? `not https: ${bad.join(", ")}` : urls.length ? `${parts.join(", ")}${p.only ? ", and nothing public" : ""}` : "the packages block names no source");
+		}
 		// A lab that describes its API: OpenAPI 3.1 with paths and the contract's schemas.
 		if (has("openapi")) {
 			await attempt("GET /v1/openapi.json", async () => {
@@ -1521,6 +1547,23 @@ export class GateSite implements SiteAdapter, SandboxApi, DesktopApi {
 	}
 
 	/** Run a command in the sandbox: its exit code and output streams. */
+	/** Whole-disk checkpoints of the person's sandbox (checkpoint.schema.json), when the lab serves them. */
+	checkpoints(): SandboxCheckpoints | undefined {
+		if (!this.offers("checkpoints")) return undefined;
+		return {
+			make: async (label, signal) => {
+				const id = await this.sandbox(signal);
+				return (await this.json<{ id: string }>("POST", `/v1/containers/${encodeURIComponent(id)}/checkpoints`, { json: { label: label.slice(0, 200) }, signal })).id;
+			},
+			restore: async (checkpoint, signal) => {
+				const id = await this.sandbox(signal);
+				await this.json("POST", `/v1/containers/${encodeURIComponent(id)}/checkpoints/${encodeURIComponent(checkpoint)}/restore`, { json: {}, signal });
+				for (const end = Date.now() + 300_000; Date.now() < end; await sleep(1_000, signal)) if ((await this.containerStatus(id, signal, true)) === "running") return;
+				throw new ToolError(`The ${this.title} sandbox didn't come back from its checkpoint within 5 minutes.`);
+			},
+		};
+	}
+
 	async run(command: string, timeoutSeconds: number, signal?: AbortSignal): Promise<{ exitCode: number | null; stdout: string; stderr: string; timedOut: boolean }> {
 		const id = await this.sandbox(signal);
 		const result = await this.json<{ exit_code?: number; stdout?: string; stderr?: string; timed_out?: boolean }>("POST", `/v1/containers/${id}/exec`, {

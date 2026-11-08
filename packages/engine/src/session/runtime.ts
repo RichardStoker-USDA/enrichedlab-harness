@@ -35,6 +35,7 @@ import { canonical, decide } from "../permissions.ts";
 import type { CanvasPublisher, Tool, ToolContext } from "../tools/types.ts";
 import { ToolError } from "../tools/types.ts";
 import type { Workspace } from "../tools/workspace.ts";
+import { SandboxWorkspace } from "../sites/sandbox_workspace.ts";
 import { clip, errorText, estimateTokens, newId, now, redact, sleep } from "../util.ts";
 import { summarize } from "./compaction.ts";
 import { budget, cutPoint, derive, ELIDE_MIN_CHARS, elisionCandidates, gauge, INLINE_MAX_CHARS } from "./context.ts";
@@ -546,7 +547,10 @@ export class SessionRuntime {
 		try {
 			const shot = await history.snapshot(label);
 			if (!shot.changed && callId !== "turn") return;
-			this.append({ t: "checkpoint", id: newId("e"), at: now(), callId, files: [], history: shot.commit, ...(calls ? { calls } : {}), ...(shot.skipped.length ? { skipped: shot.skipped.slice(0, 200) } : {}) });
+			// A lab that checkpoints whole sandboxes keeps the rest of the disk too.
+			const whole = this.workspace instanceof SandboxWorkspace ? this.workspace.checkpoints : undefined;
+			const lab = whole ? await whole.make(label).catch(() => undefined) : undefined;
+			this.append({ t: "checkpoint", id: newId("e"), at: now(), callId, files: [], history: shot.commit, ...(lab ? { lab } : {}), ...(calls ? { calls } : {}), ...(shot.skipped.length ? { skipped: shot.skipped.slice(0, 200) } : {}) });
 		} catch (error) {
 			this.historyOff = true;
 			this.notice("warn", `Step history is off for this session, so its steps can't be taken back: ${redact(errorText(error))}`);
@@ -569,6 +573,15 @@ export class SessionRuntime {
 		const history = this.stepHistory();
 		if (!history) return { ok: false, files: [], detail: "Step history is off for this session." };
 		try {
+			// The whole sandbox at a lab that checkpoints it: the present is kept as a checkpoint first.
+			const whole = this.workspace instanceof SandboxWorkspace ? this.workspace.checkpoints : undefined;
+			if (point.lab && whole) {
+				const saved = await whole.make(`before going back: ${before}`);
+				await whole.restore(point.lab);
+				this.append({ t: "rewind", id: newId("e"), at: now(), before, to: point.lab, saved, restored: [], removed: [] });
+				this.changed = undefined;
+				return { ok: true, files: [], detail: `The ${this.workspace.label.replace(/^the /, "")} is back as it was before that step.` };
+			}
 			const back = await history.restore(point.history, `before ${before}`);
 			this.append({ t: "rewind", id: newId("e"), at: now(), before, to: point.history, saved: back.saved, restored: back.restored, removed: back.removed });
 			this.changed = undefined;

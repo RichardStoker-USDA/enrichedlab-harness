@@ -13,7 +13,8 @@ const descriptor: LabDescriptor = {
 	contract: "2026-11",
 	name: "devlab",
 	title: "Dev Lab",
-	endpoints: { models: true, bundles: true, events: true, guard: true, usage: true, containers: true, attach: true, files: true, runs: true },
+	endpoints: { models: true, bundles: true, events: true, guard: true, usage: true, containers: true, attach: true, files: true, runs: true, checkpoints: true },
+	packages: { conda: ["https://conda.example.org/vetted"], pypi: "https://pypi.example.org/simple", only: true },
 	sign_in: { kind: "cloudflare-access-oauth" },
 	policy: { keep_data_inside: false },
 	support: { url: "https://help.example.org" },
@@ -43,7 +44,7 @@ const me = {
 	sandbox_networks: ["none", "internet"],
 	data_scopes: [{ id: "soils-2026", title: "Soil cores, 2026", research_group: "soils", access: "read" }],
 };
-const seen: { desktop: string[]; cursor?: string | null; deleted?: string; uploaded: string; keepsTestFile?: boolean; filesDeleted: string[]; internet: string[]; leaks?: boolean; tries?: boolean; passesBadCerts?: boolean } = { desktop: [], uploaded: "", filesDeleted: [], internet: [] };
+const seen: { desktop: string[]; cursor?: string | null; deleted?: string; uploaded: string; keepsTestFile?: boolean; filesDeleted: string[]; internet: string[]; leaks?: boolean; tries?: boolean; passesBadCerts?: boolean; restored?: boolean } = { desktop: [], uploaded: "", filesDeleted: [], internet: [] };
 /** The EICAR test file's sha-256: the lab here knows it by its hash, so this file never holds it. */
 const EICAR_SHA256 = "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f";
 
@@ -115,6 +116,14 @@ const lab = Bun.serve<{ stdin: string; started: boolean }, never>({
 				const piped = /^printf %s '(x*)' \| wc -c$/.exec(command);
 				return Response.json({ exit_code: 0, stdout: piped ? `${piped[1]!.length}\n` : "ok\n", stderr: "" });
 			}
+			case "/v1/containers/c1/checkpoints":
+				if (request.method === "POST") return Response.json({ id: "k1", container: "c1", at: new Date().toISOString(), label: "el lab check" }, { status: 201 });
+				return Response.json({ checkpoints: [{ id: "k1", container: "c1", at: new Date().toISOString() }] });
+			case "/v1/containers/c1/checkpoints/k1/restore":
+				seen.restored = true;
+				return Response.json({ id: "c1", status: "restoring" }, { status: 202 });
+			case "/v1/containers/c1/checkpoints/k1":
+				return new Response(null, { status: 204 });
 			case "/v1/containers/c1/jobs":
 				return Response.json({ id: "j1", status: "running" }, { status: 201 });
 			case "/v1/containers/c1/jobs/j1":
@@ -159,6 +168,7 @@ const lab = Bun.serve<{ stdin: string; started: boolean }, never>({
 			seen.internet.push("deleted");
 			return Response.json({ ok: true });
 		}
+		if (request.method === "GET" && url.pathname === "/v1/containers/c1") return Response.json({ id: "c1", status: "running" });
 		if (request.method === "DELETE" && url.pathname === "/v1/containers/c1") {
 			seen.deleted = "c1";
 			return Response.json({ ok: true });
@@ -233,6 +243,9 @@ describe("lab contract", () => {
 		]);
 		expect(seen.desktop).toEqual(["screenshot", "deleted"]);
 		expect(rows.find((r) => r.row === "GET /v1/runs")?.status).toBe("pass");
+		expect(rows.find((r) => r.row === "sandbox checkpoints")).toMatchObject({ status: "pass", detail: "made, listed, and restored: a file written after it is gone" });
+		expect(seen.restored).toBe(true);
+		expect(rows.find((r) => r.row === "package sources")).toMatchObject({ status: "pass", detail: "1 conda channel, a PyPI index, and nothing public" });
 		expect(rows.find((r) => r.row === "attach streams stdin")?.status).toBe("pass");
 		expect(rows.find((r) => r.row === "scanner refuses a test file")).toMatchObject({ status: "pass", detail: "422 file_refused" });
 		// An internet sandbox reaches the public web, not the metadata or a private address, and takes no files.
