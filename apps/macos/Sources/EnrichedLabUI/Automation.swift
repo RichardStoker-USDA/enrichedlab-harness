@@ -19,6 +19,7 @@ import SwiftUI
 /// EL_SCENE_DRAG     window or divider: drag the window's edge, or the workbench's divider, in small steps as a person would
 /// EL_SCENE_SEND     a message sent in the opened session; the scene waits for its first question
 /// EL_SCENE_FOLDER   a folder to ask about, as the first session there does (the question stays open)
+/// EL_SCENE_SCROLLUP 1 to scroll the run sheet up 800 points partway through a live turn, as a reader looking back does
 @MainActor
 enum Automation {
 	static var active: Bool { ProcessInfo.processInfo.environment["EL_SCENE"] != nil }
@@ -121,6 +122,20 @@ enum Automation {
 		return steps
 	}
 
+	/// The run sheet's scroll view: the tallest one.
+	private static func transcriptScroll(_ window: NSWindow) -> NSScrollView? {
+		func scrolls(_ view: NSView) -> [NSScrollView] { ((view as? NSScrollView).map { [$0] } ?? []) + view.subviews.flatMap(scrolls) }
+		return window.contentView.flatMap { scrolls($0).max(by: { ($0.documentView?.frame.height ?? 0) < ($1.documentView?.frame.height ?? 0) }) }
+	}
+
+	/// The run sheet's distance from its bottom.
+	private static func transcriptGap(_ window: NSWindow) -> CGFloat? {
+		guard let scroll = transcriptScroll(window), let document = scroll.documentView else { return nil }
+		let visible = scroll.contentView.bounds
+		// The composer sits over the bottom as an inset: the bottom is reached when the inset's edge meets the content's.
+		return document.isFlipped ? document.frame.height - visible.maxY + scroll.contentInsets.bottom : visible.minY
+	}
+
 	private static func splitViews(in view: NSView?) -> [NSSplitView] {
 		guard let view else { return [] }
 		let own: [NSSplitView] = (view as? NSSplitView).map { [$0] } ?? []
@@ -159,7 +174,19 @@ enum Automation {
 		let sent = clock.now
 		guard await app.create(folder: URL(fileURLWithPath: folder), place: "local", model: nil, prompt: prompt) != nil else { print("scene: live: not started"); return }
 		var answered = false
+		var scrolledUp = ProcessInfo.processInfo.environment["EL_SCENE_SCROLLUP"] != "1"
 		for _ in 0 ..< 600 {
+			if !scrolledUp, (app.session?.blocks.count ?? 0) > 12, let window = mainWindow, let scroll = transcriptScroll(window) {
+				scrolledUp = true
+				// Wheel events, the path a mouse or trackpad takes, not a jump of the clip view.
+				for _ in 0 ..< 10 {
+					if let wheel = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 1, wheel1: 80, wheel2: 0, wheel3: 0), let event = NSEvent(cgEvent: wheel) {
+						scroll.scrollWheel(with: event)
+					}
+					try? await Task.sleep(for: .milliseconds(16))
+				}
+				print("scene: scrolled up 800 pt mid-turn, \(Int(transcriptGap(window) ?? -1)) pt from the bottom")
+			}
 			guard let session = app.session else { break }
 			if first == nil, !session.partial.text.isEmpty || !session.partial.tools.isEmpty || !session.blocks.isEmpty { first = clock.now - sent }
 			if until == "streaming", (session.partial.tools.first?.args.count ?? 0) > 4000 { break }
@@ -177,7 +204,9 @@ enum Automation {
 		_ = await watch.value
 		let ms = { (d: Duration?) in d.map { String(Int($0.components.seconds * 1000 + $0.components.attoseconds / 1_000_000_000_000_000)) } ?? "none" }
 		let session = app.session
-		print("scene: live \(until): first output \(ms(first)) ms, longest main-thread stall opening \(ms(opening)) ms, streaming \(ms(streaming)) ms, steps \(session?.blocks.count ?? 0), questions \(session?.pending.count ?? 0), busy \(session?.busy ?? false)")
+		// How far the run sheet is from its bottom: a session that followed its output ends at the bottom.
+		let gap = mainWindow.flatMap { transcriptGap($0) }.map { "\(Int($0)) pt" } ?? "unknown"
+		print("scene: live \(until): transcript \(gap) from the bottom; first output \(ms(first)) ms, longest main-thread stall opening \(ms(opening)) ms, streaming \(ms(streaming)) ms, steps \(session?.blocks.count ?? 0), questions \(session?.pending.count ?? 0), busy \(session?.busy ?? false)")
 	}
 }
 #endif

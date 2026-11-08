@@ -93,6 +93,16 @@ function reply(body: ChatBody): Response {
 	if (!body.tools?.length) return stream([delta({ content: "Project check" }), delta({}, "stop"), usage(40, 3)]);
 	const last = body.messages.at(-1) as { role: string; content?: unknown };
 	if (last?.role === "user" && JSON.stringify(last.content ?? "").includes("big page")) return bigWrite();
+	// A long turn, like a real analysis: a dozen commands with output and thinking between, then a long answer.
+	const asked = [...body.messages].reverse().find((m) => m.role === "user") as { content?: unknown } | undefined;
+	if (JSON.stringify(asked?.content ?? "").includes("long analysis")) {
+		const rounds = body.messages.filter((m) => m.role === "tool").length;
+		if (rounds < 12) {
+			const call = { index: 0, id: `call_${Date.now()}_${rounds}`, type: "function", function: { name: "shell", arguments: JSON.stringify({ command: `ls -la; echo "pass ${rounds + 1} of 12"` }) } };
+			return paced([delta({ reasoning_content: `Pass ${rounds + 1}: checking the folder again before the next step. `.repeat(6) }), delta({ content: `Pass ${rounds + 1}: looking at the files.\n\n${"The soil moisture readings line up with the field notes. ".repeat(8)}` }), delta({ tool_calls: [call] }), delta({}, "tool_calls"), usage(1500, 80)], 40);
+		}
+		return paced([...`## Findings\n\n${Array.from({ length: 30 }, (_, i) => `${i + 1}. Plot ${i + 1} kept its moisture within the expected band across the season, with one dry week in August.`).join("\n")}\n`.match(/[\s\S]{1,60}/g)!.map((part) => delta({ content: part })), delta({}, "stop"), usage(3000, 900)], 60);
+	}
 	if (body.messages.at(-1)?.role === "user") {
 		const call = { index: 0, id: `call_${Date.now()}`, type: "function", function: { name: "shell", arguments: JSON.stringify({ command: "uname -s; git log --oneline -1; ls" }) } };
 		return stream([delta({ reasoning_content: "The person wants commands run in the project; the shell tool does that." }), delta({ content: "I'll run that in the project." }), delta({ tool_calls: [call] }), delta({}, "tool_calls"), usage(1200, 40)]);
@@ -375,6 +385,8 @@ interface MacScene {
 	drag?: "window" | "divider";
 	/** Open the 60,000-point scatter plot view first. */
 	plot?: boolean;
+	/** Scroll the run sheet up partway through the live turn: it must stay where the reader put it. */
+	scrollUp?: boolean;
 	/** A message sent in the opened session; the scene waits for its question. */
 	send?: string;
 	/** Ask about the project folder, as a first session there does, and capture the question. */
@@ -405,6 +417,8 @@ const MAC_SCENES: MacScene[] = [
 	{ name: "mac_live_streaming", prompt: "Write the big page", until: "streaming", after: 300 },
 	{ name: "mac_live_question", prompt: "Write the big page", until: "question", after: 800 },
 	{ name: "mac_live_done", prompt: "Write the big page", until: "done", after: 800 },
+	{ name: "mac_live_long", prompt: "Run a long analysis of the field data", until: "done", after: 800 },
+	{ name: "mac_live_scrolled", prompt: "Run a long analysis of the field data", until: "done", scrollUp: true, after: 800 },
 	{ name: "mac_settings_general", settings: "general" },
 	{ name: "mac_settings_models", settings: "models", after: 2500 },
 	{ name: "mac_settings_labs", settings: "labs" },
@@ -436,6 +450,7 @@ async function macScenes(client: EngineClient, engineVersion: string, sessions: 
 					...(scene.open ? { EL_SCENE_OPEN: scene.open } : {}),
 					...(scene.drag ? { EL_SCENE_DRAG: scene.drag } : {}),
 					...(scene.send ? { EL_SCENE_SEND: scene.send } : {}),
+					...(scene.scrollUp ? { EL_SCENE_SCROLLUP: "1" } : {}),
 					...(scene.folder ? { EL_SCENE_FOLDER: project } : {}),
 					...(scene.prompt ? { EL_SCENE_PROMPT: scene.prompt, EL_SCENE_UNTIL: scene.until ?? "done" } : {}),
 					...(scene.settings ? { EL_SCENE_SETTINGS: scene.settings } : {}),

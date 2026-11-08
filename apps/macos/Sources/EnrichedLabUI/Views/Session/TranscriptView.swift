@@ -3,7 +3,8 @@ import SwiftUI
 import Textual
 
 /// The run sheet: the person's request, the agent's thinking, its steps as one activity per stretch of work, and its
-/// answer, typeset for reading. It follows new output while the reader is at the bottom and stays put otherwise.
+/// answer, typeset for reading. It follows new output while the reader is at the bottom, and stays put once the reader
+/// scrolls up; scrolling back to the bottom, or sending a message, follows again.
 struct TranscriptView: View {
 	@Environment(AppModel.self) private var app
 	var session: SessionModel
@@ -31,14 +32,27 @@ struct TranscriptView: View {
 		}
 		.scrollPosition($position)
 		.defaultScrollAnchor(.bottom, for: .initialOffset)
-		.onScrollGeometryChange(for: Bool.self) { geometry in
-			geometry.contentSize.height - geometry.contentOffset.y - geometry.containerSize.height < 96
-		} action: { _, atBottom in
-			pinned = atBottom
+		// Content growing (a tall step, streamed output, a question) never unpins: only the reader moving up does.
+		// While pinned, any growth scrolls to the new bottom, whatever grew.
+		.onScrollGeometryChange(for: Scroll.self) { geometry in
+			Scroll(offset: geometry.contentOffset.y, height: geometry.contentSize.height, gap: geometry.contentSize.height - geometry.contentOffset.y - geometry.containerSize.height)
+		} action: { old, new in
+			if new.gap < 96 {
+				pinned = true
+			} else if new.offset < old.offset - 1 {
+				// Growth moves the bottom, never the top: an offset that went up is the reader looking back.
+				pinned = false
+				return
+			}
+			if pinned, new.gap > 0.5, new.height != old.height { position.scrollTo(edge: .bottom) }
 		}
-		.onChange(of: session.blocks.count) { follow() }
-		.onChange(of: session.partial.text.count) { follow() }
-		.onChange(of: session.partial.reasoning.count) { follow() }
+		// Sending a message follows again, wherever the reader was.
+		.onChange(of: session.turnStarted) { _, started in
+			if started != nil {
+				pinned = true
+				position.scrollTo(edge: .bottom)
+			}
+		}
 		.onChange(of: session.pending.count) { follow() }
 		.overlay(alignment: .bottomTrailing) {
 			if !pinned {
@@ -61,6 +75,12 @@ struct TranscriptView: View {
 	private func follow() {
 		guard pinned else { return }
 		position.scrollTo(edge: .bottom)
+	}
+
+	private struct Scroll: Equatable {
+		var offset: CGFloat
+		var height: CGFloat
+		var gap: CGFloat
 	}
 }
 
