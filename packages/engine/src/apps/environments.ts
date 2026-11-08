@@ -21,9 +21,11 @@ const PIXI_BUILDS: Record<string, [string, string]> = {
 	"win32-x64": ["pixi-x86_64-pc-windows-msvc.exe", "89c7455923dac401c1853310894d87fa06602911b838e389a46c7bc8df00171e"],
 };
 
-/** True when pixi is here without downloading: on PATH, or the pinned build already under `tools`. */
-export function pixiPresent(tools: string): boolean {
-	return existsSync(join(tools, `pixi-${PIXI_VERSION}${process.platform === "win32" ? ".exe" : ""}`));
+/** The pinned pixi already under `tools` and matching its SHA-256, without downloading anything; else undefined. */
+export function pixiHere(tools: string): string | undefined {
+	const build = PIXI_BUILDS[`${process.platform}-${process.arch}`];
+	const file = join(tools, `pixi-${PIXI_VERSION}${process.platform === "win32" ? ".exe" : ""}`);
+	return build && existsSync(file) && pixiMatches(file, build[1]) ? file : undefined;
 }
 
 /** The pixi program: on PATH, else the pinned build under `tools`, downloaded and checked the first time. */
@@ -89,11 +91,16 @@ export async function inEnvironment(dir: string, command: string[], tools: strin
 	if (!launch.facility) throw new Error("This computer has no sandbox to contain the app's install (Seatbelt on macOS, bubblewrap on Linux), so nothing was installed.");
 	// From a scratch folder: some packages' install scripts write test files where they run, and the app's folder
 	// is watched for edits.
-	const install = Bun.spawn([launch.file, ...launch.args], { cwd: tmpdir(), stdio: ["ignore", "pipe", "pipe", ...(launch.pass ?? [])], env });
-	const lines = async (stream: ReadableStream<Uint8Array>) => {
-		for await (const chunk of stream) for (const line of new TextDecoder().decode(chunk).split(/\r|\n/)) if (line.trim()) log(line.trim());
-	};
-	await Promise.all([lines(install.stdout), lines(install.stderr), install.exited]).finally(() => launch.release?.());
+	let install: ReturnType<typeof Bun.spawn>;
+	try {
+		install = Bun.spawn([launch.file, ...launch.args], { cwd: tmpdir(), stdio: ["ignore", "pipe", "pipe", ...(launch.pass ?? [])], env });
+		const lines = async (stream: ReadableStream<Uint8Array>) => {
+			for await (const chunk of stream) for (const line of new TextDecoder().decode(chunk).split(/\r|\n/)) if (line.trim()) log(line.trim());
+		};
+		await Promise.all([lines(install.stdout as ReadableStream<Uint8Array>), lines(install.stderr as ReadableStream<Uint8Array>), install.exited]);
+	} finally {
+		launch.release?.();
+	}
 	if (install.exitCode !== 0) throw new Error(`Building the app's environment failed; the app's log has pixi's output.`);
 	return [program, "run", "--manifest-path", manifest, "--frozen", "--", ...command];
 }

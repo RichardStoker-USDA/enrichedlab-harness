@@ -4,79 +4,51 @@
 
 import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { isAbsolute, join, resolve, sep } from "node:path";
-import { contained, trustedGit } from "./tools/workspace.ts";
-import { SECRET_NAME } from "./util.ts";
-
-/** Each repository's folders git may write: the working folder, its top, and its git folders (main and worktree). */
-const writableFor = new Map<string, string[]>();
+import { basename, isAbsolute, join, resolve, sep } from "node:path";
+import { mkdirPhysical, unlinkPhysical } from "./tools/anchored.ts";
+import { contained, FULL_CONTAINMENT, GIT_SETTINGS_PATTERNS, physical, sandboxer, shellSafe, trustedGit } from "./tools/workspace.ts";
+import { SECRET_NAME, withoutSecrets } from "./util.ts";
 
 /**
  * git on the project's own repository. Its settings and attributes are project content (an agent can write them),
- * and some make git run a program (filter and diff drivers, fsmonitor, hooks), so the engine's git runs contained
- * like the agent's commands: it may write the repository and nothing else, with no network. Hooks and fsmonitor are
- * off as well. Where this computer has no facility, every configured filter and diff driver is turned off instead.
+ * and some make git run a program (filter and diff drivers, fsmonitor, hooks), so the engine's git runs only under
+ * full containment (Seatbelt or bubblewrap): it may write the repository and the temp folders and nothing else, with
+ * no network, no keys or tokens in its environment, hooks and fsmonitor off, and the repository's settings, hooks and
+ * info folder read only. Where this computer can't contain it, it doesn't run (snapshots and worktrees are off there).
  */
 function git(cwd: string, args: string[], env?: Record<string, string>): string {
-	const program = trustedGit() ?? "git";
-	const full = [program, "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", ...args];
-	const options = { cwd, env: { ...process.env, ...env, GIT_TERMINAL_PROMPT: "0" }, encoding: "utf8" as const, stdio: ["ignore", "pipe", "pipe"] as ["ignore", "pipe", "pipe"] };
-	let writable = writableFor.get(cwd);
-	if (!writable) {
-		// Asked once per folder, contained to writing nothing: where the repository's folders are. Those answers come
-		// from project content (a .git file, core.worktree), so they widen what git may write only in the layouts git
-		// makes itself: the folder's own .git, a repository above it whose .git sits directly in its top folder, or an
-		// EnrichedLab worktree inside the repository's .git.
-		const probe = contained(full[0]!, ["rev-parse", "--show-toplevel", "--git-common-dir"], { writable: [], network: "none" });
-		const real = (p: string) => {
-			try {
-				return realpathSync(p);
-			} catch {
-				return resolve(p);
-			}
-		};
-		const within = (p: string, dir: string) => p === dir || p.startsWith(dir.endsWith(sep) ? dir : `${dir}${sep}`);
-		const here = real(cwd);
-		writable = [cwd];
-		try {
-			const [top = "", common = ""] = execFileSync(probe.file, probe.args, options).trim().split("\n").map((p) => real(resolve(cwd, p)));
-			if (common === join(top, ".git") && within(here, top)) writable = [cwd, top, common];
-			else if (within(common, here) || within(here, common)) writable = [cwd, common];
-		} catch {
-			// Not a repository yet (git init comes next): the folder itself.
-		}
-		writableFor.set(cwd, writable);
+	const program = trustedGit();
+	if (!program) throw new Error("No git from the system's or Homebrew's own folders was found, so the engine's git work didn't run.");
+	const full = ["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", ...args];
+	const facility = sandboxer();
+	if (!facility || !FULL_CONTAINMENT.has(facility)) throw new Error("This computer has no sandbox for the engine's git work (Seatbelt on macOS, bubblewrap on Linux), so it didn't run.");
+	const options = { cwd, env: { ...withoutSecrets(shellSafe({ ...process.env, ...env })), ...env, GIT_TERMINAL_PROMPT: "0" }, encoding: "utf8" as const };
+	const here = physical(cwd);
+	// Where the repository's folders are, asked each time under containment that writes nothing. The answers are
+	// project content (a .git file, core.worktree), so they widen what git may write only in layouts git makes itself:
+	// the folder's own .git, a repository above it whose .git sits directly in its top folder, or an EnrichedLab
+	// worktree inside the repository's .git.
+	const within = (p: string, dir: string) => p === dir || p.startsWith(`${dir}${sep}`);
+	let writable = [here];
+	const probe = contained(program, ["rev-parse", "--show-toplevel", "--git-common-dir"], { writable: [], network: "none" });
+	try {
+		const [top = "", common = ""] = execFileSync(probe.file, probe.args, { ...options, stdio: ["ignore", "pipe", "pipe"] }).trim().split("\n").map((p) => physical(resolve(cwd, p)));
+		if (common === join(top, ".git") && within(here, top)) writable = [...new Set([here, top, common])];
+		else if (within(common, here) || within(here, common)) writable = [...new Set([here, common])];
+	} catch {
+		// Not a repository yet: the folder itself.
 	}
-	// Where nothing contains it, the drivers the repository's own settings define (project content, includes from
-	// them counted) are turned off instead; the person's global ones (git-lfs) stay. git too old to say where a
-	// setting comes from doesn't run here.
-	if (!contained(full[0]!, [], { writable: [], network: "none" }).facility) {
-		let listed: string;
-		try {
-			listed = execFileSync(program, ["config", "--show-scope", "--name-only", "--get-regexp", "^(filter|diff)\\."], options);
-		} catch (error) {
-			// Exit 1 is "no such settings"; anything else (an old git without --show-scope) refuses.
-			if ((error as { status?: number }).status !== 1) throw new Error("This git can't say where its settings come from (it needs 2.26 or later), so the engine's git work didn't run.");
-			listed = "";
-		}
-		const names = listed.split("\n").filter((line) => /^(local|worktree|command)\t/.test(line)).map((line) => line.slice(line.indexOf("\t") + 1));
-		const named = (kind: string) => [...new Set(names.map((n) => new RegExp(`^${kind}\\.(.+)\\.[^.]+$`).exec(n.trim())?.[1]).filter((d): d is string => Boolean(d)))];
-		const off = [
-			...named("filter").flatMap((d) => ["-c", `filter.${d}.clean=`, "-c", `filter.${d}.smudge=`, "-c", `filter.${d}.process=`, "-c", `filter.${d}.required=false`]),
-			// The engine's git lists names only (no merges, no diff content), but diff drivers go too.
-			...named("diff").flatMap((d) => ["-c", `diff.${d}.textconv=`, "-c", `diff.${d}.command=`]),
-			"-c",
-			"diff.external=",
-			// fetch can list an alternate repository's refs with a program: one that prints nothing instead.
-			"-c",
-			"core.alternateRefsCommand=true",
-		];
-		return execFileSync(program, [...full.slice(1, 5), ...off, ...full.slice(5)], options).trim();
+	const gitDirs = writable.filter((w) => basename(w) === ".git" || existsSync(join(w, "HEAD"))).concat(writable.map((w) => join(w, ".git")).filter((g) => existsSync(g)));
+	const protect = [...new Set(gitDirs)].flatMap((g) => [join(g, "config"), join(g, "hooks"), join(g, "info")]);
+	// Each folder granted as the one just checked (bubblewrap binds it by handle; Seatbelt judges real paths).
+	const launch = contained(program, full, { writable, network: "none", exact: true, protect, protectPatterns: GIT_SETTINGS_PATTERNS });
+	try {
+		return execFileSync(launch.file, launch.args, { ...options, stdio: ["ignore", "pipe", "pipe", ...(launch.pass ?? [])] }).trim();
+	} finally {
+		launch.release?.();
 	}
-	const launch = contained(full[0]!, full.slice(1), { writable, network: "none" });
-	return execFileSync(launch.file, launch.args, options).trim();
 }
 
 /** The repository's top folder, or undefined outside git. */
@@ -96,8 +68,9 @@ export function branchFor(sessionId: string, title: string): string {
 
 /** Create a worktree on a new branch from the current HEAD. Returns its folder and branch. */
 export function createWorktree(root: string, sessionId: string, title: string): { path: string; branch: string } {
-	const dir = join(root, ".git", "enrichedlab-worktrees");
-	mkdirSync(dir, { recursive: true });
+	// Made without following a link anywhere on the way (a .git that is a link refuses).
+	const dir = join(physical(root), ".git", "enrichedlab-worktrees");
+	mkdirPhysical(dir);
 	const path = join(dir, sessionId);
 	const branch = branchFor(sessionId, title);
 	git(root, ["worktree", "add", "-b", branch, path, "HEAD"]);
@@ -155,7 +128,8 @@ export function restoreSnapshot(cwd: string, commit: string): string[] {
 			git(cwd, ["checkout-index", "-a", "-f"], env);
 			for (const file of changed) {
 				const inTarget = git(cwd, ["ls-tree", "--name-only", commit, "--", file]);
-				if (!inTarget && existsSync(join(cwd, file))) rmSync(join(cwd, file), { force: true });
+				// Removed without following a link anywhere on the way: a folder swapped for one refuses.
+				if (!inTarget) unlinkPhysical(join(physical(cwd), file));
 			}
 		} finally {
 			rmSync(scratch, { recursive: true, force: true });

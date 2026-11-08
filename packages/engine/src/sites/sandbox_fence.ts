@@ -5,8 +5,10 @@
 // (/dev/null and the like); everything the command starts inherits the fence. Where the kernel has them, TCP and
 // signals or abstract sockets reaching processes outside the fence are refused too. Reading isn't fenced (the
 // sandbox holds only the person's own work), and the sandbox has no network. File modes, owners and times aren't
-// covered by Landlock. A sandbox whose kernel or image can't fence (an older Landlock, no root-owned python3) says
+// covered by Landlock; in read mode (a read-only subagent) a seccomp filter refuses those changes too. A sandbox whose kernel or image can't fence (an older Landlock, no root-owned python3) says
 // so when probed, and its commands ask instead.
+
+import { deflateSync } from "node:zlib";
 
 /** Interpreters the fence may run with: the image's own, root-owned and writable by nobody else (checked in the probe). */
 export const FENCE_PYTHONS = ["/usr/bin/python3", "/usr/local/bin/python3"];
@@ -69,6 +71,36 @@ def fence(rules):
         raise OSError("restrict: errno %d" % ctypes.get_errno())
     os.close(fd)
 
+# Read mode: no changes to modes, owners, times or extended attributes anywhere (Landlock has no right for them), by
+# seccomp: these system calls fail with EPERM; a process of another architecture is stopped.
+META = {
+    "x86_64": (0xC000003E, [90, 91, 92, 93, 94, 132, 188, 189, 190, 197, 198, 199, 235, 260, 261, 268, 280, 452, 463, 466]),
+    "aarch64": (0xC00000B7, [5, 6, 7, 14, 15, 16, 52, 53, 54, 55, 88, 452, 463, 466]),
+}
+
+class SockFilter(ctypes.Structure):
+    _fields_ = [("code", ctypes.c_uint16), ("jt", ctypes.c_uint8), ("jf", ctypes.c_uint8), ("k", ctypes.c_uint32)]
+
+class SockFprog(ctypes.Structure):
+    _fields_ = [("len", ctypes.c_uint16), ("filter", ctypes.POINTER(SockFilter))]
+
+def no_metadata():
+    machine = os.uname().machine
+    if machine not in META:
+        raise OSError("no metadata filter for %s" % machine)
+    arch, calls = META[machine]
+    deny, allow, kill = 0x00050000 | 1, 0x7FFF0000, 0x80000000
+    prog = [(0x20, 0, 0, 4), (0x15, 1, 0, arch), (0x06, 0, 0, kill), (0x20, 0, 0, 0)]
+    if machine == "x86_64":
+        prog += [(0x35, 0, 1, 0x40000000), (0x06, 0, 0, deny)]
+    for nr in calls:
+        prog += [(0x15, 0, 1, nr), (0x06, 0, 0, deny)]
+    prog.append((0x06, 0, 0, allow))
+    table = (SockFilter * len(prog))(*[SockFilter(*p) for p in prog])
+    fp = SockFprog(len(prog), table)
+    if libc.prctl(22, 2, ctypes.byref(fp), 0, 0) != 0:
+        raise OSError("seccomp: errno %d" % ctypes.get_errno())
+
 DEVICES = ["/dev/null", "/dev/zero", "/dev/full", "/dev/tty"]
 DROP = ("BASH_ENV", "ENV", "ZDOTDIR", "SHELLOPTS", "BASHOPTS", "PS4", "PROMPT_COMMAND", "CDPATH", "GLOBIGNORE", "BASH_XTRACEFD", "EXECIGNORE", "IFS")
 
@@ -129,6 +161,8 @@ def run(root, command, mode):
         if pid == 0:
             try:
                 fence(rules)
+                if mode == "read":
+                    no_metadata()
             except OSError as e:
                 sys.stderr.write("The sandbox couldn't fence this command (%s), so it didn't run.\n" % e)
                 os._exit(125)
@@ -159,6 +193,12 @@ else:
         sys.exit(125)
 `;
 
+/**
+ * FENCE_PY as it is sent: compressed (zlib, base64), so the probe and each fenced command stay well under the length
+ * some labs accept for one command. Python's own zlib unpacks it; the source above is what runs.
+ */
+const SENT = `import base64,zlib;exec(zlib.decompress(base64.b64decode("${deflateSync(FENCE_PY, { level: 9 }).toString("base64")}")))`;
+
 /** The interpreter starts without loader variables, so nothing runs in it before the fence is set. */
 const CLEAN = "env -u LD_PRELOAD -u LD_AUDIT -u LD_LIBRARY_PATH -u PYTHONHOME -u PYTHONPATH";
 
@@ -166,7 +206,7 @@ const CLEAN = "env -u LD_PRELOAD -u LD_AUDIT -u LD_LIBRARY_PATH -u PYTHONHOME -u
 export function probeCommand(nonce: string, quote: (text: string) => string): string {
 	const ok = (py: string) => `[ -x ${py} ] && [ "$(stat -L -c %u ${py})" = 0 ] && [ "$(stat -L -c %u $(dirname ${py}))" = 0 ] && [ $(( 0$(stat -L -c %a ${py}) & 022 )) = 0 ] && [ $(( 0$(stat -L -c %a $(dirname ${py})) & 022 )) = 0 ]`;
 	const pick = FENCE_PYTHONS.map((py) => `if [ -z "$__el_py" ] && ${ok(py)}; then __el_py=${py}; fi`).join("; ");
-	return `__el_py=; ${pick}; if [ -n "$__el_py" ]; then ${CLEAN} "$__el_py" -I -c ${quote(FENCE_PY)} probe ${quote(nonce)}; else echo "el-fence no"; fi`;
+	return `__el_py=; ${pick}; if [ -n "$__el_py" ]; then ${CLEAN} "$__el_py" -I -c ${quote(SENT)} probe ${quote(nonce)}; else echo "el-fence no"; fi`;
 }
 
 /** The interpreter a probe answer names, when it is one the fence may use; undefined otherwise. */
@@ -181,5 +221,5 @@ export function fencePython(line: string, nonce: string): string | undefined {
 /** The command fenced with the interpreter the probe checked: the project is `root`, the folder the shell is in. */
 /** `readOnly`: nothing in the project may change. */
 export function fencedCommand(root: string, command: string, quote: (text: string) => string, python = FENCE_PYTHONS[0]!, readOnly = false): string {
-	return `${CLEAN} ${python} -I -c ${quote(FENCE_PY)} run ${quote(root)} ${quote(command)}${readOnly ? " read" : ""}`;
+	return `${CLEAN} ${python} -I -c ${quote(SENT)} run ${quote(root)} ${quote(command)}${readOnly ? " read" : ""}`;
 }

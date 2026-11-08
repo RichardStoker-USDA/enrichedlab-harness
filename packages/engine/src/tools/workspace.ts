@@ -2,7 +2,7 @@
 // without changing its tools. The local workspace acts in the project folder with the person's own rights.
 
 import { spawn } from "node:child_process";
-import { closeSync, constants, existsSync, fstatSync, ftruncateSync, lstatSync, readlinkSync, realpathSync, statSync, writeSync } from "node:fs";
+import { closeSync, constants, existsSync, fstatSync, ftruncateSync, lstatSync, readFileSync, readlinkSync, realpathSync, statSync, writeSync } from "node:fs";
 import { readdir, readFile, stat } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -226,7 +226,14 @@ export type NetworkAccess = "none" | "loopback" | "all";
 
 /** Seatbelt profile: writes only to `writable`, the credential folders unreadable, and the network as `network`
  * allows ("none" includes local sockets: Docker, ssh-agent). */
-function seatbeltProfile(writable: string[], network: NetworkAccess, readable: string[] = [], protect: string[] = []): string {
+/**
+ * Where git keeps what makes it run programs, in any repository at any depth (nested ones, submodules, one made
+ * later): settings, hooks, the info folder, and a worktree's own settings. Seatbelt matches these by pattern;
+ * bubblewrap can only protect the ones that exist when a command starts.
+ */
+export const GIT_SETTINGS_PATTERNS = ["/\\.git/(modules/.+/)?(config|hooks|info)(/|$)", "/\\.git/worktrees/[^/]+/config\\.worktree$"];
+
+function seatbeltProfile(writable: string[], network: NetworkAccess, readable: string[] = [], protect: string[] = [], patterns: string[] = []): string {
 	const quote = (p: string) => JSON.stringify(p);
 	const hidden = PRIVATE_DIRS.map((d) => `(subpath ${quote(join(homedir(), d))})`).join(" ");
 	const net =
@@ -242,6 +249,7 @@ function seatbeltProfile(writable: string[], network: NetworkAccess, readable: s
 		`(allow file-write* ${writable.map((p) => `(subpath ${quote(p)})`).join(" ")} (literal "/dev/null") (regex #"^/dev/(tty|fd/|stdout|stderr)"))`,
 		// Later rules win: protected paths inside a writable folder stay read only, existing or not.
 		...(protect.length ? [`(deny file-write* ${protect.map((p) => `(subpath ${quote(p)})`).join(" ")})`] : []),
+		...(patterns.length ? [`(deny file-write* ${patterns.map((p) => `(regex #"${p}")`).join(" ")})`] : []),
 		`(deny file-read* ${hidden})`,
 		// Paths inside a hidden folder that this program needs (an app's runner and data); later rules win.
 		...(readable.length ? [`(allow file-read* ${readable.map((p) => `(subpath ${quote(p)})`).join(" ")})`] : []),
@@ -261,7 +269,7 @@ function seatbeltProfile(writable: string[], network: NetworkAccess, readable: s
  * once it has exited. `protect`: paths inside the writable ones that stay read only (a
  * repository's settings and hooks).
  */
-export function contained(file: string, args: string[], options: { writable: string[]; network: NetworkAccess; readable?: string[]; server?: boolean; temp?: boolean; exact?: boolean; protect?: string[] }): { file: string; args: string[]; facility?: Facility; pass?: number[]; release?: () => void } {
+export function contained(file: string, args: string[], options: { writable: string[]; network: NetworkAccess; readable?: string[]; server?: boolean; temp?: boolean; exact?: boolean; protect?: string[]; protectPatterns?: string[] }): { file: string; args: string[]; facility?: Facility; pass?: number[]; release?: () => void } {
 	// Each path resolved once: the check and the grant are the same answer.
 	const resolved = options.writable.map(real);
 	if (options.exact) resolved.forEach((p, i) => {
@@ -282,7 +290,7 @@ export function contained(file: string, args: string[], options: { writable: str
 	const writable = [...resolved, ...(options.temp === false ? [] : [safeTemp(), "/private/tmp", "/tmp"])].filter((p, i, all) => existsSync(p) && all.indexOf(p) === i);
 	const readable = [...resolved, ...(options.readable ?? []).map(real)].filter((p) => existsSync(p));
 	const protect = (options.protect ?? []).map(real);
-	if (facility === "seatbelt") return { file: "/usr/bin/sandbox-exec", args: ["-p", seatbeltProfile(writable, options.network, readable, protect), file, ...args], facility };
+	if (facility === "seatbelt") return { file: "/usr/bin/sandbox-exec", args: ["-p", seatbeltProfile(writable, options.network, readable, protect, options.protectPatterns), file, ...args], facility };
 	// Read-only root, the writable folders bound, a private /tmp, credential folders hidden, every namespace unshared
 	// (network, pids, IPC, user) so host sockets under /tmp and /run are out of reach. Loopback can't be split from
 	// the network in a namespace, so "loopback" shares the network here.
@@ -327,14 +335,17 @@ export class LocalWorkspace implements Workspace {
 	/** Set when commands run contained (see SandboxMode): the facility in use. */
 	readonly sandboxed?: Facility;
 
-	/** The session's own worktree: its folder, and the repository's git folder it commits into. */
-	readonly worktree?: { path: string; gitDir: string };
+	/**
+	 * The session's own worktree: its folder, the repository's git folder, the worktree's own folder in it (`admin`),
+	 * and the folder holding its branch's ref (refs/heads/enrichedlab).
+	 */
+	readonly worktree?: { path: string; gitDir: string; admin: string; branchDir: string };
 
 	/** `worktree`: the one EnrichedLab made for this session, from the session's record (engine.ts). */
 	constructor(
 		readonly root: string,
 		sandbox: SandboxMode = "off",
-		worktree?: { path: string; repo: string },
+		worktree?: { path: string; repo: string; branch?: string },
 	) {
 		this.label = `this computer, in ${root}`;
 		if (sandbox === "workspace") this.sandboxed = sandboxer();
@@ -342,21 +353,31 @@ export class LocalWorkspace implements Workspace {
 			const gitDir = real(join(worktree.repo, ".git"));
 			const path = real(worktree.path);
 			const here = real(root);
-			// Only a worktree inside the repository's own .git, holding this folder.
-			if (statSync(gitDir, { throwIfNoEntry: false })?.isDirectory() && path.startsWith(`${gitDir}${sep}`) && (here === path || here.startsWith(`${path}${sep}`))) this.worktree = { path, gitDir };
+			// Where git keeps this worktree's own state, from its .git file: it must be a folder under .git/worktrees.
+			const dotGit = join(path, ".git");
+			const pointer = lstatSync(dotGit, { throwIfNoEntry: false })?.isFile() ? /^gitdir: (.+)$/m.exec(readFileSync(dotGit, "utf8"))?.[1]?.trim() : undefined;
+			const admin = pointer ? real(resolve(path, pointer)) : "";
+			const branch = worktree.branch ?? "";
+			const branchDir = dirname(branch);
+			// Only a worktree inside the repository's own .git, holding this folder, on an EnrichedLab branch.
+			if (statSync(gitDir, { throwIfNoEntry: false })?.isDirectory() && path.startsWith(`${gitDir}${sep}`) && (here === path || here.startsWith(`${path}${sep}`)) && dirname(admin) === join(gitDir, "worktrees") && /^enrichedlab\/[a-z0-9-]+$/.test(branch)) {
+				this.worktree = { path, gitDir, admin, branchDir: join(gitDir, "refs", "heads", branchDir) };
+			}
 		}
 	}
 
 	/**
-	 * What contained commands may write: the project, and in the session's worktree the repository's git folder too
-	 * (commits go there). Never a repository's settings, hooks or info folder, which make git run programs later.
+	 * What contained commands may write: the project, and in the session's worktree what a commit on its branch needs
+	 * (the object store, the worktree's own state, and EnrichedLab's branch refs and their logs), not the person's
+	 * branches, HEAD or index. Never a repository's settings, hooks or info folder, which make git run programs later.
 	 */
-	private writable(): { writable: string[]; protect: string[] } {
-		const writable = [this.root, ...(this.worktree ? [this.worktree.gitDir] : [])];
-		const gitDirs = [...(this.worktree ? [this.worktree.gitDir] : []), ...writable.map((w) => join(w, ".git")).filter((g) => statSync(g, { throwIfNoEntry: false })?.isDirectory())];
-		const protect = [...new Set(gitDirs)].flatMap((g) => [join(g, "config"), join(g, "hooks"), join(g, "info")]);
-		if (this.worktree) protect.push(join(this.worktree.gitDir, "worktrees", basename(this.worktree.path), "config.worktree"));
-		return { writable, protect };
+	private writable(): { writable: string[]; protect: string[]; protectPatterns: string[] } {
+		const tree = this.worktree;
+		const writable = [this.root, ...(tree ? [join(tree.gitDir, "objects"), tree.admin, tree.branchDir, join(tree.gitDir, "logs", relative(tree.gitDir, tree.branchDir))] : [])];
+		const gitDirs = [...(tree ? [tree.gitDir] : []), join(this.root, ".git")].filter((g) => statSync(g, { throwIfNoEntry: false })?.isDirectory());
+		const protect = gitDirs.flatMap((g) => [join(g, "config"), join(g, "hooks"), join(g, "info")]);
+		if (tree) protect.push(join(tree.admin, "config.worktree"));
+		return { writable, protect, protectPatterns: GIT_SETTINGS_PATTERNS };
 	}
 
 	/** The program and arguments that run `command`, contained when the workspace is sandboxed. */
@@ -462,6 +483,8 @@ export class LocalWorkspace implements Workspace {
 		const home = physical(this.root);
 		const rest = relative(home, real);
 		if (!options.outside && (rest.startsWith("..") || isAbsolute(rest))) throw new Error(`${this.display(full)} now leads outside the project (a link may have moved); nothing was written.`);
+		// A repository's git folder holds what git runs later (settings, hooks): file edits never go there.
+		if (rest.split(/[\\/]/).some((part) => part.toLowerCase() === ".git")) throw new Error(`${this.display(full)} is inside a repository's .git folder; EnrichedLab doesn't edit files there.`);
 		// Then made and opened at that physical path without following a link anywhere (anchored.ts): a folder swapped
 		// for a link meanwhile makes it fail instead of writing somewhere else.
 		let fd: number;

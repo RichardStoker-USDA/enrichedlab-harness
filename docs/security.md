@@ -62,27 +62,36 @@ the person's own settings:
 
 The engine's own work stays inside the same line:
 
-- Its git on a project's repository (worktrees, snapshots, sending a project to a lab) runs contained, because the
-  repository's settings and attributes are project content and can name programs (filter and diff drivers). It may
-  write that repository and the temp folders, with hooks and fsmonitor off and no network. What it may write widens
-  past the folder only in layouts git makes itself (the folder's own `.git`, a repository above it whose `.git`
-  sits in its top folder, or an EnrichedLab worktree inside `.git`), so a `.git` file or `core.worktree` pointing
-  elsewhere grants nothing. Where this computer has no facility, the filter, diff and alternate-refs programs the
-  repository's own settings define (local and worktree scope, includes from them counted) are turned off instead;
-  git older than 2.26 can't say where a setting comes from, so the engine's git doesn't run there. Its only fetch
-  reads a bundle file over the file transport, and a test pins the git subcommands it uses (none merges or prints
-  file content).
-- Bringing work back from a lab commits what's left with hooks, fsmonitor and signing off, under the lab's fence
-  when it holds; without the fence, the filter drivers the repository's own settings define are off too.
+- Its git on a project's repository (worktrees, snapshots, sending a project to a lab) runs only under Seatbelt or
+  bubblewrap, because the repository's settings and attributes are project content and can name programs (filter
+  and diff drivers). It may write that repository and the temp folders, with hooks and fsmonitor off, no network and
+  no keys or tokens in its environment, and the repository's settings, hooks and info folder read only. Where the
+  repository's folders are is asked again on every call, and each is granted as the folder just checked (bound by
+  handle on Linux). It widens past the folder only in layouts git makes itself (the folder's own `.git`, a
+  repository above it whose `.git` sits in its top folder, or an EnrichedLab worktree inside `.git`), so a `.git`
+  file or `core.worktree` pointing elsewhere grants nothing. Where this computer can't contain it (Windows, Linux
+  without bubblewrap) it doesn't run, so snapshots and worktrees are off there. Its only fetch reads a bundle file
+  over the file transport, a test pins the git subcommands it uses (none merges or prints file content), and its
+  own folder work (making the worktrees folder, removing files on undo) never follows a link.
+- Bringing work back from a lab (committing what's left, then bundling) runs only under the lab's fence, with
+  hooks, fsmonitor and signing off. A lab where the fence doesn't hold refuses it.
 - App backends (`bun`, `command`, `serve`) run contained or not at all. On Windows, where servers run as the person,
   the consent card says so before anything starts.
-- Package installs and listings run contained with the pinned pixi; a listing gets no network.
-- In a session's own worktree (known from the session's record, not its path) commands run contained with the
-  repository's git folder writable, so commits work. In every repository the sandbox can reach, `.git/config`,
-  `.git/hooks`, `.git/info` and a worktree's `config.worktree` stay read only, since git runs programs from them
-  the next time the person uses git (on Linux, the ones that exist).
-- A read-only subagent's commands run contained with nothing in the project writable (under a lab's fence, with no
-  project rights), or not at all. Their words decide nothing.
+- Package installs and listings run contained with the pinned pixi, checked against its SHA-256 before each use. A
+  listing never downloads it and gets no network.
+- In a session's own worktree (known from the session's record, not its path) commands run contained and may write
+  what a commit on its branch needs: the object store, the worktree's own state, and EnrichedLab's branch refs and
+  their logs (every session's EnrichedLab branches, not only its own). The person's branches, HEAD and index stay
+  read only.
+- Git's settings, hooks and info folder and a worktree's `config.worktree` stay read only for contained commands,
+  since git runs programs from them the next time the person uses git. On macOS that holds in any repository at
+  any depth, including nested ones, submodules and ones made later. On Linux it holds for the repository at the
+  project's top and the worktree's repository, as they are when the command starts. File edits never write inside
+  a `.git` folder. A project kept in a temp folder gets none of this (temp folders stay writable).
+- A read-only subagent's commands run contained with nothing in the project writable, or not at all. In a lab they
+  run under the fence with no project rights, and a seccomp filter there refuses changes to modes, owners, times and
+  extended attributes (on x86_64 and arm64; other machines don't run them). Temp folders stay writable. Their words
+  decide nothing.
 
 Reading a command's words still decides three things: which lines are pushes (they ask in every mode), what may
 run unasked inside containment (paths inside the project), and what an answer covers. Inside containment a command
@@ -101,7 +110,9 @@ Accepted residuals, each with its reason:
   no-network rule, and pathname sockets inside the sandbox aren't fenced, so a fenced command can talk to a server
   another session started there.
 - Metadata and running programs. Landlock doesn't restrict modes, owners, times, extended attributes or ACLs, so a
-  fenced command can change those on other projects' files in the same sandbox (files the sandbox user owns). That
+  fenced command that may write its project can change those on other projects' files in the same sandbox (files
+  the sandbox user owns). A filter can't tell which file a mode change is for, and ordinary work needs one in its
+  own project (`chmod +x`), so this stays for writing commands; read-only subagents' commands get the filter. That
   can change who may read them and their recorded times, and a project's checkpoints don't undo it. Running programs
   isn't restricted either; that is needed, and whatever they start inherits the fence.
 - Hard links and mounts. A file in the project is in the project, whatever other names it has: a hard link that
@@ -207,8 +218,8 @@ File edits in the sandbox run under it as well, after a check of where their fol
 the end instead of following it; where the fence doesn't hold, each file edit asks. `full` and Discovery mode don't fence (the person let the session act outside the
 project), and in `auto` a sandbox whose whole disk is checkpointed runs changes unfenced, because the disk can be
 put back. A lab's own command tools (`<lab>_sandbox_run`, `<lab>_sandbox_job_start`) run
-outside any project: read-only commands run (a version check only for a program found on PATH, never one the
-project holds), and the rest ask, remembered per program apart from this computer's answers.
+outside any project and outside the fence: only what the person listed in `allowCommands` runs unasked, and the
+rest ask, remembered per program apart from this computer's answers.
 Commands that change lab data outside the project ask, unless the lab checkpoints the whole sandbox disk
 (`endpoints.checkpoints`) and the session is in `auto`. An answer about a path
 outside the project covers that path. Pushes and unreviewed lab tools ask every time, in every mode.

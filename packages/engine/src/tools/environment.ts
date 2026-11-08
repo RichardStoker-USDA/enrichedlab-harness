@@ -6,7 +6,7 @@
 import { closeSync, constants, existsSync, lstatSync, mkdirSync, readFileSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
-import { pixi, pixiPresent } from "../apps/environments.ts";
+import { pixi, pixiHere } from "../apps/environments.ts";
 import { type Tool, ToolError } from "./types.ts";
 import { openPhysical } from "./anchored.ts";
 import { contained, type NetworkAccess, physical } from "./workspace.ts";
@@ -52,7 +52,13 @@ async function run(program: string, args: string[], root: string, env: Record<st
 	const launch = contained(program, args, { writable: [root, physical(caches)], readable: [program], network, exact: true });
 	// Package install scripts never run uncontained: no facility here, no install.
 	if (!launch.facility) throw new ToolError("This computer has no sandbox to contain package installs (Seatbelt on macOS, bubblewrap on Linux), so nothing was installed.");
-	const child = Bun.spawn([launch.file, ...launch.args], { cwd: tmpdir(), stdio: ["ignore", "pipe", "pipe", ...(launch.pass ?? [])], env });
+	let child: ReturnType<typeof Bun.spawn>;
+	try {
+		child = Bun.spawn([launch.file, ...launch.args], { cwd: tmpdir(), stdio: ["ignore", "pipe", "pipe", ...(launch.pass ?? [])], env });
+	} catch (error) {
+		launch.release?.();
+		throw error;
+	}
 	let out = "";
 	let err = "";
 	const read = async (stream: ReadableStream<Uint8Array>, keep: (text: string) => void) => {
@@ -62,7 +68,7 @@ async function run(program: string, args: string[], root: string, env: Record<st
 			for (const line of text.split(/\r|\n/)) if (line.trim()) log(line.trim());
 		}
 	};
-	await Promise.all([read(child.stdout, (t) => (out += t)), read(child.stderr, (t) => (err += t)), child.exited]).finally(() => launch.release?.());
+	await Promise.all([read(child.stdout as ReadableStream<Uint8Array>, (t) => (out += t)), read(child.stderr as ReadableStream<Uint8Array>, (t) => (err += t)), child.exited]).finally(() => launch.release?.());
 	if (child.exitCode !== 0) throw new ToolError(`pixi ${args[0]} failed:\n${(err || out).trim().split("\n").slice(-25).join("\n")}`);
 	return out;
 }
@@ -103,8 +109,10 @@ export const environmentTool: Tool<{ action: Action; packages?: string[]; pypi?:
 		const tools = ctx.tools ?? join(tmpdir(), "el-tools");
 		// Listing reads what's there: it never downloads pixi or makes an environment.
 		if (args.action === "list" && !existsSync(join(root, "pixi.toml"))) return { ok: true, content: "This project has no environment yet. Add packages to make one." };
-		if (args.action === "list" && !pixiPresent(tools)) return { ok: true, content: `pixi isn't on this computer yet, so this is what pixi.toml asks for (nothing is built):\n${readFileSync(join(root, "pixi.toml"), "utf8")}` };
-		const program = await pixi(tools, (line) => ctx.output(`${line}\n`));
+		// Listing never downloads: only a pinned pixi already here and matching its hash runs.
+		const here = args.action === "list" ? pixiHere(tools) : undefined;
+		if (args.action === "list" && !here) return { ok: true, content: `pixi isn't on this computer yet (or its copy didn't match its pinned hash), so this is what pixi.toml asks for (nothing is built):\n${readFileSync(join(root, "pixi.toml"), "utf8")}` };
+		const program = here ?? (await pixi(tools, (line) => ctx.output(`${line}\n`)));
 		const caches = join(tools, "pixi-cache");
 		// Made first: containment can only let the install write a folder that exists.
 		mkdirSync(caches, { recursive: true });

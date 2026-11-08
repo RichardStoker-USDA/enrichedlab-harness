@@ -5,7 +5,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import type { SessionEvent } from "../packages/protocol/src/index.ts";
 import { budget, cutPoint, derive, elisionCandidates, SUMMARY_PREFIX } from "../packages/engine/src/session/context.ts";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { LabConfig } from "../packages/engine/src/config.ts";
 import { allowKey, allowKeys, canonical, decide, folderAccess, HIDDEN_REASON, identity, pushes } from "../packages/engine/src/permissions.ts";
@@ -714,14 +714,15 @@ describe("own-branch commits", () => {
 		const { createWorktree } = await import("../packages/engine/src/git.ts");
 		const config = { permissions: { mode: "ask", allowCommands: [] } } as unknown as LabConfig;
 		const shell = { name: "shell", kind: "exec" } as unknown as Tool;
-		const repo = realpathSync(scratch("own"));
+		// Outside the temp folders, which contained commands may always write.
+		const repo = realpathSync(mkdtempSync(join(homedir(), ".el-own-")));
 		const git = (...a: string[]) => execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", ...a], { cwd: repo, encoding: "utf8" });
-		git("init", "-q");
+		git("init", "-q", "-b", "main");
 		writeFileSync(join(repo, "a.txt"), "one\n");
 		git("add", ".");
 		git("commit", "-q", "-m", "start");
 		const made = createWorktree(repo, "s1", "test");
-		const own = new LocalWorkspace(made.path, "workspace", { path: made.path, repo });
+		const own = new LocalWorkspace(made.path, "workspace", { ...made, repo });
 		expect(own.worktree?.gitDir).toBe(join(repo, ".git"));
 		const run = (ws: LocalWorkspace, command: string) => decide(shell, { command }, ws, config, new Set()).action;
 		expect(run(own, "git add -A && git commit -m 'Fix the parser'")).toBe("run");
@@ -741,6 +742,14 @@ describe("own-branch commits", () => {
 		expect((await own.exec(`printf x > ${join(repo, ".git", "hooks", "pre-commit")}`, opts)).exitCode).not.toBe(0);
 		expect(readFileSync(join(repo, ".git", "config"), "utf8")).toBe(before);
 		expect(existsSync(join(repo, ".git", "hooks", "pre-commit"))).toBe(false);
+		// The person's own branch and index aren't the session's to change; settings in a repository made later aren't either.
+		const main = git("rev-parse", "HEAD").trim();
+		expect((await own.exec("git update-ref refs/heads/main HEAD", opts)).exitCode).not.toBe(0);
+		expect(git("rev-parse", "HEAD").trim()).toBe(main);
+		expect((await own.exec("mkdir -p nested && cd nested && git init -q && git config core.hooksPath /tmp/elsewhere", opts)).exitCode).not.toBe(0);
+		// File edits never go into a .git folder.
+		await expect(own.write(".git", "gitdir: /tmp/elsewhere\n")).rejects.toThrow(".git folder");
+		rmSync(repo, { recursive: true, force: true });
 	});
 });
 

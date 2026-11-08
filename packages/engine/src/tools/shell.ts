@@ -83,7 +83,8 @@ const looksLikePath = (t: string) => /^(~|\/|\\\\|[A-Za-z]:[\\/])/.test(t) || /(
 /** True when the command is one the person listed in allowCommands (a whole word prefix, nothing chained). */
 export function personAllows(command: string, extra: string[]): boolean {
 	const text = command.trim();
-	return Boolean(text) && extra.some((prefix) => text === prefix || text.startsWith(`${prefix} `)) && !/[;&|<>`$\n*?[\]{}~]/.test(text);
+	// Any control character (a carriage return ends a statement in PowerShell, as a newline does in bash) refuses.
+	return Boolean(text) && extra.some((prefix) => text === prefix || text.startsWith(`${prefix} `)) && !/[;&|<>`$*?[\]{}~\x00-\x1f\x7f\u0085\u2028\u2029]/.test(text);
 }
 
 /** True when every part of a command only reads, inside the project when `inside` is given. Anything unusual

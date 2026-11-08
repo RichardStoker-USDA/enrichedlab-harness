@@ -53,7 +53,7 @@ Updates are signed and install themselves the same way: the app offers them, `el
   its git repository along. A lab that keeps its data inside pins its sessions there.
 - **Contained by default.** On macOS and Linux the agent's commands can write only to the project and temp folders,
   can't read your credential folders, and have no network unless you allow it; anything that would run outside that
-  asks first. On Windows they can write only to the project and temp folders, can read your credential folders, and
+  asks first, unless you listed it or chose Allow Everything. On Windows they can write only to the project and temp folders, can read your credential folders, and
   ask before they run ([docs/security.md](docs/security.md)).
 
 ## Terminal

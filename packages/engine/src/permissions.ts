@@ -207,9 +207,11 @@ const GIT_VALUE_OPTIONS = new Set(["-c", "-C", "--git-dir", "--work-tree", "--na
 /** git subcommands that send work somewhere else: push and its plumbing, and patches mailed out. */
 const PUBLISH = ["push", "send-pack", "http-push", "send-email", "imap-send"];
 const GIT_PUBLISHERS = PUBLISH.flatMap((p) => [`git-${p}`, `git-${p}.exe`]);
+/** git's bridges that publish with a subcommand: git-svn dcommit, git-p4 submit (run directly or as git svn). */
+const BRIDGES: Record<string, string> = { svn: "dcommit", p4: "submit" };
 
 /** Settings that make git run a program (or rename a command): set on the command line, git could push unseen. */
-const GIT_RUNS = /^(alias\.|core\.(sshcommand|fsmonitor|pager|editor|askpass|hookspath|gitproxy|alternaterefscommand)|diff\.|filter\.|merge\.|gpg\.|credential\.|uploadpack\.|receivepack\.|sequence\.|interactive\.|remote\.|protocol\.|url\.|include|pager\.|log\.showsignature|submodule\.)/i;
+const GIT_RUNS = /^(alias\.|core\.(sshcommand|fsmonitor|pager|editor|askpass|hookspath|gitproxy|alternaterefscommand)|diff\.|difftool\.|filter\.|merge\.|mergetool\.|gpg\.|credential\.|uploadpack\.|receivepack\.|sequence\.|interactive\.|remote\.|protocol\.|url\.|include|pager\.|log\.showsignature|submodule\.|tar\.|sendemail\.|lfs\.|web\.browser|browser\.|man\.|instaweb\.|ssh\.)/i;
 /** Programs that never run their arguments, so a shell's name among them is just a name. */
 // Not sort (--compress-program), bat (--pager), man (a pager) or find (-exec): those can run a program.
 const NON_RUNNING = new Set(["ls", "cat", "head", "tail", "wc", "echo", "printf", "which", "whereis", "type", "file", "stat", "grep", "egrep", "fgrep", "cut", "tr", "diff", "cmp", "basename", "dirname", "realpath", "readlink", "nl", "jq", "eza", "tree", "du", "df", "apropos", "whatis", "test", "[", "true", "false", "pwd", "date", "uname", "id", "whoami"]);
@@ -280,6 +282,14 @@ function publishing(command: string, depth = 0): "push" | "hidden" | undefined {
 				sawGit = true;
 				sawPush = true;
 			}
+			for (const [bridge, word] of Object.entries(BRIDGES)) {
+				if (could(argv[i], patterns[i], [`git-${bridge}`, `git-${bridge}.exe`]) && argv.slice(i + 1).some((w) => w === undefined || w === word)) {
+					sawGit = true;
+					sawPush = true;
+				}
+			}
+			// git settings handed in by name anywhere a wrapper passes them on (timeout 5 env GIT_X=..., builtin export).
+			if (argv[i] !== undefined && /^GIT_\w*=/.test(argv[i]!)) hidden = true;
 			if (could(argv[i], patterns[i], ["git", "git.exe"])) {
 				sawGit = true;
 				let j = i + 1;

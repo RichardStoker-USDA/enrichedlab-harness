@@ -14,8 +14,9 @@ How EnrichedLab handles git on a person's computer and in a lab sandbox, and how
   agents never write over each other or the person's checkout. `el worktrees` lists them; `--prune` removes the
   ones merged into the current branch.
 - **What asks.** In its own worktree the agent edits files and commits without asking: its commands run contained
-  with the repository's git folder writable (its settings and hooks stay read only), and the person reviews the
-  branch when merging. Where commands can't be contained, commits ask like any command. `git push` (and
+  and may write what a commit on an EnrichedLab branch needs (objects, the worktree's state, EnrichedLab's branch
+  refs), not the person's branches, HEAD, index, settings or hooks; the person reviews the branch when merging.
+  Worktrees need Seatbelt or bubblewrap: elsewhere sessions work in the checkout and commits ask like any command. `git push` (and
   `send-pack`, `svn dcommit` and the like) asks in every mode, every time, and "allow for this session" doesn't
   cover it; `el run` refuses pushes unless `--push` is given.
 - **Commit messages** follow the prompt's rule: one imperative subject under 80 characters, no AI attribution.

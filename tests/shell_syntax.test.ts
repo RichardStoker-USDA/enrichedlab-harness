@@ -389,7 +389,9 @@ describe("round 5: one boundary", () => {
 		for (const m of source.matchAll(/git\([a-zA-Z.]+, \["fetch"[^\n]*/g)) expect(m[0]).toContain('GIT_ALLOW_PROTOCOL: "file"');
 		for (const c of calls.filter((x) => x.sub === "log")) expect(c.rest).not.toMatch(/"-p"|"--patch"|"--stat"|textconv/);
 		// Every process git.ts starts goes through its contained helper.
-		expect((source.match(/execFileSync\(/g) ?? []).length).toBe(4);
+		expect((source.match(/execFileSync\(/g) ?? []).length).toBe(2);
+		// Only under full containment: no direct run of git anywhere in the file.
+		expect(source).toContain("FULL_CONTAINMENT.has(facility)");
 		expect(source.match(/from "node:child_process"/g)?.length).toBe(1);
 		expect(source).toContain('import { execFileSync } from "node:child_process";');
 		expect(source).not.toMatch(/Bun\.spawn|spawnSync\(|execSync\(/);
@@ -436,7 +438,7 @@ describe("round 6: containment is the boundary", () => {
 		}
 	});
 
-	test.skipIf(process.platform === "win32")("bringing work back from a lab runs none of the project's hooks or filter drivers", async () => {
+	test.skipIf(process.platform === "win32")("bringing work back from a lab runs only under its fence, so none of the project's hooks or filter drivers run outside it", async () => {
 		const { execFileSync } = await import("node:child_process");
 		const { fetchRepo } = await import("../packages/engine/src/sites/repo_handoff.ts");
 		const base = realpathSync(mkdtempSync(join(tmpdir(), "el-handoff-")));
@@ -467,11 +469,43 @@ describe("round 6: containment is the boundary", () => {
 				},
 				get: async (from: string, to: string) => writeFileSync(to, readFileSync(from.replace("/sandbox/out", out))),
 			} as unknown as SandboxApi;
-			const commits = await fetchRepo(api, dir, { repo, base: head, home: head }, "enrichedlab/test-1");
-			expect(commits.length).toBe(1);
+			// This "lab" can't fence (no Landlock here), so nothing runs in it but the probe.
+			await expect(fetchRepo(api, dir, { repo, base: head, home: head }, "enrichedlab/test-1")).rejects.toThrow("can't fence");
 			expect(readdirSync(marks)).toEqual([]);
 		} finally {
 			rmSync(base, { recursive: true, force: true });
+		}
+	});
+
+	test("round 7: allowCommands holds one statement, and more publishing forms count", () => {
+		const root = realpathSync(mkdtempSync(join(tmpdir(), "el-allow-")));
+		try {
+			const off = new LocalWorkspace(root, "off");
+			const listed = { permissions: { mode: "ask", allowCommands: ["Write-Output", "ls"] } } as unknown as LabConfig;
+			for (const command of ["Write-Output a\rWrite-Output b", "ls ls", "ls\u0085x", "ls\tx\0"]) {
+				expect([JSON.stringify(command), decide(shell, { command }, off, listed, new Set()).action]).toEqual([JSON.stringify(command), "ask"]);
+			}
+			expect(decide(shell, { command: "ls -la" }, off, listed, new Set()).action).toBe("run");
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+		for (const command of ["/usr/lib/git-core/git-svn dcommit", "/usr/lib/git-core/git-p4 submit"]) {
+			expect([command, allowKeys(shell, { command }).keys[0]]).toEqual([command, "shell!push"]);
+		}
+		for (const command of ["timeout 5 env GIT_SSH_COMMAND=./x git fetch", "nice env GIT_CONFIG_COUNT=1 git status", "builtin export GIT_CONFIG_COUNT=1", "git -c tar.x.command=./y archive HEAD", "git -c difftool.t.cmd=./y difftool"]) {
+			expect([command, allowKeys(shell, { command }).keys[0]]).toEqual([command, "shell!hidden"]);
+		}
+	});
+
+	test("listing packages never downloads pixi, and a copy that doesn't match its hash isn't run", async () => {
+		const { PIXI_VERSION, pixiHere } = await import("../packages/engine/src/apps/environments.ts");
+		const tools = realpathSync(mkdtempSync(join(tmpdir(), "el-pixi-")));
+		try {
+			expect(pixiHere(tools)).toBeUndefined();
+			writeFileSync(join(tools, `pixi-${PIXI_VERSION}${process.platform === "win32" ? ".exe" : ""}`), "not pixi");
+			expect(pixiHere(tools)).toBeUndefined();
+		} finally {
+			rmSync(tools, { recursive: true, force: true });
 		}
 	});
 });
