@@ -3,7 +3,7 @@
 
 import { afterAll, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, truncateSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { localHistory, MAX_FILE } from "../packages/engine/src/session/history.ts";
@@ -73,5 +73,32 @@ describe("step history", () => {
 		expect(a.changed && b.changed).toBe(true);
 		expect(await one.head()).toBe(a.commit);
 		expect(await two.head()).toBe(b.commit);
+	});
+
+	test("going back never deletes through a link, leaves files too large to keep, and keeps bytes exact", async () => {
+		const folder = join(dir, "careful");
+		const outside = join(dir, "outside");
+		mkdirSync(join(folder, "link"), { recursive: true });
+		mkdirSync(outside);
+		writeFileSync(join(outside, "report.txt"), "not ours\n");
+		writeFileSync(join(folder, ".gitattributes"), "*.txt text\n");
+		writeFileSync(join(folder, "crlf.txt"), "a\r\nb\r\n");
+		const history = localHistory(join(dir, "store"), folder, "s3");
+		// The target: link is a link to a folder outside.
+		rmSync(join(folder, "link"), { recursive: true });
+		symlinkSync(outside, join(folder, "link"));
+		const target = await history.snapshot("target");
+		// The present: link is a real folder holding report.txt; crlf.txt edited; big.bin too large to keep.
+		rmSync(join(folder, "link"));
+		mkdirSync(join(folder, "link"));
+		writeFileSync(join(folder, "link", "report.txt"), "ours\n");
+		writeFileSync(join(folder, "crlf.txt"), "changed\r\n");
+		writeFileSync(join(folder, "big.bin"), "");
+		truncateSync(join(folder, "big.bin"), MAX_FILE + 1);
+		const back = await history.restore(target.commit, "test");
+		expect(readFileSync(join(outside, "report.txt"), "utf8")).toBe("not ours\n");
+		expect(readFileSync(join(folder, "crlf.txt"), "utf8")).toBe("a\r\nb\r\n");
+		expect(existsSync(join(folder, "big.bin"))).toBe(true);
+		expect(back.removed).not.toContain("big.bin");
 	});
 });

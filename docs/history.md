@@ -18,16 +18,22 @@ command (`packages/engine/src/session/history.ts`). Each point is a `checkpoint`
 - **Fast after the first.** The index remembers each file's size and time, so a snapshot hashes only what changed.
 - **Everything the person made.** Ignore files don't apply: a data folder a repository ignores is what a person
   would want back.
+- **Byte for byte.** Git attributes are off in the store (`info/attributes`), so line endings and filters never
+  change what comes back.
 - **Not kept, and said so.** Files over 25 MB, new data past 1 GB in one snapshot (the first snapshot of a large data
-  folder stops there and lists what it left out in the event's `skipped`), and folders tools rebuild
-  (`node_modules`, virtual environments, `.pixi`, caches, nested `.git`). Going back leaves these as they are.
+  folder stops there and lists what it left out in the event's `skipped`), repositories inside the folder (kept as a
+  pointer, not their files), names with line breaks in a lab sandbox, and folders tools rebuild (`node_modules`,
+  virtual environments, `.pixi`, caches). Going back leaves these as they are, whether they were too large then or now.
+- **One at a time.** Snapshots and restores of one folder take turns, and going back holds its session like a turn.
 
 ## Going back
 
 `session.rewind {sessionId, before, retry?}` puts the folder back as it was at the newest point before the step
 `before` (an event id). Files changed since come back, files made since go. The present is kept first, as its own
-point, so going back can itself be taken back; the session's line goes on from there, and a `rewind` event records
-what changed. The model is told on its next request.
+point, so going back can itself be taken back (rewind with `before` set to the `rewind` event's id returns to it);
+the session's line goes on from there, and a `rewind` event records what changed. Files go first, while the folder
+is as the present has it, and never through a link, so a link the target brings back can't carry a removal outside
+the folder. The model is told on its next request.
 
 With `retry`, a new session continues from just before that step: the conversation up to there, the same folder
 and model, titled "Retry: …". The original stays as it was, so both tries can be compared. On this computer for now;

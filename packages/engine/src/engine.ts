@@ -3,7 +3,7 @@
 // it in-process.
 
 import { createHash } from "node:crypto";
-import { existsSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
 import type {
@@ -285,6 +285,7 @@ export class Engine {
 				return sites.title(site);
 			},
 			run: (command, timeout, signal) => live().run(command, timeout, signal),
+			checkpoints: () => sites.sandbox(site)?.checkpoints?.(),
 			put: (path, signal) => live().put(path, signal),
 			get: (path, target, signal) => live().get(path, target, signal),
 			attach: (spec, signal) => {
@@ -449,7 +450,9 @@ export class Engine {
 		const fork = this.createSession(runtime.cwd, runtime.modelRef, runtime.site);
 		fork.setPermissionMode(runtime.permissionMode ?? modeOf(this.config.permissions.mode));
 		const at = runtime.events.findIndex((e) => e.id === before);
-		for (const e of runtime.events.slice(0, at)) if (e.t !== "header" && e.t !== "title" && e.t !== "permissions") fork.append(e);
+		// Tool output kept beside the log comes along; per-file copies stay with the original (history covers the folder).
+		if (existsSync(runtime.log.outputsDir)) cpSync(runtime.log.outputsDir, fork.log.outputsDir, { recursive: true });
+		for (const e of runtime.events.slice(0, at)) if (e.t !== "header" && e.t !== "title" && e.t !== "permissions") fork.append(e.t === "checkpoint" ? { ...e, files: [] } : e);
 		fork.append({ t: "title", id: newId("e"), at: new Date().toISOString(), title: `Retry: ${runtime.summary().title}`.slice(0, 120) });
 		return fork;
 	}

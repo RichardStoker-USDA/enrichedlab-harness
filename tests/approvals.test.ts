@@ -141,7 +141,11 @@ describe("approvals", () => {
 		const back = await session.rewind(step.id);
 		expect(back).toMatchObject({ ok: true, files: ["notes.txt"] });
 		expect(readFileSync(join(root, "notes.txt"), "utf8")).toBe("x\n");
-		expect(session.events.at(-1)).toMatchObject({ t: "rewind", before: step.id, restored: ["notes.txt"] });
+		const went = session.events.at(-1)!;
+		expect(went).toMatchObject({ t: "rewind", before: step.id, restored: ["notes.txt"] });
+		// Going back from the go-back returns to the present it kept.
+		expect((await session.rewind(went.id)).ok).toBe(true);
+		expect(existsSync(join(root, "notes.txt"))).toBe(false);
 		// Each step that changed files left a point to go back to, and the history is outside the folder.
 		expect(session.events.filter((e) => e.t === "checkpoint" && e.history).length).toBeGreaterThanOrEqual(3);
 		expect(existsSync(join(root, ".git"))).toBe(false);
