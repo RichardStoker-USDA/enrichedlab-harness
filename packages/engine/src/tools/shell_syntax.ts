@@ -20,7 +20,10 @@ export interface Redirect {
 /** One simple command: what it sets in front, the words it runs, and where its streams go. */
 export interface Simple {
 	assigns: { name: string; value: string }[];
+	/** Each word's text; a glob word's text is its pattern as written, quotes taken out. */
 	words: string[];
+	/** For each word, its glob pattern when it is one (the shell replaces it with the names it matches). */
+	patterns: (string | undefined)[];
 	redirects: Redirect[];
 	background: boolean;
 }
@@ -28,6 +31,10 @@ export interface Simple {
 /** A command anywhere in a line, with each word's text when literal (undefined when it isn't). */
 export interface AnyCommand {
 	words: (string | undefined)[];
+	/** For each word, its glob pattern when it is one. */
+	patterns: (string | undefined)[];
+	/** The names of the variables set in front of it. */
+	assigns: string[];
 }
 
 const REDIRECTS: Record<number, string> = { 63: ">", 64: ">>", 65: "<", 66: "<>", 67: "<&", 68: ">&", 69: ">|", 70: ">>|", 71: "<<", 72: "<<-", 73: "<<<", 74: "&>", 75: "&>|", 76: "&>>", 77: "&>>|" };
@@ -60,46 +67,72 @@ export function parseShell(line: string): Node | undefined {
 	return file ?? undefined;
 }
 
-/** bash's $'..' escapes. */
+/** bash's $'..' escapes. A NUL ends the quoted text there, as bash cuts it. */
 function ansiC(text: string): string {
 	const named: Record<string, string> = { a: "\x07", b: "\b", e: "\x1b", E: "\x1b", f: "\f", n: "\n", r: "\r", t: "\t", v: "\v", "\\": "\\", "'": "'", '"': '"', "?": "?" };
 	const point = (n: number) => (n > 0x10ffff ? "�" : String.fromCodePoint(n));
-	return text.replace(/\\(x[0-9A-Fa-f]{1,2}|u[0-9A-Fa-f]{1,4}|U[0-9A-Fa-f]{1,8}|[0-7]{1,3}|c[\s\S]|[\s\S])/g, (all, e: string) => {
+	const decoded = text.replace(/\\(x[0-9A-Fa-f]{1,2}|u[0-9A-Fa-f]{1,4}|U[0-9A-Fa-f]{1,8}|[0-7]{1,3}|c[\s\S]|[\s\S])/g, (all, e: string) => {
 		if (/^[xuU]/.test(e) && e.length > 1) return point(Number.parseInt(e.slice(1), 16));
 		if (/^[0-7]/.test(e)) return String.fromCharCode(Number.parseInt(e, 8) & 0xff);
 		if (e[0] === "c" && e.length === 2) return String.fromCharCode(e.charCodeAt(1) & 31);
 		return named[e] ?? all;
 	});
+	const nul = decoded.indexOf("\0");
+	return nul < 0 ? decoded : decoded.slice(0, nul);
+}
+
+const GLOB = new Set(["*", "?", "["]);
+const SPECIAL = new Set(["*", "?", "[", "]", "\\", "{", "}", "!"]);
+
+/** A word as the shell reads it: its text, and when unquoted glob characters make it a pattern, the pattern. */
+export interface Word {
+	text: string;
+	/** A glob pattern with the word's quoted characters escaped (\*): the shell expands it to matching names. */
+	pattern?: string;
 }
 
 /**
- * A word's text as the program receives it, or undefined when more than the text decides it: a variable, a command,
- * process or arithmetic substitution, an extended glob, brace expansion, or (in zsh) a leading "=".
+ * A word as the program receives it, or undefined when more than its text and the names it matches decide it: a
+ * variable, a command, process or arithmetic substitution, an extended glob, brace expansion, a "~user" home, or
+ * (in zsh) a leading "=". `assignment`: the value of NAME=value, where a ~ after = or : expands too.
  */
-export function literal(word: Node): string | undefined {
-	let text = "";
-	// The word with quoted characters masked, to see what the shell itself would expand.
-	let shape = "";
+export function wordOf(word: Node, assignment = false): Word | undefined {
+	// Each character with whether the shell treats it as quoted.
+	const chars: { c: string; quoted: boolean }[] = [];
 	for (const part of word?.parts ?? []) {
 		if (part.type === "Lit") {
-			const value = String(part.value).replace(/\\([\s\S])/g, (_, c: string) => (c === "\n" ? "" : c));
-			text += value;
-			shape += String(part.value);
+			const raw = String(part.value);
+			for (let i = 0; i < raw.length; i++) {
+				if (raw[i] === "\\" && i + 1 < raw.length) {
+					i++;
+					if (raw[i] !== "\n") chars.push({ c: raw[i]!, quoted: true });
+				} else chars.push({ c: raw[i]!, quoted: false });
+			}
 		} else if (part.type === "SglQuoted") {
-			const value = part.dollar ? ansiC(String(part.value)) : String(part.value);
-			text += value;
-			shape += "q".repeat(value.length);
+			for (const c of part.dollar ? ansiC(String(part.value)) : String(part.value)) chars.push({ c, quoted: true });
 		} else if (part.type === "DblQuoted" && !part.dollar) {
 			for (const inner of part.parts ?? []) {
 				if (inner.type !== "Lit") return undefined;
-				const value = String(inner.value).replace(/\\([$`"\\\n])/g, (_, c: string) => (c === "\n" ? "" : c));
-				text += value;
-				shape += "q".repeat(value.length);
+				for (const c of String(inner.value).replace(/\\([$`"\\\n])/g, (_, x: string) => (x === "\n" ? "" : x))) chars.push({ c, quoted: true });
 			}
 		} else return undefined;
 	}
+	const text = chars.map((x) => x.c).join("");
+	const shape = chars.map((x) => (x.quoted ? "q" : x.c)).join("");
 	if (/\{[^{}]*(,|\.\.)[^{}]*\}/.test(shape) || /^=\w/.test(shape)) return undefined;
-	return text;
+	// "~" alone or "~/..." is the home folder (resolved where paths are judged); "~user", "~+" and "~-" aren't text.
+	if (shape.startsWith("~") && !/^~(\/|$)/.test(shape)) return undefined;
+	if (assignment && /(^|:)~/.test(shape)) return undefined;
+	const glob = chars.some((x, i) => !x.quoted && GLOB.has(x.c) && (x.c !== "[" || chars.slice(i + 1).some((y) => !y.quoted && y.c === "]")));
+	if (!glob) return { text };
+	const pattern = chars.map((x) => (x.quoted && SPECIAL.has(x.c) ? `\\${x.c}` : x.c)).join("");
+	return { text, pattern };
+}
+
+/** A word's text when it is plain text: no expansion, and no glob pattern either. */
+export function literal(word: Node): string | undefined {
+	const w = wordOf(word);
+	return w && !w.pattern ? w.text : undefined;
 }
 
 /**
@@ -124,19 +157,22 @@ export function plainCommands(line: string): Simple[] | undefined {
 		if (cmd?.type === "BinaryCmd" && SEQUENCES.has(cmd.op)) return !redirects.length && !stmt.background && statement(cmd.x) && statement(cmd.y);
 		if (cmd && cmd.type !== "CallExpr") return false;
 		const words: string[] = [];
+		const patterns: (string | undefined)[] = [];
 		for (const w of cmd?.args ?? []) {
-			const text = literal(w);
-			if (text === undefined) return false;
-			words.push(text);
+			const read = wordOf(w);
+			if (read === undefined) return false;
+			words.push(read.text);
+			patterns.push(read.pattern);
 		}
 		const assigns: Simple["assigns"] = [];
 		for (const a of cmd?.assigns ?? []) {
 			if (a.append || a.index || a.array || a.naked || !a.name) return false;
-			const value = a.value ? literal(a.value) : "";
+			const read = a.value ? wordOf(a.value, true) : { text: "" };
+			const value = read && !read.pattern ? read.text : undefined;
 			if (value === undefined) return false;
 			assigns.push({ name: String(a.name.value), value });
 		}
-		out.push({ assigns, words, redirects, background: Boolean(stmt.background) });
+		out.push({ assigns, words, patterns, redirects, background: Boolean(stmt.background) });
 		return true;
 	};
 	for (const stmt of file.stmts ?? []) if (!statement(stmt)) return undefined;
@@ -156,8 +192,13 @@ export function everyCommand(line: string): { commands: AnyCommand[]; heredocs: 
 	const visit = (node: Node): void => {
 		if (Array.isArray(node)) return node.forEach(visit);
 		if (!node || typeof node !== "object") return;
-		if (node.type === "CallExpr") commands.push({ words: (node.args ?? []).map(literal) });
+		if (node.type === "CallExpr") {
+			const read = (node.args ?? []).map((w: Node) => wordOf(w));
+			commands.push({ words: read.map((w: Word | undefined) => w?.text), patterns: read.map((w: Word | undefined) => w?.pattern), assigns: (node.assigns ?? []).map((a: Node) => String(a.name?.value ?? "")) });
+		}
 		if (node.type === "FuncDecl") functions = true;
+		// export, declare, local, readonly: the variables they set count like ones set in front of a command.
+		if (node.type === "DeclClause") commands.push({ words: [], patterns: [], assigns: (node.args ?? []).map((a: Node) => String(a.name?.value ?? "")) });
 		if (node.type === "Redirect" && node.hdoc) heredocs.push(rawText(node.hdoc));
 		for (const value of Object.values(node)) if (value && typeof value === "object") visit(value);
 	};

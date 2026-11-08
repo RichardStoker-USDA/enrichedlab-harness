@@ -4,10 +4,10 @@
 // pixi comes from PATH, or is downloaded once into ~/.el/tools and checked against the hashes below.
 
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { contained } from "../tools/workspace.ts";
+import { contained, physical } from "../tools/workspace.ts";
 
 export const PIXI_VERSION = "0.82.0";
 
@@ -57,14 +57,20 @@ export const hasEnvironment = (dir: string): boolean => existsSync(join(dir, "pi
  */
 export async function inEnvironment(dir: string, command: string[], tools: string, log: (line: string) => void): Promise<string[]> {
 	const program = await pixi(tools, log);
-	const manifest = join(dir, "pixi.toml");
+	// The app's own folder, where it really is, holding its own manifest: not a link to somewhere else.
+	const home = physical(dir);
+	if (lstatSync(dir, { throwIfNoEntry: false })?.isSymbolicLink() || !statSync(home, { throwIfNoEntry: false })?.isDirectory()) throw new Error("The app's folder is a link or missing, so its environment wasn't built.");
+	for (const name of ["pixi.toml", "pixi.lock"]) if (lstatSync(join(home, name), { throwIfNoEntry: false })?.isSymbolicLink()) throw new Error(`The app's ${name} is a link, so its environment wasn't built.`);
+	const manifest = join(home, "pixi.toml");
 	log(existsSync(join(dir, "pixi.lock")) ? "Checking the app's environment" : "Building the app's environment (first run takes a few minutes)");
 	// pixi keeps conda packages, repodata and its uv cache under PIXI_CACHE_DIR.
 	const caches = join(tools, "pixi-cache");
 	mkdirSync(caches, { recursive: true });
 	const env: Record<string, string> = { PIXI_NO_PATH_UPDATE: "1", PIXI_CACHE_DIR: caches, PIXI_HOME: caches };
 	for (const key of ["PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "SYSTEMROOT", "SSL_CERT_FILE", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY"]) if (process.env[key]) env[key] = process.env[key]!;
-	const launch = contained(program, ["install", "--manifest-path", manifest], { writable: [dir, caches], readable: [program], network: "all" });
+	const launch = contained(program, ["install", "--manifest-path", manifest], { writable: [home, caches], readable: [program], network: "all" });
+	// Build scripts never run uncontained: without a facility here, nothing is installed (the consent card says contained).
+	if (!launch.facility) throw new Error("This computer has no sandbox to contain the app's install (Seatbelt on macOS, bubblewrap on Linux), so nothing was installed.");
 	// From a scratch folder: some packages' install scripts write test files where they run, and the app's folder
 	// is watched for edits.
 	const install = Bun.spawn([launch.file, ...launch.args], { cwd: tmpdir(), stdout: "pipe", stderr: "pipe", env });

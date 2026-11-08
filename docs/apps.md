@@ -29,7 +29,10 @@ inside that environment, contained; `$PORT` in a served app's command is its por
 The agent's `environment` tool gives a project its own pixi environment: `pixi.toml` and `pixi.lock` in the project,
 the packages in its `.pixi` folder. It can list, add (conda-forge, or PyPI with `pypi: true`), remove, update and
 sync, for the project or for one app's folder (`folder: "apps/<name>"`). The install is contained the same way as an
-app's: it may write the project and pixi's own caches under `~/.el/tools`, and it gets no keys or tokens. Contained
+app's: it may write the project and pixi's own caches under `~/.el/tools`, and it gets no keys or tokens. Where this
+computer can't contain it (no Seatbelt or bubblewrap), nothing installs, for a project or an app. The folder is
+checked again before every pixi run, and `pixi.toml` and `pixi.lock` must be the project's own files, not links;
+a new `pixi.toml` is made without following a link. Contained
 shell commands then run inside that environment: its programs come first on PATH and `CONDA_PREFIX` is set. A command
 run outside the sandbox never gets it, so a program the project holds can't stand in for the system's there. Package
 names can't be options (they start with a letter or digit, after `--`), and listing never downloads pixi. Each project

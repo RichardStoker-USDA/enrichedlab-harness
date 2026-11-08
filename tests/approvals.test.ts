@@ -219,21 +219,25 @@ describe("approvals", () => {
 		const again = await reproduceStep(out, call["@id"] as string);
 		expect(again).toMatchObject({ same: ["copy.txt"], differ: [], extra: [], exitCode: 0 });
 		// Replay runs in its own scratch folder with a few plain variables: nothing inherited, no system temp folder.
-		process.env.EL_REPLAY_SECRET_codetest = "inherited";
+		// The variable's name is one no secret filter would drop, so only the allowlist keeps it out.
+		process.env.EL_REPLAY_INHERIT_PROBE = "inherited";
 		try {
-			const probe = { ...call, "@id": "#call-probe", "https://enrichedlab.org/contract/2026-11/terms#command": "test -z \"$EL_REPLAY_SECRET_codetest\" || exit 7; echo x > /tmp/el-replay-escape-codetest; true" };
+			const probe = { ...call, "@id": "#call-probe", "https://enrichedlab.org/contract/2026-11/terms#command": "if echo x > /tmp/el-replay-escape-codetest 2>/dev/null; then exit 9; fi; test -z \"$EL_REPLAY_INHERIT_PROBE\" || exit 7" };
 			const meta = join(out, "ro-crate-metadata.json");
 			const original = readFileSync(meta, "utf8");
 			writeFileSync(meta, JSON.stringify({ ...JSON.parse(original), "@graph": [...graph, probe] }));
 			const replay = await reproduceStep(out, "#call-probe");
 			expect(replay.exitCode).toBe(0);
 			expect(existsSync("/tmp/el-replay-escape-codetest")).toBe(false);
-			// A malformed content id isn't counted as checked.
+			// A malformed content id isn't counted as checked, and an id must name the kind of object it says.
 			writeFileSync(meta, JSON.stringify({ ...JSON.parse(original), "@graph": [...graph, { "@id": "#bad", "@type": "File", identifier: "git-blob:not-a-hash" }] }));
+			expect(verifyPackage(out).find((row) => row.check === "content ids")).toMatchObject({ ok: false });
+			const blob = (graph.find((e) => typeof e.identifier === "string" && (e.identifier as string).startsWith("git-blob:"))!.identifier as string).slice(9);
+			writeFileSync(meta, JSON.stringify({ ...JSON.parse(original), "@graph": [...graph, { "@id": "#kind", "https://enrichedlab.org/contract/2026-11/terms#historyBefore": blob }] }));
 			expect(verifyPackage(out).find((row) => row.check === "content ids")).toMatchObject({ ok: false });
 			writeFileSync(meta, original);
 		} finally {
-			delete process.env.EL_REPLAY_SECRET_codetest;
+			delete process.env.EL_REPLAY_INHERIT_PROBE;
 			rmSync("/tmp/el-replay-escape-codetest", { force: true });
 		}
 		// A file changed after packaging fails its checksum.

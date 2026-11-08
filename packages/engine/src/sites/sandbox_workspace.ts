@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { posix } from "node:path";
 import type { Entry, ExecResult, Workspace } from "../tools/workspace.ts";
-import { FENCE_PY } from "./sandbox_fence.ts";
+import { fencedCommand, probeCommand } from "./sandbox_fence.ts";
 
 /** What a site's sandbox offers. Gate implements it; other lab adapters will too. */
 export interface SandboxApi {
@@ -44,6 +44,36 @@ export interface SandboxCheckpoints {
 
 /** Quote for the sandbox's POSIX shell. */
 export const shq = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`;
+
+/** A word for the fence check: its text, and its glob pattern when the shell expands it (shell_syntax.ts). */
+export type FenceWord = { text: string; pattern?: string };
+
+/**
+ * A glob pattern (quoted characters escaped with \) as an unquoted bash word that expands the same way: every
+ * character escaped except the glob's own (* ? [ ], and ! ^ - inside brackets) and /.
+ */
+export function bashPattern(pattern: string): string {
+	let out = "";
+	let bracket = false;
+	for (let i = 0; i < pattern.length; i++) {
+		const c = pattern[i]!;
+		if (c === "\\" && i + 1 < pattern.length) {
+			out += `\\${pattern[++i]}`;
+			continue;
+		}
+		if (!bracket && (c === "*" || c === "?" || c === "/")) out += c;
+		else if (!bracket && c === "[") {
+			bracket = true;
+			out += c;
+			if (pattern[i + 1] === "!" || pattern[i + 1] === "^") out += pattern[++i];
+		} else if (bracket && c === "]") {
+			bracket = false;
+			out += c;
+		} else if (bracket && /[A-Za-z0-9_.,:-]/.test(c)) out += c;
+		else out += c === "\n" ? "'\n'" : `\\${c}`;
+	}
+	return out;
+}
 
 // Raw bytes per exec: its base64 (16 KB) stays under what labs take in one command (one refused about 36 KB with a
 // misleading "sandboxes aren't available"). Larger files go through the lab's file upload.
@@ -93,9 +123,11 @@ export class SandboxWorkspace implements Workspace {
 
 	/** Make the project folder and see whether the file fence holds here; once. */
 	prepare(): Promise<void> {
-		this.ready ??= this.api.run(`mkdir -p ${shq(this.root)} && cd ${shq(this.root)} && { command -v python3 >/dev/null 2>&1 && python3 -I -c ${shq(FENCE_PY)} probe || echo "el-fence no"; }`, 60).then((r) => {
+		// A fresh code each time: only the probe itself can print it, not a shell startup file or a stray line.
+		const nonce = randomBytes(12).toString("hex");
+		this.ready ??= this.api.run(`mkdir -p ${shq(this.root)} && cd ${shq(this.root)} && { ${probeCommand(nonce, shq)}; }`, 60).then((r) => {
 			if (r.exitCode !== 0 && !/el-fence/.test(r.stdout)) throw new Error(`Couldn't make ${this.root} in the ${this.api.title} sandbox: ${r.stderr || r.stdout}`);
-			this.fenceHolds = /^el-fence ok\b/m.test(r.stdout);
+			this.fenceHolds = r.stdout.split("\n").some((line) => line.startsWith(`el-fence ok ${nonce} `));
 		});
 		// A failed start is tried again next time.
 		this.ready.catch(() => (this.ready = undefined));
@@ -112,6 +144,8 @@ export class SandboxWorkspace implements Workspace {
 	}
 
 	inside(path: string): boolean {
+		// The sandbox shell expands ~ to its home folder, which isn't the project.
+		if (path === "~" || path.startsWith("~/")) return false;
 		const full = this.resolve(path);
 		return full === this.root || full.startsWith(`${this.root}/`);
 	}
@@ -174,13 +208,22 @@ export class SandboxWorkspace implements Workspace {
 			? ""
 			: `__el_d=$(realpath -m -- ${shq(posix.dirname(full))}) && case "$__el_d/" in "$(pwd -P)/"*) ;; *) echo ${shq(`${this.display(full)} leads outside the project (a link on the way); nothing was written.`)} >&2; exit 3;; esac && `;
 		const dir = shq(posix.dirname(full));
+		// Where the fence holds, each step runs under it, so nothing it makes or replaces can land outside the project
+		// whatever a link on the way does; the folder check above still refuses early.
+		await this.prepare();
+		const fence = this.fenced && !options.outside;
+		const step = (command: string, seconds: number) => this.run(fence ? fencedCommand(this.root, command, shq) : command, seconds);
 		const upload = async () => {
 			const scratch = await mkdtemp(join(tmpdir(), "enrichedlab-write-"));
 			try {
 				const local = join(scratch, `${randomBytes(4).toString("hex")}-${posix.basename(full)}`);
 				await writeFile(local, bytes);
 				const placed = await this.api.put(local);
-				const r = await this.run(`${guard}mkdir -p ${dir} && mv -fT -- ${shq(placed.path)} ${shq(full)}`, 120);
+				// Copied in (a move out of the upload folder is a removal there, which the fence refuses), then the upload
+				// goes, outside the fence: it's EnrichedLab's own.
+				const temp = `${full}.${randomBytes(3).toString("hex")}.part`;
+				const r = await step(`${guard}mkdir -p ${dir} && cp -- ${shq(placed.path)} ${shq(temp)} && mv -fT -- ${shq(temp)} ${shq(full)}`, 120);
+				await this.run(`rm -f -- ${shq(placed.path)}`, 30).catch(() => undefined);
 				if (r.exitCode !== 0) throw new Error(r.stderr.trim() || `Can't write ${this.display(full)}.`);
 			} finally {
 				await rm(scratch, { recursive: true, force: true });
@@ -191,29 +234,30 @@ export class SandboxWorkspace implements Workspace {
 		for (let offset = 0, first = true; first || offset < bytes.length; offset += PIECE, first = false) {
 			const piece = bytes.subarray(offset, offset + PIECE).toString("base64");
 			// A lab that refuses the command itself (not the shell failing in it) gets the file by upload instead.
-			const r = await this.run(`${guard}mkdir -p ${dir} && printf %s ${shq(piece)} | base64 -d ${first ? ">" : ">>"} ${shq(temp)}`, 60).catch(() => undefined);
+			const r = await step(`${guard}mkdir -p ${dir} && printf %s ${shq(piece)} | base64 -d ${first ? ">" : ">>"} ${shq(temp)}`, 60).catch(() => undefined);
 			if (!r) {
-				await this.run(`rm -f -- ${shq(temp)}`, 30).catch(() => undefined);
+				await step(`rm -f -- ${shq(temp)}`, 30).catch(() => undefined);
 				return upload();
 			}
 			if (r.exitCode !== 0) throw new Error(r.stderr.trim() || `Can't write ${this.display(full)}.`);
 		}
-		const done = await this.run(`${guard}mv -fT -- ${shq(temp)} ${shq(full)}`, 30);
+		const done = await step(`${guard}mv -fT -- ${shq(temp)} ${shq(full)}`, 30);
 		if (done.exitCode !== 0) throw new Error(done.stderr.trim() || `Can't write ${this.display(full)}.`);
 	}
 
-	async exec(command: string, options: { timeoutMs: number; signal: AbortSignal; onOutput?: (text: string) => void; fence?: string[] }): Promise<ExecResult> {
+	async exec(command: string, options: { timeoutMs: number; signal: AbortSignal; onOutput?: (text: string) => void; fence?: FenceWord[] }): Promise<ExecResult> {
 		// Fenced: under Landlock, writes land only in the project and temp folders (sandbox_fence.ts); a sandbox where the
 		// fence doesn't hold runs nothing fenced.
 		if (options.fence) {
 			await this.prepare();
-			if (!this.fenced) return { exitCode: 125, output: "This sandbox can't fence commands (it needs Landlock and python3), so it didn't run. Ask the person to run it.", timedOut: false };
+			if (!this.fenced) return { exitCode: 125, output: "This sandbox can't fence commands (it needs Landlock ABI 3 or later and a root-owned /usr/bin/python3), so it didn't run. Ask the person to run it.", timedOut: false };
 		}
-		// And each named path must lead inside the project once links are followed, or nothing runs.
+		// And each named path (each name a glob word matches, expanded here as the command's shell will) must lead
+		// inside the project once links are followed, or nothing runs.
 		const words = options.fence?.length
-			? `__el_root=$(pwd -P); for __el_p in ${options.fence.map(shq).join(" ")}; do __el_r=$(realpath -m -- "$__el_p" 2>/dev/null || readlink -f -- "$__el_p" 2>/dev/null); case "$__el_r" in "$__el_root"|"$__el_root"/*) ;; *) echo "EnrichedLab: $__el_p leads outside the project; a command that reaches there needs the person's yes." >&2; exit 126;; esac; done; `
+			? `__el_root=$(pwd -P); for __el_p in ${options.fence.map((w) => (w.pattern ? bashPattern(w.pattern) : shq(w.text))).join(" ")}; do __el_r=$(realpath -m -- "$__el_p" 2>/dev/null || readlink -f -- "$__el_p" 2>/dev/null); case "$__el_r" in "$__el_root"|"$__el_root"/*) ;; *) echo "EnrichedLab: $__el_p leads outside the project; a command that reaches there needs the person's yes." >&2; exit 126;; esac; done; `
 			: "";
-		const body = options.fence ? `python3 -I -c ${shq(FENCE_PY)} run "$(pwd -P)" bash -c ${shq(command)}` : command;
+		const body = options.fence ? fencedCommand(this.root, command, shq) : command;
 		// One group after the cd, so nothing in it runs if the cd fails.
 		const r = await this.run(options.fence ? `{ ${words}${body}\n}` : command, Math.max(1, Math.round(options.timeoutMs / 1000)), options.signal);
 		const output = [r.stdout, r.stderr].filter(Boolean).join(r.stdout && r.stderr ? "\n" : "");

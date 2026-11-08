@@ -3,11 +3,12 @@
 // another project, the install is contained, and pixi.toml with pixi.lock records exactly what is there, so step
 // history can take a change back and a lab can build the same environment.
 
-import { existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { closeSync, constants, existsSync, lstatSync, mkdirSync, readFileSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { pixi, pixiPresent } from "../apps/environments.ts";
 import { type Tool, ToolError } from "./types.ts";
+import { openPhysical } from "./anchored.ts";
 import { contained, physical } from "./workspace.ts";
 
 /** Where a lab's vetted packages come from (its descriptor's `packages`). */
@@ -31,8 +32,8 @@ export function manifest(name: string, sources?: PackageSources): string {
 }
 
 /** Each installed package and its version, from `pixi list`. */
-async function installed(program: string, root: string, env: Record<string, string>): Promise<Map<string, string>> {
-	const out = await run(program, ["list", "--json", "--manifest-path", join(root, "pixi.toml")], root, env, () => undefined).catch(() => "[]");
+async function installed(program: string, root: string, env: Record<string, string>, check: () => void): Promise<Map<string, string>> {
+	const out = await run(program, ["list", "--json", "--manifest-path", join(root, "pixi.toml")], root, env, () => undefined, check).catch(() => "[]");
 	const list = new Map<string, string>();
 	try {
 		for (const p of JSON.parse(out) as { name: string; version: string }[]) list.set(p.name, p.version);
@@ -43,7 +44,9 @@ async function installed(program: string, root: string, env: Record<string, stri
 }
 
 /** Run pixi contained: it may write the project (pixi.toml, pixi.lock, .pixi) and its own caches, and reach the indexes. */
-async function run(program: string, args: string[], root: string, env: Record<string, string>, log: (line: string) => void): Promise<string> {
+async function run(program: string, args: string[], root: string, env: Record<string, string>, log: (line: string) => void, check: () => void): Promise<string> {
+	// The folder is judged again right before each launch: one moved during an earlier step isn't granted.
+	check();
 	const caches = env.PIXI_CACHE_DIR!;
 	const launch = contained(program, args, { writable: [root, caches], readable: [program], network: "all" });
 	// Package install scripts never run uncontained: no facility here, no install.
@@ -111,30 +114,36 @@ export const environmentTool: Tool<{ action: Action; packages?: string[]; pypi?:
 		const made = !existsSync(file);
 		if (made) {
 			if (args.action === "list" || args.action === "remove") return { ok: true, content: "This project has no environment yet. Add packages to make one." };
-			writeFileSync(file, manifest(basename(root).replace(/[^A-Za-z0-9_-]/g, "-") || "project", ctx.packages));
+			// Made new where the folder really is, never through a link: an existing file or link there refuses it.
+			const fd = openPhysical(file, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o644);
+			try {
+				writeSync(fd, manifest(basename(root).replace(/[^A-Za-z0-9_-]/g, "-") || "project", ctx.packages));
+			} finally {
+				closeSync(fd);
+			}
 		}
 		const manifestPath = ["--manifest-path", file];
-		const before = made ? new Map<string, string>() : await installed(program, root, env);
+		const before = made ? new Map<string, string>() : await installed(program, root, env, pinned);
 		const log = (line: string) => ctx.output(`${line}\n`);
 		pinned();
 		switch (args.action) {
 			case "list":
 				break;
 			case "add":
-				await run(program, ["add", ...(args.pypi ? ["--pypi"] : []), ...manifestPath, "--", ...packages], root, env, log);
+				await run(program, ["add", ...(args.pypi ? ["--pypi"] : []), ...manifestPath, "--", ...packages], root, env, log, pinned);
 				break;
 			case "remove":
-				await run(program, ["remove", ...(args.pypi ? ["--pypi"] : []), ...manifestPath, "--", ...packages], root, env, log);
+				await run(program, ["remove", ...(args.pypi ? ["--pypi"] : []), ...manifestPath, "--", ...packages], root, env, log, pinned);
 				break;
 			case "update":
-				await run(program, ["update", ...manifestPath, "--", ...packages], root, env, log);
+				await run(program, ["update", ...manifestPath, "--", ...packages], root, env, log, pinned);
 				break;
 			case "sync":
-				await run(program, ["install", ...manifestPath], root, env, log);
+				await run(program, ["install", ...manifestPath], root, env, log, pinned);
 				break;
 		}
-		if (args.action !== "list") await run(program, ["install", ...manifestPath], root, env, log);
-		const after = await installed(program, root, env);
+		if (args.action !== "list") await run(program, ["install", ...manifestPath], root, env, log, pinned);
+		const after = await installed(program, root, env, pinned);
 		const sources = /channels\s*=\s*\[([^\]]*)\]/.exec(readFileSync(file, "utf8"))?.[1]?.replace(/"/g, "").trim() || "conda-forge";
 		const where = args.folder ?? "the project";
 		if (args.action === "list") {

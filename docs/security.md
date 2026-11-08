@@ -42,7 +42,7 @@ beside its model (`permissions.mode` in config.json, `session.permissions` over 
 | --- | --- | --- |
 | Ask Before Changes (`ask`) | reads in the project, contained commands that stay in it | file changes, other commands, new hosts |
 | Ask When It Can't Be Undone (`auto`, the default) | also file changes in a folder the person let it change | commands outside the containment, new hosts, changes outside the folder, signed-in browser actions, memory and skills |
-| Allow Everything (`full`) | everything | pushes, lines whose program only expansion names, and unreviewed lab tools |
+| Allow Everything (`full`) | everything | pushes, lines that could push unseen, and unreviewed lab tools |
 
 `auto` rests on history: what runs without asking is what the session's history can take back
 ([history.md](history.md)), so when a folder's history can't be kept (its store fails), the session asks as `ask`
@@ -56,9 +56,17 @@ Changes in this folder", which saves the same answer.
 event), so it outlasts a restart. A command is remembered per program it runs (`touch`, `rm`, `git commit`), so
 `python3 a.py | grep x` and `python3 b.py | grep y` share an answer. Lines are read the way the shell reads them:
 mvdan/sh's bash parser (compiled to WebAssembly, through `sh-syntax`) gives each command the words it receives
-once quotes and escapes are done (`$'\x67it'` is `git`, a quote after `#` is a comment), and a word is text only
-when nothing expands, substitutes or globs a brace list in it (`tools/shell_syntax.ts`). A line that doesn't parse
-asks. A program named by its full path is remembered by that path. A line is remembered exactly when its words
+once quotes and escapes are done (`$'\x67it'` is `git`, `$'git\0x'` is `git`, a quote after `#` is a comment), and a
+word is text only when nothing expands or substitutes in it: no variable, substitution, brace list or `~user`
+(`tools/shell_syntax.ts`). A glob word (`*`, `?`, `[..]`) is judged by the names it matches: on this computer
+they are listed at decision time and each must be inside the project, links followed; in a fenced lab sandbox each
+is checked just before the command runs. A glob part that starts with a dot (`.?`, `.*`) could reach `..`, so it
+asks. Commands run in the system's `/bin/bash`, whatever `$SHELL` says, without `BASH_ENV`, `ENV`, `ZDOTDIR`, shell
+options, trace or prompt hooks, `CDPATH` or functions passed in, so what runs is the line that was read. git counts
+as read-only only when the repository's own settings make no read command run a program (`core.fsmonitor`, diff
+and filter drivers, signature checks); the person's global settings are their own. A version check
+(`--version`, `-V`) counts only for a program found on PATH. A program named by its full path is remembered by that
+path. A line is remembered exactly when its words
 don't show everything it runs: substitutions, process
 substitution, here-documents, subshells, groups and functions, control flow, a program named by a variable or a
 relative path, options before a subcommand (`git -C dir reset`), output written to a file, a program that runs
@@ -66,11 +74,16 @@ what follows it (`sudo`, `ssh`, `env`, `timeout`, `xargs`, `eval`, `source`), or
 change which program runs or what it loads. That is judged broadly: a toolchain's own prefix (`PHP*`, `PYTHON*`,
 `GIT_*`, `LD_*`, `DYLD_*`, `NODE*`), or any part of the name that says path, folder, library, config, startup or
 command (`PATH`, `DIR`, `LIB`, `INI`, `RC`, `CONFIG`, `OPTS`, `PRELOAD`, `CMD`). Data variables in front
-(`SEED=42 python3 run.py`) share the program's answer. A push asks every time, however it's quoted or encoded
-(`git 'push'`, `$'\x67it' $'\x70ush'`, a continued line), anywhere in the line, including code handed to `eval`
-or `sh -c` and here-documents, and so does a line where git or push sits beside a function, alias or sourced file.
-A line whose program only expansion names (`$C a`, `git $ACTION`, `eval "$CMD"`, `curl x | bash`) could push
-unseen, so it asks even in `full`. File edits share one answer; each other kind of change (a
+(`SEED=42 python3 run.py`) share the program's answer. A push asks every time, however it's quoted, encoded or
+globbed (`git 'push'`, `$'\x67it' $'\x70ush'`, `/usr/bin/g[i]t p[u]sh`, a continued line), anywhere in the line,
+including code handed to `eval` or a shell (directly or through `env`, `timeout`, `nice`, `xargs` and the like) and
+here-documents, and so does a line where git or push sits beside a function, alias or sourced file. A line that
+could push unseen asks every time too, in every mode, and its answer is never remembered (a file or variable it
+reads can change without the line changing): a program named by expansion or a glob (`$C a`, `$(cat cmd.txt)`),
+git given an expanded word, a word after git that isn't one of git's own commands (an alias, from settings a file
+edit can change), a git setting that runs a program (`-c alias.*`, `-c core.sshCommand=...`, `GIT_*` set in front or
+exported), code for `eval` or a shell that expands or arrives on its input (`curl x | env bash`), or a line that
+doesn't parse. A lab's own command tools pass the same check. File edits share one answer; each other kind of change (a
 click or typing in the browser, a new app, a memory or skill, a filled PDF, a sandbox download) has its own, and asks
 in every mode until allowed. Session answers hold where they were given: a move to a lab or back, or a "Try Again"
 session, starts them over. Folder answers apply to what a change lands on, by the folder's real path (symlinks
@@ -79,20 +92,31 @@ Windows; and the disk's own letter case), so a read-only folder inside one that 
 answer to allow changes is saved with the folder's identity on disk. If a part of its path later becomes a link, or
 another folder takes its place, the answer no longer applies there and the question comes back; answers saved
 before identities (0.2.30) ask once more. Every call is decided again just before it runs, and a file write lands
-on the real path it was judged for, never following a link at the end, checked again once the file is open.
+on the real path it was judged for: its folders are made and the file opened without following a link anywhere on
+the way (`tools/anchored.ts`: `O_NOFOLLOW_ANY` on macOS, a folder-by-folder `openat` walk on Linux), so a folder
+swapped for a link after the check makes the write fail instead of landing elsewhere.
 Without step history (its store failed), a contained command that changes things asks too. A session
 keeps the mode it started with; a subagent asks as much as the session that started it. A session's own worktree
 runs file edits. In a lab's sandbox, commands and file
 edits inside the project run without asking: the sandbox is a separate machine with no network, and its work comes
-home as a branch the person merges. There the fence is Linux Landlock (`sites/sandbox_fence.ts`): a short Python
-program fences the command before it starts, so it and everything it runs can write, make or remove files only in
-the project, the temp folders (`/tmp`, `/var/tmp`, `/dev/shm`) and device files such as `/dev/null`, whatever a script
-or interpreter does. Reading isn't fenced. Before the first decision the sandbox is probed once: a child process
-fences itself and must fail to write outside its folder. A sandbox where that fails (an old kernel, no `python3`)
-runs no command unasked. A fenced command runs on the same terms as a contained one on this computer: it names no
-path outside the project, and every named path must also lead inside once links are followed (`realpath -m`). A
-file edit in the sandbox checks where its folder leads the same way before anything is made, and replaces a link at
-the end instead of following it. A lab's own command tools (`<lab>_sandbox_run`, `<lab>_sandbox_job_start`) run
+home as a branch the person merges. There the fence is Linux Landlock, ABI 3 or later (`sites/sandbox_fence.ts`):
+the system's own `/usr/bin/python3` (root-owned, writable by no one else) fences the command, then starts it with
+`/bin/bash` and the shell startup variables removed. It and everything it runs can write, truncate, make, rename,
+link or remove files only in the project (anchored to the folder the command starts in, which must be the folder
+named, so a renamed or swapped project is refused), in a temp folder made for that command (`TMPDIR`, removed
+after), and on `/dev/null`, `/dev/zero`, `/dev/full` and `/dev/tty`, whatever a script or interpreter does. Where the
+kernel has them (ABI 4 and 6), TCP connections and binds, signals to processes outside the fence and abstract
+sockets are refused too. Reading isn't fenced, and file modes, owners and times aren't covered by Landlock: a
+command can't change another project's files, but it could `chmod` them. Before the first decision the sandbox is
+probed once with a fresh code: a child fences itself and must fail to truncate, write, create, remove, rename into
+or link in a folder outside, and only a line carrying that code counts. A sandbox where that fails (an older
+kernel, no root-owned `python3`) runs no command unasked. A fenced command runs on the same terms as a contained one
+on this computer: it names no path outside the project, and every named path (every name a glob matches, expanded
+there) must also lead inside once links are followed (`realpath -m`). Read-only commands run under the fence too.
+File edits in the sandbox run under it as well, after a check of where their folder leads, and replace a link at
+the end instead of following it. `full` and Discovery mode don't fence (the person let the session act outside the
+project), and in `auto` a sandbox whose whole disk is checkpointed runs changes unfenced, because the disk can be
+put back. A lab's own command tools (`<lab>_sandbox_run`, `<lab>_sandbox_job_start`) run
 outside any project: read-only commands run (a version check only for a program found on PATH, never one the
 project holds), and the rest ask, remembered per program apart from this computer's answers.
 Commands that change lab data outside the project ask, unless the lab checkpoints the whole sandbox disk

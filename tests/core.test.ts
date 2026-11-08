@@ -45,9 +45,15 @@ const say = (text: string, calls?: { id: string; name: string; args: string }[])
 const tool = (callId: string, content: string, handle?: string): SessionEvent => ({ t: "tool", id: `e${n++}`, at, callId, name: "read", ok: true, content, handle });
 
 
+/** What a sandbox where Landlock holds prints for the fence probe: its one-time code back. */
+function probeAnswer(command: string): string {
+	const nonce = /probe '([0-9a-f]+)'/.exec(command)?.[1];
+	return nonce ? `el-fence ok ${nonce} abi 6\n` : "";
+}
+
 /** A lab sandbox whose fence probe reports that Landlock holds. */
 async function fencedLab(): Promise<SandboxWorkspace> {
-	const api = { title: "Field Lab", run: async (c: string) => ({ exitCode: 0, stdout: c.includes(" probe") ? "el-fence ok abi 6\n" : "", stderr: "" }) } as unknown as SandboxApi;
+	const api = { title: "Field Lab", run: async (c: string) => ({ exitCode: 0, stdout: probeAnswer(c), stderr: "" }) } as unknown as SandboxApi;
 	const lab = new SandboxWorkspace(api, "/sandbox/work/project-1");
 	await lab.prepare();
 	return lab;
@@ -129,7 +135,7 @@ describe("shell", () => {
 			"ls -la", "git status && git diff", "rg foo src | head", "cat src/a.txt 2>/dev/null", "node --version",
 			"rg 'a|b' src", "git log --oneline -5", "git branch", "git branch -a", "git config --get user.name",
 			"find src -name '*.ts'", "sort src/a.txt", "fd ts src", "rg -n '/api/v1' src", "git remote -v", "wc -l < src/a.txt",
-		]) expect([c, isReadOnlyCommand(c, [], inside)]).toEqual([c, true]);
+		]) expect([c, isReadOnlyCommand(c, [], inside, { gitSafe: () => true })]).toEqual([c, true]);
 	});
 
 	test("anything that writes, runs a program or substitutes asks", () => {
@@ -444,9 +450,11 @@ describe("permissions", () => {
 		expect(allowKeys(shell, { command: "cd app && FOO=1 python3 a.py 2>&1 | grep -v x" })).toEqual({ keys: ["shell:python3", "shell:grep"], scope: "“python3” and “grep” commands" });
 		expect(allowKeys(shell, { command: "ls 2>/dev/null; make 2>&1 | tee -a log" }).keys).toEqual(["shell:ls", "shell:make", "shell:tee"]);
 		expect(allowKeys(shell, { command: "/usr/bin/touch a" }).keys).toEqual(["shell:/usr/bin/touch"]);
+		// git settings set in front can make git run anything: every time, never remembered.
+		expect(allowKeys(shell, { command: "GIT_SSH_COMMAND=./x git fetch" }).keys).toEqual(["shell!hidden"]);
 		expect(allowKeys(shell, { command: "echo 'a; rm -rf x' | wc -l" }).keys).toEqual(["shell:wc"]);
 		// A variable that changes which program runs, or what it loads, is remembered exactly; others pass data.
-		for (const command of ["PATH=./bin touch scratch", "LD_PRELOAD=./x.so touch a", "NODE_OPTIONS=--require=./x.js node a.js", "CC=./cc make", "GIT_SSH_COMMAND=./x git fetch", "PYTHONPATH=. python3 a.py", "PATH=./bin; touch a"]) {
+		for (const command of ["PATH=./bin touch scratch", "LD_PRELOAD=./x.so touch a", "NODE_OPTIONS=--require=./x.js node a.js", "CC=./cc make", "PYTHONPATH=. python3 a.py", "PATH=./bin; touch a"]) {
 			expect([command, allowKeys(shell, { command }).scope]).toEqual([command, "this exact command"]);
 		}
 		expect(allowKeys(shell, { command: "SEED=42 OMP_NUM_THREADS=8 python3 run.py" }).keys).toEqual(["shell:python3"]);
@@ -471,7 +479,9 @@ describe("permissions", () => {
 			"./tools/touch a", "git -C x reset --hard", "env -S 'rm -rf x'", "echo 'unbalanced",
 			"wc -c <`rm${IFS}-f${IFS}x`", "/usr/bin/env sh -c 'rm x'",
 		])
-			expect([command, allowKeys(shell, { command }).scope]).toEqual([command, "this exact command"]);
+			// Remembered exactly, or (when what runs depends on more than the line) never remembered at all.
+			expect([command, allowKeys(shell, { command }).scope]).toEqual([command, expect.stringMatching(/^this (exact command|command, every time)$/)]);
+		expect(allowKeys(shell, { command: "bash <<EOF" }).scope).toBe("this command, every time");
 		// Read as the shell reads it: a quote after # is a comment, so the rm on the next line is what the answer names.
 		expect(allowKeys(shell, { command: "echo safe # '\nrm -f raw/data.csv\n# '" })).toEqual({ keys: ["shell:rm"], scope: "“rm” commands" });
 		// Once both programs are allowed, a different command using them runs; one adding another program asks.

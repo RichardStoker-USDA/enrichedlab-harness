@@ -38,7 +38,9 @@ is as the present has it, and never through a link, so a link the target brings 
 the folder. The model is told on its next request.
 
 Undo keeps each file it writes over as it is just before (`undo.kept`, beside the session log), so undo can be
-taken back too; a file it can't keep first (over 25 MB, or not a plain file) stays as it is. It puts back files outside the folder from their per-file copies first, while links in the folder still lead where
+taken back too; a file it can't keep first (over 25 MB, or not a plain file) stays as it is. Undo reads, writes and
+removes each file without following a link anywhere on its path (`tools/anchored.ts`), so a folder swapped for a
+link since the check leaves the file alone. It puts back files outside the folder from their per-file copies first, while links in the folder still lead where
 they did, and only where the path still leads to the file that was kept; through a link, it acts on the file the link
 led to. After a move, undo touches nothing where the session was. If a snapshot's list of what it left out can't be
 read, going back stops rather than guess; folders emptied by going back give way to the file that comes back.

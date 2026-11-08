@@ -114,6 +114,8 @@ describe("files written into a lab's sandbox", () => {
 		commands.length = 0;
 		await new SandboxWorkspace(refuseLong(8_000), "/sandbox/work/p").write("app/index.html", page);
 		expect(uploads).toHaveLength(1);
-		expect(commands.at(-1)).toContain("mv -fT -- '/sandbox/in/x' '/sandbox/work/p/app/index.html'");
+		// Copied in beside the file, moved over it (a link at the end is replaced, not followed), then the upload goes.
+		expect(commands.some((c) => c.includes("cp -- '/sandbox/in/x' '/sandbox/work/p/app/index.html.") && /mv -fT -- '\/sandbox\/work\/p\/app\/index\.html\.[0-9a-f]+\.part' '\/sandbox\/work\/p\/app\/index\.html'/.test(c))).toBe(true);
+		expect(commands.at(-1)).toContain("rm -f -- '/sandbox/in/x'");
 	});
 });

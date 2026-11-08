@@ -12,7 +12,7 @@
 import { lstatSync, readlinkSync, realpathSync, statSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import type { FolderAccess, LabConfig, PermissionMode } from "./config.ts";
-import { isReadOnlyCommand, pathsInside } from "./tools/shell.ts";
+import { isReadOnlyCommand, type Judging, pathsInside } from "./tools/shell.ts";
 import { everyCommand, plainCommands } from "./tools/shell_syntax.ts";
 import type { Tool } from "./tools/types.ts";
 import { isOpenPort } from "./sites/port_proxy.ts";
@@ -189,39 +189,118 @@ function commandKeys(command: string): { keys: string[]; names: string[] } | und
 	return keys.size ? { keys: [...keys], names: [...names] } : undefined;
 }
 
+/** git's own commands: any other word after git could be an alias (from config the agent can write) or a git-* program. */
+const GIT_COMMANDS = new Set(("add am annotate apply archive bisect blame branch bugreport bundle cat-file check-attr check-ignore check-mailmap " +
+	"check-ref-format checkout checkout-index cherry cherry-pick clean clone column commit commit-graph commit-tree config count-objects " +
+	"credential describe diagnose diff diff-files diff-index diff-tree difftool fast-export fast-import fetch fetch-pack filter-branch " +
+	"fmt-merge-msg for-each-ref for-each-repo format-patch fsck gc grep hash-object help hook index-pack init interpret-trailers log ls-files " +
+	"ls-remote ls-tree mailinfo mailsplit maintenance merge merge-base merge-file merge-index merge-tree mergetool mktag mktree multi-pack-index " +
+	"mv notes pack-objects pack-redundant pack-refs patch-id prune prune-packed pull push range-diff read-tree rebase receive-pack reflog " +
+	"remote repack replace replay request-pull rerere reset restore rev-list rev-parse revert rm send-pack shortlog show show-branch show-index " +
+	"show-ref sparse-checkout stage stash status stripspace submodule switch symbolic-ref tag unpack-file unpack-objects update-index " +
+	"update-ref update-server-info upload-archive upload-pack var verify-commit verify-pack verify-tag version whatchanged worktree write-tree").split(" "));
+/** git options whose value is the next word. */
+const GIT_VALUE_OPTIONS = new Set(["-c", "-C", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env", "--list-cmds", "--attr-source"]);
+/** Settings that make git run a program (or rename a command): set on the command line, git could push unseen. */
+const GIT_RUNS = /^(alias\.|core\.(sshcommand|fsmonitor|pager|editor|askpass|hookspath|gitproxy)|diff\.|filter\.|merge\.|gpg\.|credential\.|uploadpack\.|receivepack\.|sequence\.|interactive\.|remote\.|protocol\.|url\.|include)/i;
+/** Programs that never run their arguments, so a shell's name among them is just a name. */
+const NON_RUNNING = new Set(["ls", "cat", "head", "tail", "wc", "echo", "printf", "which", "whereis", "type", "file", "stat", "grep", "egrep", "fgrep", "sort", "cut", "tr", "diff", "cmp", "basename", "dirname", "realpath", "readlink", "nl", "jq", "bat", "eza", "tree", "du", "df", "man", "apropos", "whatis", "test", "[", "true", "false", "pwd", "date", "uname", "id", "whoami"]);
+
+/** A glob pattern as a regular expression for one name, as bash matches it. */
+function patternRegex(pattern: string): RegExp | undefined {
+	let out = "";
+	for (let i = 0; i < pattern.length; i++) {
+		const c = pattern[i]!;
+		if (c === "\\" && i + 1 < pattern.length) out += pattern[++i]!.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&");
+		else if (c === "*") out += "[^/]*";
+		else if (c === "?") out += "[^/]";
+		else if (c === "[") {
+			const end = pattern.indexOf("]", i + 2);
+			if (end < 0) return undefined;
+			let body = pattern.slice(i + 1, end);
+			if (body.startsWith("!")) body = `^${body.slice(1)}`;
+			out += `[${body.replace(/\\/g, "\\\\")}]`;
+			i = end;
+		} else out += c.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&");
+	}
+	try {
+		return new RegExp(`^${out}$`);
+	} catch {
+		return undefined;
+	}
+}
+
 /**
  * Whether a line publishes. Read as the shell reads it (shell_syntax.ts), every command anywhere in it counts.
- * "push": git and a push word in the same line, code handed to eval or a shell that pushes, or git or push near a
- * function, alias or sourced file. "hidden": what runs depends on expansion (a program named by a variable or a
- * substitution, git given an expanded word, eval or a shell handed code that expands or arrives on its input), so it
- * could push. A line that doesn't parse pushes when it mentions git or push, and is hidden when it expands anything.
+ * "push": git and a push word in the same line (a glob that could match either counts), code handed to eval or a
+ * shell that pushes, or git or push near a function, alias or sourced file. "hidden": what runs depends on more than
+ * the line shows, so it could push unseen: a program named by expansion or a glob, git given an expanded word, a
+ * setting that makes git run something, a word after git that isn't one of its commands (an alias), git settings
+ * set in front, eval or a shell (started directly or through env, timeout, xargs and the like) handed code that
+ * expands or arrives on its input, or a line that doesn't parse.
  */
 function publishing(command: string, depth = 0): "push" | "hidden" | undefined {
 	const line = everyCommand(command);
-	if (!line || depth > 4) return /\bgit\b|\bpush\b/.test(command) ? "push" : /[$`]/.test(command) ? "hidden" : undefined;
-	const isGit = (w: string) => /(^|\/)git(\.exe)?$/.test(w);
-	const isPush = (w: string) => /(^|\s)push\b/.test(w);
+	if (!line || depth > 4) return /\bgit\b|\bpush\b/.test(command) ? "push" : "hidden";
+	const name = (w: string) => w.replace(/^.*\//, "");
+	const could = (text: string | undefined, pattern: string | undefined, names: string[]) => {
+		if (text === undefined) return false;
+		if (!pattern) return names.includes(name(text));
+		const last = pattern.slice(pattern.lastIndexOf("/") + 1);
+		const re = patternRegex(last);
+		return !re || names.some((n) => re.test(n));
+	};
+	const isPush = (w: string | undefined, p: string | undefined) => (p ? could(w, p, ["push"]) : w !== undefined && /(^|\s)push\b/.test(w));
 	const words: string[] = [];
 	let hidden = false;
-	for (const { words: argv } of line.commands) {
+	let sawGit = false;
+	let sawPush = false;
+	for (const { words: argv, patterns, assigns } of line.commands) {
+		if (assigns.some((a) => /^GIT_/.test(a))) hidden = true;
 		if (!argv.length) continue;
-		const [first, ...rest] = argv;
-		if (first === undefined) hidden = true;
-		else {
-			const name = first.replace(/^.*\//, "");
-			if (isGit(first) && rest.includes(undefined)) hidden = true;
-			if (name === "eval") {
-				const inner = rest.includes(undefined) ? "hidden" : publishing(rest.join(" "), depth + 1);
-				if (inner === "push") return "push";
-				if (inner) hidden = true;
+		if (argv[0] === undefined || patterns[0] !== undefined) hidden = true;
+		for (let i = 0; i < argv.length; i++) {
+			if (could(argv[i], patterns[i], ["git", "git.exe"])) {
+				sawGit = true;
+				let j = i + 1;
+				for (; j < argv.length; j++) {
+					const w = argv[j];
+					if (w === undefined) break;
+					if (w === "-c" && (argv[j + 1] === undefined || GIT_RUNS.test(argv[j + 1]!))) hidden = true;
+					if (/^--(exec-path|config-env)(=|$)/.test(w)) hidden = true;
+					if (GIT_VALUE_OPTIONS.has(w)) j++;
+					else if (!w.startsWith("-")) break;
+				}
+				const sub = argv[j];
+				if (j < argv.length && (sub === undefined || patterns[j] !== undefined || !GIT_COMMANDS.has(sub))) hidden = true;
+				if (argv.slice(i + 1).includes(undefined)) hidden = true;
 			}
-			if (SHELLS.has(name)) {
-				const flag = rest.findIndex((w) => w !== undefined && /^-[a-zA-Z]*c[a-zA-Z]*$/.test(w));
-				const script = flag >= 0 ? rest[flag + 1] : undefined;
-				const inner = flag >= 0 ? (script === undefined ? "hidden" : publishing(script, depth + 1)) : undefined;
-				if (inner === "push") return "push";
-				// No -c and no script file: it runs whatever arrives on its input.
-				if (inner || (flag < 0 && !rest.some((w) => w !== undefined && !w.startsWith("-")))) hidden = true;
+			if (isPush(argv[i], patterns[i])) sawPush = true;
+		}
+		// A shell or eval anywhere a wrapper could start it (env bash -c, timeout 5 sh -c, xargs sh), unless the program
+		// is one that only reads its arguments.
+		const first = argv[0] === undefined ? undefined : name(argv[0]);
+		if (first === undefined || !NON_RUNNING.has(first)) {
+			for (let i = 0; i < argv.length; i++) {
+				const w = argv[i];
+				if (w === undefined) continue;
+				const rest = argv.slice(i + 1);
+				if (name(w) === "eval") {
+					const inner = rest.includes(undefined) ? "hidden" : publishing(rest.join(" "), depth + 1);
+					if (inner === "push") return "push";
+					if (inner) hidden = true;
+					break;
+				}
+				if (SHELLS.has(name(w))) {
+					const flag = rest.findIndex((x) => x !== undefined && /^-[a-zA-Z]*c[a-zA-Z]*$/.test(x));
+					const script = flag >= 0 ? rest[flag + 1] : undefined;
+					const inner = flag >= 0 ? (script === undefined ? "hidden" : publishing(script, depth + 1)) : undefined;
+					if (inner === "push") return "push";
+					// No -c and no script file: it runs whatever arrives on its input.
+					if (inner || (flag < 0 && !rest.some((x) => x === undefined || !x.startsWith("-")))) hidden = true;
+					if (flag < 0 && rest.includes(undefined)) hidden = true;
+					break;
+				}
 			}
 		}
 		for (const w of argv) if (w !== undefined) words.push(w);
@@ -230,8 +309,7 @@ function publishing(command: string, depth = 0): "push" | "hidden" | undefined {
 	const text = words.join(" ");
 	// Functions, aliases and sourced files run what the line can't show: a push when git or push is in it at all.
 	if ((line.functions || words.some((w) => w === "alias" || w === "source" || w === ".")) && /\bgit\b|\bpush\b/.test(`${text} ${command}`)) return "push";
-	// Git and a push word, or a push word beside a program only expansion names ($g push).
-	if ((words.some(isGit) && words.some(isPush)) || words.some((w) => /\bgit\b[\s\S]*\bpush\b/.test(w)) || (hidden && words.some(isPush))) return "push";
+	if ((sawGit && sawPush) || words.some((w) => /\bgit\b[\s\S]*\bpush\b/.test(w)) || (hidden && sawPush)) return "push";
 	return hidden ? "hidden" : undefined;
 }
 
@@ -251,6 +329,10 @@ function list(items: string[]): string {
 /** What an "allow for this session" answer remembers for this call, and what that covers in words. */
 export function allowKeys(tool: Tool, args: Record<string, unknown>): { keys: string[]; scope: string } {
 	if (tool.kind === "sandbox" && typeof args.command === "string") {
+		// The same publishing gate as a shell command: a push, or a line that could push unseen, asks every time.
+		const publishes = publishing(args.command.trim());
+		if (publishes === "push") return { keys: ["sandbox!push"], scope: "pushing" };
+		if (publishes === "hidden") return { keys: ["sandbox!hidden"], scope: "this command, every time" };
 		// Remembered per program like a shell command, apart from this computer's answers.
 		const found = commandKeys(args.command.trim());
 		if (!found) return { keys: [`sandbox=${args.command.trim()}`], scope: "this exact command in the lab's sandbox" };
@@ -260,7 +342,11 @@ export function allowKeys(tool: Tool, args: Record<string, unknown>): { keys: st
 		const command = String(args.command ?? "").trim();
 		// Pushing publishes work: it asks every time, whatever was allowed before. Judged on the words as the shell reads
 		// them, so git 'push', g\it push and $'\x67it' push are pushes too.
-		if (pushes(command)) return { keys: ["shell!push"], scope: "pushing" };
+		const publishes = publishing(command);
+		if (publishes === "push") return { keys: ["shell!push"], scope: "pushing" };
+		// What it runs depends on more than the line shows: never remembered, so a changed file or variable can't ride
+		// on an earlier yes.
+		if (publishes === "hidden") return { keys: ["shell!hidden"], scope: "this command, every time" };
 		const found = commandKeys(command);
 		if (!found) return { keys: [`shell=${command}`], scope: "this exact command" };
 		return { keys: found.keys, scope: `${list(found.names.map((n) => `“${n}”`))} commands` };
@@ -364,10 +450,10 @@ export function decide(tool: Tool, args: Record<string, unknown>, workspace: Wor
 	const { keys, scope } = allowKeys(tool, args);
 	const ask = (reason: string, folder?: string): Verdict => ({ action: "ask", reason, keys, scope, ...(folder ? { folder } : {}) });
 	// Pushing publishes work, and an unreviewed lab tool hasn't been checked by anyone: both ask in every mode, every time.
-	if (keys[0] === "shell!push") return ask(PUSH_REASON);
+	if (keys[0] === "shell!push" || keys[0] === "sandbox!push") return ask(PUSH_REASON);
+	if (keys[0] === "shell!hidden" || keys[0] === "sandbox!hidden") return ask(HIDDEN_REASON);
 	if (tool.unreviewed) return { action: "ask", reason: "The lab hasn't reviewed this tool yet, so it asks every time.", keys: [`unreviewed!${tool.name}`], scope: "this call" };
-	// Full mode runs everything else, except a line that could push without showing it.
-	if (mode === "full") return tool.kind === "exec" && publishing(String(args.command ?? "")) === "hidden" ? ask(HIDDEN_REASON) : { action: "run" };
+	if (mode === "full") return { action: "run" };
 	// Discovery mode: what acts inside the lab the session works at runs without asking (the lab's filters, checks and
 	// audit stay on there). Anything on this computer still asks.
 	if (discovery && (tool.site === discovery || (!tool.site && workspace.kind === "sandbox" && (IN_SANDBOX.has(tool.kind) || keys[0] === "write")))) return { action: "run" };
@@ -428,10 +514,16 @@ export function decide(tool: Tool, args: Record<string, unknown>, workspace: Wor
 			// Windows contains writes only, so there it still asks. A folder set to read only asks for everything.
 			// In a lab's sandbox the OS fence is Landlock (sandbox_fence.ts): a sandbox where it doesn't hold asks.
 			const lab = workspace.kind === "sandbox";
-			const contained = workspace.sandboxed && FULL_CONTAINMENT.has(workspace.sandboxed) && args.unsandboxed !== true && (!lab || workspace.fenced === true);
+			const fenced = lab && workspace.fenced === true;
+			const contained = workspace.sandboxed && FULL_CONTAINMENT.has(workspace.sandboxed) && args.unsandboxed !== true && (!lab || fenced);
+			// Glob words are judged by the names they match: here (expanded now), or in a fenced lab sandbox, where each
+			// name is checked just before the command runs. git reads run unasked only when its settings run nothing.
+			const judging: Judging = { expand: workspace.expand?.bind(workspace), gitSafe: workspace.gitSafe?.bind(workspace), defer: fenced };
+			const inside = (path: string) => workspace.inside(path);
 			// Without history (its store failed) a contained change can't be taken back either: it asks.
-			if (contained && recoverable && !(local && readOnlyWithin(config, workspace.root)) && pathsInside(command, (path) => workspace.inside(path), lab || process.platform !== "win32")) return lab ? { action: "run", fence: true } : { action: "run" };
-			if (isReadOnlyCommand(command, config.permissions.allowCommands, (path) => workspace.inside(path))) return { action: "run" };
+			if (contained && recoverable && !(local && readOnlyWithin(config, workspace.root)) && pathsInside(command, inside, lab || process.platform !== "win32", false, judging)) return lab ? { action: "run", fence: true } : { action: "run" };
+			// A read in a fenced lab sandbox runs under the fence too.
+			if (isReadOnlyCommand(command, config.permissions.allowCommands, inside, judging)) return fenced ? { action: "run", fence: true } : { action: "run" };
 			// In a lab's sandbox whose whole disk is checkpointed, any command can be taken back.
 			if (mode === "auto" && workspace.kind === "sandbox" && workspace.checkpointed === "filesystem" && args.unsandboxed !== true) return { action: "run" };
 			const reads = isReadOnlyCommand(command, config.permissions.allowCommands, () => true);

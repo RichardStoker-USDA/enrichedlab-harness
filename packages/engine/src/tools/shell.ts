@@ -35,14 +35,53 @@ const GIT_LIST_ONLY: Record<string, RegExp> = {
 	tag: /^(-l|--list|-n\d*|--sort=.*|--contains|--points-at|--format=.*)$/,
 	config: /^(--get|--get-all|--get-regexp|--list|-l|--show-origin|--name-only|--local|--null|-z)$/,
 };
-const VERSION_ONLY = /^(--version|-V|version)$/;
+const VERSION_ONLY = /^(--version|-V)$/;
+
+/**
+ * How glob words and git are judged. `expand`: the names a glob pattern matches here (undefined when it can't
+ * say); without it a glob word isn't read-only. `defer`: a glob whose fixed part is inside may pass, because the
+ * place checks each name it expands to before the command runs (a lab sandbox's fence). `gitSafe`: git's settings
+ * here make no read command run a program; without it git isn't read-only.
+ */
+export interface Judging {
+	expand?: (pattern: string) => string[] | undefined;
+	defer?: boolean;
+	gitSafe?: () => boolean;
+}
+
+/** A glob path component starting with a literal dot can match "." or ".." (bash 3.2's .? and .*): it could leave. */
+function couldClimb(pattern: string): boolean {
+	return pattern.split("/").some((part) => part.startsWith(".") && /(^|[^\\])[*?[]/.test(part));
+}
+
+/** The folder part of a glob before its first glob component, escapes taken out ("" for the current folder). */
+export function globBase(pattern: string): string {
+	const parts = pattern.split("/");
+	const first = parts.findIndex((part) => /(^|[^\\])[*?[]/.test(part));
+	return parts.slice(0, first < 0 ? parts.length : first).join("/").replace(/\\(.)/g, "$1");
+}
+
+/** Every name a word stands for is judged by `ok`: its matches for a glob, else itself. */
+function eachName(text: string, pattern: string | undefined, ok: (path: string) => boolean, judging: Judging): boolean {
+	if (!pattern) return ok(text);
+	if (couldClimb(pattern)) return false;
+	if (judging.expand) {
+		const matches = judging.expand(pattern);
+		if (!matches) return false;
+		// No match: bash passes the pattern on as it is.
+		return matches.length ? matches.every(ok) : ok(text);
+	}
+	if (!judging.defer) return false;
+	const base = globBase(pattern);
+	return ok(base || ".");
+}
 
 
 const looksLikePath = (t: string) => /^(~|\/|\\\\|[A-Za-z]:[\\/])/.test(t) || /(^|[\\/])\.\.([\\/]|$)/.test(t);
 
 /** True when every part of a command only reads, inside the project when `inside` is given. Anything unusual
  * (variables, substitution, writing redirection, background jobs, environment prefixes) is not. */
-export function isReadOnlyCommand(command: string, extra: string[] = [], inside?: (path: string) => boolean): boolean {
+export function isReadOnlyCommand(command: string, extra: string[] = [], inside?: (path: string) => boolean, judging: Judging = {}): boolean {
 	const text = command.trim();
 	if (!text) return false;
 	if (extra.some((prefix) => text === prefix || text.startsWith(`${prefix} `)) && !/[;&|<>`$\n]/.test(text)) return true;
@@ -62,15 +101,17 @@ export function isReadOnlyCommand(command: string, extra: string[] = [], inside?
 			return false;
 		}
 	}
-	const segments = commands.map((c) => c.words);
-	return segments.length > 0 && segments.every((words) => {
+	return commands.length > 0 && commands.every(({ words, patterns }) => {
 		const joined = words.join(" ");
-		if (extra.some((prefix) => joined === prefix || joined.startsWith(`${prefix} `))) return true;
+		if (extra.some((prefix) => joined === prefix || joined.startsWith(`${prefix} `)) && !patterns.some(Boolean)) return true;
 		const [cmd, ...args] = words;
-		if (!cmd || /^\w+=/.test(cmd)) return false;
+		const argPatterns = patterns.slice(1);
+		if (!cmd || patterns[0] !== undefined || /^\w+=/.test(cmd)) return false;
 		// "--version" says nothing about a program the project holds: only a bare name found on PATH counts.
 		if (args.length === 1 && VERSION_ONLY.test(args[0]!) && /^[A-Za-z0-9][\w.+-]*$/.test(cmd)) return true;
 		if (cmd === "git") {
+			// A repository's settings can make even git status run a program (core.fsmonitor, filter and diff drivers).
+			if (!judging.gitSafe?.() || argPatterns.some(Boolean)) return false;
 			const [sub, ...rest] = args;
 			if (!sub || /^-/.test(sub)) return false;
 			if (rest.some((a) => /^(--output|--ext-diff|--exec|-c$|--upload-pack|--receive-pack)/.test(a))) return false;
@@ -90,29 +131,41 @@ export function isReadOnlyCommand(command: string, extra: string[] = [], inside?
 		if (!READ_ONLY.has(cmd)) return false;
 		const unsafe = UNSAFE_FLAGS[cmd];
 		if (unsafe && args.some((a) => unsafe.test(a))) return false;
-		if (TEXT_ONLY.has(cmd)) return true;
-		return paths(args, inside, PATTERN_FIRST.has(cmd), cmd);
+		if (TEXT_ONLY.has(cmd)) return !argPatterns.some(Boolean);
+		return paths(args, inside, PATTERN_FIRST.has(cmd), cmd, argPatterns, judging);
 	});
 }
 
-/** True when the command can be parsed and every word shaped like a path is inside the project. */
-export function pathsInside(command: string, inside: (path: string) => boolean, posix = process.platform !== "win32", strict = false): boolean {
+/** True when the command can be parsed and every word shaped like a path (every name a glob matches) is inside. */
+export function pathsInside(command: string, inside: (path: string) => boolean, posix = process.platform !== "win32", strict = false, judging: Judging = {}): boolean {
 	// Only POSIX shell words are read; a Windows shell's command asks.
 	if (!posix) return false;
-	const words = commandWords(command);
+	const words = wordsOf(command);
 	if (!words.length) return false;
-	return words.every((text) => {
+	return words.every(({ text, pattern }) => {
 		// Where named paths are the only fence, a quoted word holding several words and a path or shell syntax is code
 		// or a list, not one path: it can't be judged.
 		if (strict && /\s/.test(text) && /[/;|&$`(){}<>]|\.\./.test(text)) return false;
-		const value = text.startsWith("-") && text.includes("=") ? text.slice(text.indexOf("=") + 1) : text;
-		return !(looksLikePath(value) || value.includes("/")) || inside(value);
+		const one = (name: string) => {
+			const value = name.startsWith("-") && name.includes("=") ? name.slice(name.indexOf("=") + 1) : name;
+			return !(looksLikePath(value) || value.includes("/")) || inside(value);
+		};
+		return eachName(text, pattern, one, judging);
 	});
+}
+
+/** Every word of a command with its glob pattern when it is one: assignment values, words and redirection targets. */
+export function wordsOf(command: string): { text: string; pattern?: string }[] {
+	return (plainCommands(command.trim()) ?? []).flatMap((c) => [
+		...c.assigns.map((a) => ({ text: a.value })),
+		...c.words.map((text, i) => (c.patterns[i] ? { text, pattern: c.patterns[i] } : { text })),
+		...c.redirects.map((r) => ({ text: r.target })),
+	]);
 }
 
 /** Every word of a command, quotes taken out (for naming the files a step read); empty when it can't be read. */
 export function commandWords(command: string): string[] {
-	return (plainCommands(command.trim()) ?? []).flatMap((c) => [...c.assigns.map((a) => a.value), ...c.words, ...c.redirects.map((r) => r.target)]);
+	return wordsOf(command).map((w) => w.text);
 }
 
 /** Flags whose value (the next word) is a file or folder, for commands whose first word is a pattern. */
@@ -125,16 +178,25 @@ const PATH_FLAGS: Record<string, Set<string>> = {
 	jq: new Set(["-f", "--from-file", "--rawfile", "--slurpfile", "-L"]),
 };
 
-/** Every path argument (and every --flag=path value) must be inside the project. */
-function paths(args: string[], inside: ((path: string) => boolean) | undefined, skipFirst: boolean, cmd = ""): boolean {
+/** Every path argument (and every --flag=path value, and every name a glob argument matches) must be inside. */
+function paths(args: string[], inside: ((path: string) => boolean) | undefined, skipFirst: boolean, cmd = "", patterns: (string | undefined)[] = [], judging: Judging = {}): boolean {
 	let skipped = !skipFirst;
 	const pathFlags = PATH_FLAGS[cmd];
+	const one = (path: string) => (inside ? inside(path) : !looksLikePath(path));
 	for (let i = 0; i < args.length; i++) {
 		const arg = args[i]!;
+		const pattern = patterns[i];
+		// A glob is expanded by the shell before the program sees it: each name it matches is a path to judge, even
+		// where the program would read the word as its pattern.
+		if (pattern) {
+			if (!eachName(arg, pattern, one, judging)) return false;
+			if (!skipped) skipped = true;
+			continue;
+		}
 		if (pathFlags?.has(arg) && args[i + 1] !== undefined) {
 			// "grep -f FILE": FILE is a path to check, and it isn't the pattern.
-			const value = args[++i]!;
-			if (inside ? !inside(value) : looksLikePath(value)) return false;
+			i++;
+			if (patterns[i] ? !eachName(args[i]!, patterns[i], one, judging) : !one(args[i]!)) return false;
 			continue;
 		}
 		if (arg.startsWith("-")) {
@@ -146,7 +208,7 @@ function paths(args: string[], inside: ((path: string) => boolean) | undefined, 
 			skipped = true;
 			continue;
 		}
-		if (inside ? !inside(arg) : looksLikePath(arg)) return false;
+		if (!one(arg)) return false;
 	}
 	return true;
 }
@@ -172,7 +234,7 @@ export const shellTool: Tool = {
 		if (!command.trim()) throw new ToolError("The command is empty.");
 		const timeout = Math.min(MAX_TIMEOUT_S, Math.max(1, num(args, "timeout") ?? DEFAULT_TIMEOUT_S));
 		const started = Date.now();
-		const result = await ctx.workspace.exec(command, { timeoutMs: timeout * 1_000, signal: ctx.signal, onOutput: ctx.output, unsandboxed: args.unsandboxed === true, ...(ctx.fence ? { fence: commandWords(command) } : {}) });
+		const result = await ctx.workspace.exec(command, { timeoutMs: timeout * 1_000, signal: ctx.signal, onOutput: ctx.output, unsandboxed: args.unsandboxed === true, ...(ctx.fence ? { fence: wordsOf(command) } : {}) });
 		const seconds = ((Date.now() - started) / 1000).toFixed(1);
 		const status = result.timedOut ? `stopped after ${timeout}s` : ctx.signal.aborted ? "cancelled" : `exit ${result.exitCode ?? "?"}`;
 		const output = result.output.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "");

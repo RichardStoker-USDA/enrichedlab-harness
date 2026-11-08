@@ -119,10 +119,13 @@ Scientists validate everything, so every step has to be readable and repeatable.
   `TZ`) and nothing else from the caller, and doesn't run at all where the computer can't contain it. It then
   compares every file against what the step left, the same or different, names any file the rerun changed that the
   step didn't, and fails when the command fails. A package may come from anyone, so both read it defensively: only
-  plain files inside the folder (metadata too), opened without following links and checked again once open, and
-  its history through git with no hooks, no system or global config, no inherited `GIT_*` settings, no replace
-  objects, and only the session refs fetched. Export copies a changed file only when it is a plain file inside the
-  project, so a file swapped for a link to somewhere else is left out. A lab session's files stay in the lab; its
+  plain files inside the folder (metadata too), opened without following a link anywhere on the way, and its history
+  from a private copy of the bundle, through the system's git (not one on the caller's PATH) with no hooks, no
+  system or global config, no inherited `GIT_*` settings, home and temp in the scratch folder, no replace objects,
+  and only the session refs fetched; every content id must be the kind of object it names (a commit for a history
+  point, a blob for a file). Export copies a changed file only when it is a plain file inside the project, read the
+  same link-free way, so a file swapped for a link to somewhere else is left out. On Linux, the rerun's private
+  `/tmp` and `/run` are read-only. A lab session's files stay in the lab; its
   receipts are in the log.
 
 ## Desktops

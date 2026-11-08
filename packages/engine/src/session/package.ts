@@ -9,12 +9,13 @@
 
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import type { SessionEvent, SessionSummary } from "@enrichedlab/protocol";
 import { commandWords } from "../tools/shell.ts";
-import { contained, physical } from "../tools/workspace.ts";
+import { openPhysical } from "../tools/anchored.ts";
+import { contained, physical, trustedGit } from "../tools/workspace.ts";
 
 const CRATE = "https://w3id.org/ro/crate/1.3";
 const PROFILE = "https://w3id.org/ro/wfrun/process/0.6";
@@ -111,21 +112,44 @@ function named(name: string, args: Record<string, unknown>, cwd: string): string
  * helpers or fsmonitor), no hooks, every object checked as it arrives.
  */
 const UNTRUSTED_GIT = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "transfer.fsckObjects=true", "-c", "fetch.fsckObjects=true", "-c", "core.symlinks=false", "-c", "core.autocrlf=false", "-c", "protocol.allow=never", "-c", "protocol.file.allow=always"];
-/** Only what git needs: no GIT_DIR, object or alternate directories, templates or injected config from the caller. */
-const UNTRUSTED_ENV: Record<string, string> = {
-	...Object.fromEntries(["PATH", "HOME", "LANG", "LC_ALL", "TMPDIR"].flatMap((k) => (process.env[k] ? [[k, process.env[k]!]] : []))),
-	GIT_CONFIG_NOSYSTEM: "1",
-	GIT_CONFIG_GLOBAL: "/dev/null",
-	GIT_TERMINAL_PROMPT: "0",
-	GIT_NO_REPLACE_OBJECTS: "1",
-	GIT_TEMPLATE_DIR: "",
-};
+/**
+ * Only what git needs: the system's own folders on PATH (not the caller's), home and temp in the scratch folder, and
+ * no GIT_DIR, object or alternate directories, templates or injected config from the caller.
+ */
+function untrustedEnv(scratch: string): Record<string, string> {
+	return {
+		PATH: "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin",
+		HOME: scratch,
+		TMPDIR: scratch,
+		LANG: "C.UTF-8",
+		GIT_CONFIG_NOSYSTEM: "1",
+		GIT_CONFIG_GLOBAL: "/dev/null",
+		GIT_TERMINAL_PROMPT: "0",
+		GIT_NO_REPLACE_OBJECTS: "1",
+		GIT_TEMPLATE_DIR: "",
+	};
+}
 
-/** Open a history bundle into a new, empty bare repository, every ref in it (a plain clone takes branches and tags only). */
-function openBundle(bundle: string, repo: string): { ok: boolean; error: string } {
-	const init = spawnSync("git", [...UNTRUSTED_GIT, "init", "--quiet", "--bare", "--template=", repo], { encoding: "utf8", env: UNTRUSTED_ENV });
+/** git for reading a package: from the system's or Homebrew's folders, never the caller's PATH. */
+function packageGit(): string {
+	const git = trustedGit();
+	if (!git) throw new Error("git isn't installed where EnrichedLab looks for it (/usr/bin, /opt/homebrew/bin, /usr/local/bin).");
+	return git;
+}
+
+/**
+ * Open a package's history bundle into a new, empty bare repository in `scratch`, the session refs only. git reads a
+ * private copy of the bundle, taken through a link-free open, so the file it reads is the one that was checked.
+ */
+function openBundle(folder: string, scratch: string, repo: string): { ok: boolean; error: string } {
+	const bytes = readPackaged(folder, "history/steps.bundle");
+	if (!bytes) return { ok: false, error: "history/steps.bundle isn't a plain file in the package" };
+	const copy = join(scratch, "steps.bundle");
+	writeFileSync(copy, bytes, { mode: 0o600 });
+	const env = untrustedEnv(scratch);
+	const init = spawnSync(packageGit(), [...UNTRUSTED_GIT, "init", "--quiet", "--bare", "--template=", repo], { encoding: "utf8", env });
 	if (init.status !== 0) return { ok: false, error: (init.stderr || "git init failed").trim() };
-	const fetched = spawnSync("git", [...UNTRUSTED_GIT, "--git-dir", repo, "fetch", "--quiet", "--no-tags", "--no-recurse-submodules", bundle, "refs/sessions/*:refs/sessions/*"], { encoding: "utf8", env: UNTRUSTED_ENV });
+	const fetched = spawnSync(packageGit(), [...UNTRUSTED_GIT, "--git-dir", repo, "fetch", "--quiet", "--no-tags", "--no-recurse-submodules", copy, "refs/sessions/*:refs/sessions/*"], { encoding: "utf8", env });
 	return { ok: fetched.status === 0, error: (fetched.stderr || "").trim() };
 }
 
@@ -144,16 +168,20 @@ function packaged(folder: string, id: string): string | undefined {
 	return statSync(at).isFile() ? at : undefined;
 }
 
-/** A package file's bytes, opened without following a link and checked again once open; undefined when it isn't safe. */
+/**
+ * A package file's bytes, opened where the package folder really is without following a link anywhere on the way
+ * (anchored.ts), so a folder swapped for a link after the check makes it fail; undefined when it isn't safe.
+ */
 function readPackaged(folder: string, id: string): Buffer | undefined {
-	const at = packaged(folder, id);
-	if (!at) return undefined;
-	const fd = openSync(at, constants.O_RDONLY | constants.O_NOFOLLOW);
+	if (!packaged(folder, id)) return undefined;
+	let fd: number;
 	try {
-		const opened = fstatSync(fd);
-		const there = lstatSync(at, { throwIfNoEntry: false });
-		if (!opened.isFile() || !there || there.ino !== opened.ino || there.dev !== opened.dev || packaged(folder, id) !== at) return undefined;
-		return readFileSync(fd);
+		fd = openPhysical(join(physical(folder), id), constants.O_RDONLY);
+	} catch {
+		return undefined;
+	}
+	try {
+		return fstatSync(fd).isFile() ? readFileSync(fd) : undefined;
 	} finally {
 		closeSync(fd);
 	}
@@ -187,8 +215,18 @@ export function writePackage(folder: string, input: PackageInput): { files: numb
 		const real = physical(isAbsolute(path) ? path : `${cwd}/${path}`);
 		const inside = relative(home, real);
 		if (!inside || inside.startsWith("..") || isAbsolute(inside)) return undefined;
-		const info = lstatSync(real, { throwIfNoEntry: false });
-		return info?.isFile() ? readFileSync(real) : undefined;
+		// Opened at that physical path without following a link anywhere: one swapped in after the check is refused.
+		let fd: number;
+		try {
+			fd = openPhysical(real, constants.O_RDONLY);
+		} catch {
+			return undefined;
+		}
+		try {
+			return fstatSync(fd).isFile() ? readFileSync(fd) : undefined;
+		} finally {
+			closeSync(fd);
+		}
 	};
 	if (local) {
 		for (const name of ["pixi.toml", "pixi.lock"]) {
@@ -371,21 +409,24 @@ export function verifyPackage(folder: string): CheckRow[] {
 		const scratch = mkdtempSync(join(tmpdir(), "el-verify-"));
 		try {
 			const repo = join(scratch, "steps.git");
-			const opened = openBundle(bundle, repo);
+			const opened = openBundle(folder, scratch, repo);
 			rows.push({ check: "step history", ok: opened.ok, detail: opened.ok ? "the bundle opens" : opened.error || "the bundle doesn't open" });
 			if (opened.ok) {
-				const ids = new Set<string>();
-				for (const e of graph) if (typeof e.identifier === "string" && e.identifier.startsWith("git-blob:")) ids.add(e.identifier.slice(9));
-				for (const e of graph) for (const key of [`${TERMS}historyBefore`, `${TERMS}historyAfter`]) if (e[key] !== undefined) ids.add(String(e[key]));
-				const listed = [...ids];
-				const malformed = listed.filter((id) => !/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(id));
-				const asked = listed.filter((id) => !malformed.includes(id));
-				const r = asked.length ? spawnSync("git", [...UNTRUSTED_GIT, "--git-dir", repo, "cat-file", "--batch-check"], { input: `${asked.join("\n")}\n`, encoding: "utf8", env: UNTRUSTED_ENV }) : { status: 0, stdout: "" };
-				// Every id asked must come back present, one line each, from a git that finished cleanly.
+				// Each id with the kind of object it must be: a file's content is a blob, a history point a commit.
+				const ids = new Map<string, string>();
+				const expect = (id: string, kind: string) => ids.set(`${id} ${kind}`, id);
+				for (const e of graph) if (typeof e.identifier === "string" && e.identifier.startsWith("git-blob:")) expect(e.identifier.slice(9), "blob");
+				for (const e of graph) for (const key of [`${TERMS}historyBefore`, `${TERMS}historyAfter`]) if (e[key] !== undefined) expect(String(e[key]), "commit");
+				const listed = [...ids.entries()].map(([key, id]) => ({ id, kind: key.slice(key.lastIndexOf(" ") + 1) }));
+				const malformed = listed.filter((x) => !/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(x.id));
+				const asked = listed.filter((x) => !malformed.includes(x));
+				const r = asked.length ? spawnSync(packageGit(), [...UNTRUSTED_GIT, "--git-dir", repo, "cat-file", "--batch-check"], { input: `${asked.map((x) => x.id).join("\n")}\n`, encoding: "utf8", env: untrustedEnv(scratch) }) : { status: 0, stdout: "" };
+				// Every id asked must come back, one line each and in order, as the kind it must be, from a git that
+				// finished cleanly.
 				const answers = r.stdout.split("\n").filter(Boolean);
-				const present = answers.filter((line) => !line.endsWith(" missing")).length;
-				const ok = r.status === 0 && !malformed.length && answers.length === asked.length && present === asked.length;
-				rows.push({ check: "content ids", ok, detail: ok ? `all ${listed.length} are in the history` : `${malformed.length ? `${malformed.length} malformed; ` : ""}${asked.length - present} of ${asked.length} not found in the history` });
+				const right = asked.filter((x, i) => answers[i] === undefined ? false : answers[i]!.split(" ")[0] === x.id && answers[i]!.split(" ")[1] === x.kind).length;
+				const ok = r.status === 0 && !malformed.length && answers.length === asked.length && right === asked.length;
+				rows.push({ check: "content ids", ok, detail: ok ? `all ${listed.length} are in the history, each the right kind` : `${malformed.length ? `${malformed.length} malformed; ` : ""}${asked.length - right} of ${asked.length} missing or not the kind named` });
 			}
 		} finally {
 			rmSync(scratch, { recursive: true, force: true });
@@ -434,11 +475,11 @@ export async function reproduceStep(folder: string, step: string, options: { pre
 		const work = join(scratch, "work");
 		mkdirSync(work);
 		const run = (args: string[], env: Record<string, string> = {}) => {
-			const r = spawnSync("git", [...UNTRUSTED_GIT, "--git-dir", repo, "--work-tree", work, ...args], { encoding: "utf8", cwd: work, env: { ...UNTRUSTED_ENV, ...env } });
+			const r = spawnSync(packageGit(), [...UNTRUSTED_GIT, "--git-dir", repo, "--work-tree", work, ...args], { encoding: "utf8", cwd: work, env: { ...untrustedEnv(scratch), ...env } });
 			if (r.status !== 0) throw new Error(`git ${args[0]}: ${(r.stderr || "").trim()}`);
 			return r.stdout;
 		};
-		const opened = openBundle(bundle, repo);
+		const opened = openBundle(folder, scratch, repo);
 		if (!opened.ok) throw new Error(`The step history bundle doesn't open: ${opened.error}`);
 		mkdirSync(join(repo, "info"), { recursive: true });
 		writeFileSync(join(repo, "info", "attributes"), "* -text -eol -filter -ident -working-tree-encoding\n");

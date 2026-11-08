@@ -2,11 +2,12 @@
 // without changing its tools. The local workspace acts in the project folder with the person's own rights.
 
 import { spawn } from "node:child_process";
-import { closeSync, constants, existsSync, fstatSync, ftruncateSync, lstatSync, openSync, readlinkSync, realpathSync, rmSync, writeSync } from "node:fs";
-import { mkdir, readdir, readFile, stat } from "node:fs/promises";
+import { closeSync, constants, existsSync, fstatSync, ftruncateSync, lstatSync, readlinkSync, realpathSync, statSync, writeSync } from "node:fs";
+import { readdir, readFile, stat } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { withoutSecrets } from "../util.ts";
+import { mkdirPhysical, openPhysical } from "./anchored.ts";
 
 export interface Entry {
 	name: string;
@@ -37,9 +38,13 @@ export interface Workspace {
 	 * `fence` (lab sandboxes): the command runs under the sandbox's file fence (sandbox_fence.ts), and the paths it names
 	 * must lead inside the project, links followed, or it doesn't run.
 	 */
-	exec(command: string, options: { timeoutMs: number; signal: AbortSignal; onOutput?: (text: string) => void; unsandboxed?: boolean; env?: Record<string, string>; fence?: string[] }): Promise<ExecResult>;
+	exec(command: string, options: { timeoutMs: number; signal: AbortSignal; onOutput?: (text: string) => void; unsandboxed?: boolean; env?: Record<string, string>; fence?: { text: string; pattern?: string }[] }): Promise<ExecResult>;
 	/** Set when commands run contained: by the OS ("seatbelt", "bwrap") or in a site's sandbox ("site"). */
 	readonly sandboxed?: string;
+	/** The names a glob pattern matches here, relative as the shell gives them; undefined when it can't say. */
+	expand?(pattern: string): string[] | undefined;
+	/** git's settings here make no read command (status, diff, log) run a program. */
+	gitSafe?(): boolean;
 	/** Commands can run under an OS file fence here (a lab sandbox where Landlock holds): known once prepared. */
 	readonly fenced?: boolean;
 	/** Whatever a place checks before its first decision (a lab sandbox's fence probe). */
@@ -61,8 +66,9 @@ function pickShell(): { file: string; args: (command: string) => string[]; name:
 		const file = pwsh ? "pwsh.exe" : "powershell.exe";
 		return { file, args: (c) => ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", c], name: pwsh ? "PowerShell 7" : "Windows PowerShell" };
 	}
-	const preferred = process.env.SHELL && /\/(bash|zsh)$/.test(process.env.SHELL) ? process.env.SHELL : existsSync("/bin/bash") ? "/bin/bash" : "/bin/sh";
-	return { file: preferred, args: (c) => ["-c", c], name: preferred.split("/").pop() ?? "sh" };
+	// Always the system's bash, the language the approvals parse (shell_syntax.ts), never a shell named by $SHELL.
+	const file = existsSync("/bin/bash") ? "/bin/bash" : "/bin/sh";
+	return { file, args: (c) => ["-c", c], name: file.split("/").pop() ?? "sh" };
 }
 
 /** realpath of the longest existing prefix, with the rest appended: works for files that don't exist yet. */
@@ -101,6 +107,59 @@ function selfCommand(): string[] {
 	return /^bun(\.exe)?$/i.test(basename(process.execPath)) ? [process.execPath, join(import.meta.dir, "..", "..", "..", "cli", "src", "main.ts")] : [process.execPath];
 }
 
+/**
+ * The environment without what makes bash run something other than the line: startup files (BASH_ENV, ENV,
+ * ZDOTDIR), options and traces (SHELLOPTS, BASHOPTS, PS4), prompt and cd hooks, and functions passed in.
+ */
+export function shellSafe(env: Record<string, string | undefined>): Record<string, string> {
+	const drop = /^(BASH_ENV|ENV|ZDOTDIR|SHELLOPTS|BASHOPTS|PS4|PROMPT_COMMAND|CDPATH|GLOBIGNORE|BASH_XTRACEFD|EXECIGNORE|IFS)$|^BASH_FUNC_/;
+	return Object.fromEntries(Object.entries(env).filter((entry): entry is [string, string] => entry[1] !== undefined && !drop.test(entry[0]) && !entry[1].startsWith("() {")));
+}
+
+/** The temp folder commands may write: the system's, unless it is / or holds the home folder (then /tmp). */
+export function safeTemp(): string {
+	const fallback = process.platform === "darwin" ? "/private/tmp" : "/tmp";
+	let temp: string;
+	try {
+		temp = realpathSync(tmpdir());
+	} catch {
+		return fallback;
+	}
+	const home = (() => {
+		try {
+			return realpathSync(homedir());
+		} catch {
+			return homedir();
+		}
+	})();
+	const holds = (outer: string, inner: string) => inner === outer || inner.startsWith(outer.endsWith(sep) ? outer : `${outer}${sep}`);
+	return temp === sep || holds(temp, home) || temp.split(sep).filter(Boolean).length < 2 ? fallback : temp;
+}
+
+/** git from the system's or Homebrew's own folders, never one found on the caller's PATH. */
+export function trustedGit(): string | undefined {
+	// macOS's /usr/bin/git is a stub that asks to install the developer tools when they're missing.
+	const tools = process.platform !== "darwin" || existsSync("/Library/Developer/CommandLineTools/usr/bin/git") || existsSync("/Applications/Xcode.app");
+	return ["/opt/homebrew/bin/git", "/usr/local/bin/git", ...(tools ? ["/usr/bin/git"] : []), "/bin/git"].find((at) => existsSync(at));
+}
+
+/** git settings that make a read command (status, diff, log, show, blame) run a program. */
+const GIT_READ_RUNS = /^(diff\.external|diff\..+\.(command|textconv)|filter\..+\.(clean|smudge|process)|gpg\.(.+\.)?program|log\.showsignature|core\.alternaterefscommand)$/;
+
+/** bubblewrap from the system's own folders, owned by root and writable by nobody else, never one found on PATH. */
+function trustedBwrap(): string | undefined {
+	for (const at of ["/usr/bin/bwrap", "/bin/bwrap", "/usr/local/bin/bwrap"]) {
+		try {
+			const s = statSync(at);
+			const dir = statSync(dirname(at));
+			if (s.isFile() && s.uid === 0 && (s.mode & 0o022) === 0 && dir.uid === 0 && (dir.mode & 0o022) === 0) return at;
+		} catch {
+			// Not there.
+		}
+	}
+	return undefined;
+}
+
 export type Facility = "seatbelt" | "bubblewrap" | "restricted-token";
 
 /** Facilities that contain reads and the network as well as writes; commands under them run without asking. */
@@ -124,8 +183,8 @@ function sandboxer(): Facility | undefined {
 		// bubblewrap needs user namespaces; some hosts (nested containers, locked-down nodes) don't allow them. Try
 		// once: without a working sandbox, commands ask first instead of failing.
 		if (bwrapWorks === undefined) {
-			const found = (process.env.PATH ?? "").split(":").some((dir) => dir && existsSync(join(dir, "bwrap")));
-			bwrapWorks = found && Bun.spawnSync(["bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--unshare-all", "true"], { stdout: "ignore", stderr: "ignore" }).exitCode === 0;
+			const bwrap = trustedBwrap();
+			bwrapWorks = bwrap !== undefined && Bun.spawnSync([bwrap, "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--unshare-all", "true"], { stdout: "ignore", stderr: "ignore" }).exitCode === 0;
 		}
 		if (bwrapWorks) return "bubblewrap";
 	}
@@ -182,10 +241,10 @@ export function contained(file: string, args: string[], options: { writable: str
 		// This program runs the command under a write-restricted token (windows_contain.ts): the compiled binary
 		// itself, or bun with the CLI's source.
 		const self = selfCommand();
-		const writable = [...options.writable, ...(options.temp === false ? [] : [tmpdir()])].map((p) => resolve(p));
+		const writable = [...options.writable, ...(options.temp === false ? [] : [safeTemp()])].map((p) => resolve(p));
 		return { file: self[0]!, args: [...self.slice(1), "__contain", JSON.stringify(writable), "--", file, ...args], facility };
 	}
-	const writable = [...options.writable.map(real), ...(options.temp === false ? [] : [real(tmpdir()), "/private/tmp", "/tmp"])].filter((p, i, all) => existsSync(p) && all.indexOf(p) === i);
+	const writable = [...options.writable.map(real), ...(options.temp === false ? [] : [safeTemp(), "/private/tmp", "/tmp"])].filter((p, i, all) => existsSync(p) && all.indexOf(p) === i);
 	const readable = [...options.writable, ...(options.readable ?? [])].map(real).filter((p) => existsSync(p));
 	if (facility === "seatbelt") return { file: "/usr/bin/sandbox-exec", args: ["-p", seatbeltProfile(writable, options.network, readable), file, ...args], facility };
 	// Read-only root, the writable folders bound, a private /tmp, credential folders hidden, every namespace unshared
@@ -197,9 +256,11 @@ export function contained(file: string, args: string[], options: { writable: str
 		...(options.readable ?? []).map(real).filter((p) => existsSync(p)).flatMap((p) => ["--ro-bind", p, p]),
 	];
 	const net = options.network === "none" ? [] : ["--share-net"];
+	// Without temp folders (a replay), the private /tmp and /run that hide the host's sockets can't be written either.
+	const sealed = options.temp === false ? ["--remount-ro", "/tmp", "--remount-ro", "/run"] : [];
 	return {
-		file: "bwrap",
-		args: ["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--tmpfs", "/run", ...hidden, ...binds, "--unshare-all", ...net, "--die-with-parent", "--new-session", "--", file, ...args],
+		file: trustedBwrap() ?? "/usr/bin/bwrap",
+		args: ["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--tmpfs", "/run", ...sealed, ...hidden, ...binds, "--unshare-all", ...net, "--die-with-parent", "--new-session", "--", file, ...args],
 		facility,
 	};
 }
@@ -275,23 +336,64 @@ export class LocalWorkspace implements Workspace {
 	 * Written where the path leads, links followed once here, never following a link at the end, and checked again
 	 * after opening: a link changed meanwhile can't send the bytes somewhere else.
 	 */
+	expand(pattern: string): string[] | undefined {
+		const parts = pattern.split("/");
+		const first = parts.findIndex((part) => /(^|[^\\])[*?[]/.test(part));
+		if (first < 0) return [pattern.replace(/\\(.)/g, "$1")];
+		const prefix = parts.slice(0, first).join("/");
+		const plain = prefix.replace(/\\(.)/g, "$1");
+		const base = pattern.startsWith("/") ? plain || "/" : plain === "~" || plain.startsWith("~/") ? join(homedir(), plain.slice(1)) : resolve(this.root, plain || ".");
+		const out: string[] = [];
+		try {
+			for (const match of new Bun.Glob(parts.slice(first).join("/")).scanSync({ cwd: base, dot: true, onlyFiles: false, followSymlinks: false })) {
+				out.push(prefix || pattern.startsWith("/") ? `${plain === "/" ? "" : plain}/${match}` : match);
+				// More names than can be judged one by one: the command asks.
+				if (out.length > 2_000) return undefined;
+			}
+		} catch {
+			return undefined;
+		}
+		return out;
+	}
+
+	gitSafe(): boolean {
+		const git = trustedGit();
+		if (!git) return false;
+		const r = Bun.spawnSync([git, "config", "--list", "--show-scope", "--includes", "-z"], { cwd: this.root, env: shellSafe({ PATH: process.env.PATH, HOME: process.env.HOME, LANG: process.env.LANG }), stdout: "pipe", stderr: "ignore", timeout: 5_000 });
+		if (r.exitCode !== 0) return false;
+		const fields = r.stdout.toString().split("\0");
+		for (let i = 0; i + 1 < fields.length; i += 2) {
+			// The repository's own settings (which a file edit can change), not the person's global or system ones
+			// (git lfs install sets a filter there for every repository).
+			if (!["local", "worktree", "command"].includes(fields[i]!)) continue;
+			const [key = "", value = ""] = fields[i + 1]!.split("\n");
+			const name = key.toLowerCase();
+			if (GIT_READ_RUNS.test(name)) return false;
+			// core.fsmonitor names a program to run unless it's true (git's own daemon) or false.
+			if (name === "core.fsmonitor" && !/^(true|false|yes|no|on|off|1|0|)$/i.test(value)) return false;
+		}
+		return true;
+	}
+
 	async write(path: string, data: string | Buffer, options: { outside?: boolean } = {}): Promise<void> {
 		const full = this.open(path);
-		const leadsOut = () => !options.outside && !this.inside(path);
-		// Judged where it leads now, before and after making its folder: a link changed since the decision isn't followed.
-		if (leadsOut()) throw new Error(`${this.display(full)} now leads outside the project (a link may have moved); nothing was written.`);
-		await mkdir(dirname(full), { recursive: true });
-		if (leadsOut()) throw new Error(`${this.display(full)} now leads outside the project (a link may have moved); nothing was written.`);
+		// Where it leads now, links followed once, judged before anything is made: a link changed since the decision
+		// isn't followed out of the project.
 		const real = physical(full);
-		const existed = lstatSync(real, { throwIfNoEntry: false }) !== undefined;
-		const fd = openSync(real, constants.O_WRONLY | constants.O_CREAT | constants.O_NOFOLLOW, 0o666);
+		const home = physical(this.root);
+		const rest = relative(home, real);
+		if (!options.outside && (rest.startsWith("..") || isAbsolute(rest))) throw new Error(`${this.display(full)} now leads outside the project (a link may have moved); nothing was written.`);
+		// Then made and opened at that physical path without following a link anywhere (anchored.ts): a folder swapped
+		// for a link meanwhile makes it fail instead of writing somewhere else.
+		let fd: number;
 		try {
-			const opened = fstatSync(fd);
-			const there = lstatSync(real, { throwIfNoEntry: false });
-			if (physical(full) !== real || !there || there.ino !== opened.ino || there.dev !== opened.dev || leadsOut()) {
-				if (!existed && opened.size === 0) rmSync(real, { force: true });
-				throw new Error(`${this.display(full)} changed while it was being written (a link may have moved); nothing was written.`);
-			}
+			mkdirPhysical(dirname(real));
+			fd = openPhysical(real, constants.O_WRONLY | constants.O_CREAT, 0o666);
+		} catch {
+			throw new Error(`${this.display(full)} changed while it was being written (a link may have moved); nothing was written.`);
+		}
+		try {
+			if (!fstatSync(fd).isFile()) throw new Error(`${this.display(full)} isn't a file; nothing was written.`);
 			ftruncateSync(fd, 0);
 			writeSync(fd, typeof data === "string" ? Buffer.from(data) : data, 0, undefined, 0);
 		} finally {
@@ -324,7 +426,7 @@ export class LocalWorkspace implements Workspace {
 		if (options.signal.aborted) return Promise.resolve({ exitCode: null, output: "", timedOut: false });
 		const { file, args } = this.launch(command, !options.unsandboxed);
 		// A contained command runs without asking, so it never sees the engine's keys and tokens: `env` would show them.
-		const base = options.env ?? process.env;
+		const base = shellSafe(options.env ?? process.env);
 		const env = this.sandboxed && !options.unsandboxed ? withoutSecrets(base) : base;
 		return new Promise((done) => {
 			const child = spawn(file, args, {

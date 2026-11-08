@@ -2,8 +2,9 @@
 // turn's file changes can be undone. Shell commands aren't covered; they can change anything.
 
 import { createHash } from "node:crypto";
-import { closeSync, constants, existsSync, fstatSync, ftruncateSync, lstatSync, mkdirSync, openSync, readFileSync, rmSync, statSync, writeFileSync, writeSync } from "node:fs";
+import { closeSync, constants, existsSync, fstatSync, ftruncateSync, lstatSync, mkdirSync, readFileSync, writeFileSync, writeSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { mkdirPhysical, openPhysical, unlinkPhysical } from "../tools/anchored.ts";
 import { physical } from "../tools/workspace.ts";
 
 /**
@@ -28,13 +29,22 @@ export class Checkpoints {
 		const out: FileBefore[] = [];
 		for (const path of paths) {
 			const real = physical(path);
-			if (!existsSync(path)) {
-				out.push({ path, existed: false, real });
+			// Read where the path leads, without following a link anywhere on the way (one swapped in is refused).
+			let fd: number;
+			try {
+				fd = openPhysical(real, constants.O_RDONLY);
+			} catch {
+				if (!lstatSync(real, { throwIfNoEntry: false })) out.push({ path, existed: false, real });
 				continue;
 			}
-			const info = statSync(path);
-			if (!info.isFile() || info.size > MAX_BYTES) continue;
-			const bytes = readFileSync(path);
+			let bytes: Buffer;
+			try {
+				const info = fstatSync(fd);
+				if (!info.isFile() || info.size > MAX_BYTES) continue;
+				bytes = readFileSync(fd);
+			} finally {
+				closeSync(fd);
+			}
 			const blob = createHash("sha256").update(bytes).digest("hex");
 			const file = join(this.dir, blob);
 			if (!existsSync(file)) {
@@ -66,27 +76,27 @@ export class Checkpoints {
 					kept.set(at, now[0]!);
 				}
 				if (file.existed && file.blob) {
-					mkdirSync(dirname(at), { recursive: true });
-					// Opened without truncating or following a link at the end, then checked: the folder above must still be
-					// the one judged (a link swapped in meanwhile is caught) before any byte changes.
-					const existedNow = lstatSync(at, { throwIfNoEntry: false }) !== undefined;
-					const fd = openSync(at, constants.O_WRONLY | constants.O_CREAT | constants.O_NOFOLLOW, 0o666);
+					// Folders made and the file opened without following a link anywhere on the way (anchored.ts), so a
+					// folder swapped for a link meanwhile makes it fail rather than write somewhere else.
+					let fd: number;
 					try {
-						const opened = fstatSync(fd);
-						const there = lstatSync(at, { throwIfNoEntry: false });
-						if (physical(file.path) !== at || !there || there.ino !== opened.ino || there.dev !== opened.dev) {
-							if (!existedNow && opened.size === 0) rmSync(at, { force: true });
-							continue;
-						}
+						mkdirPhysical(dirname(at));
+						fd = openPhysical(at, constants.O_WRONLY | constants.O_CREAT, 0o666);
+					} catch {
+						continue;
+					}
+					try {
+						if (!fstatSync(fd).isFile()) continue;
 						ftruncateSync(fd, 0);
 						writeSync(fd, readFileSync(join(this.dir, file.blob)), 0, undefined, 0);
 					} finally {
 						closeSync(fd);
 					}
 				} else if (!file.existed) {
-					// Removed only while the path still leads here, checked right before.
-					if (physical(file.path) !== at || lstatSync(at, { throwIfNoEntry: false })?.isDirectory()) continue;
-					rmSync(at, { force: true });
+					// Removed the same way: a link anywhere on the path, or a folder there, and it stays.
+					if (lstatSync(at, { throwIfNoEntry: false })?.isDirectory() || !unlinkPhysical(at)) {
+						if (lstatSync(at, { throwIfNoEntry: false })) continue;
+					}
 				}
 				restored.add(file.path);
 			}

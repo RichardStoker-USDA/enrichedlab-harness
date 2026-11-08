@@ -1241,6 +1241,6 @@ function transient(error: unknown): boolean {
 
 /** What a read-only subagent may do: read, search, look things up, and run commands that only read the project. */
 function readOnlyCall(tool: Tool, args: Record<string, unknown>, workspace: Workspace, allowCommands: string[]): boolean {
-	if (tool.kind === "exec") return isReadOnlyCommand(String(args.command ?? ""), allowCommands, (path) => workspace.inside(path));
+	if (tool.kind === "exec") return isReadOnlyCommand(String(args.command ?? ""), allowCommands, (path) => workspace.inside(path), { expand: workspace.expand?.bind(workspace), gitSafe: workspace.gitSafe?.bind(workspace) });
 	return tool.kind === "read" || tool.kind === "site-read" || tool.kind === "net" || (tool.kind === "local" && !tool.name.startsWith("agent_") && tool.name !== "remember");
 }
