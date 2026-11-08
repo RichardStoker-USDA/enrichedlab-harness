@@ -3,7 +3,7 @@ import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "n
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
-export const VERSION = "0.2.29";
+export const VERSION = "0.2.30";
 
 /**
  * How the harness names itself to a lab. Gate files every request under the User-Agent's first word, so the lab's
@@ -13,6 +13,7 @@ export const CLIENT_AGENT = `EnrichedLab/${VERSION} (${process.platform}; ${proc
 
 /** What changed in this version, one line each, newest first. Surfaces show the first lines when a session opens. */
 export const NEWS = [
+	"0.2.30: no more crash when resizing the window with a plot or dashboard open; the agent asks only for what can't be undone (choose Ask, Auto or Allow All beside the model), asks once per folder, and “allow for this session” names what it covers and sticks; every step is kept, so you can go back to before any step or try again from there; the conversation follows new output; UC Davis light and dark colors.",
 	"0.2.29: el lab check reads a lab's published API description (OpenAPI 3.1) where the lab offers one.",
 	"0.2.28: Update Desktop works whether the desktop is running, stopping, stopped or already archived.",
 	"0.2.27: a lab desktop made before the lab updated its desktop shows Update Desktop in its pane, which moves it to the current one and keeps its files; the agent names each window by its app.",

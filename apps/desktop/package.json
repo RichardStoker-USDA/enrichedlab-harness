@@ -1,7 +1,7 @@
 {
   "name": "enrichedlab-desktop",
   "productName": "EnrichedLab",
-  "version": "0.2.29",
+  "version": "0.2.30",
   "private": true,
   "description": "The EnrichedLab desktop window",
   "license": "CC0-1.0",
