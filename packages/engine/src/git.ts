@@ -53,13 +53,20 @@ function git(cwd: string, args: string[], env?: Record<string, string>): string 
 	if (!contained(full[0]!, [], { writable: [], network: "none" }).facility) {
 		const names = (() => {
 			try {
-				return execFileSync(program, ["config", "--name-only", "--get-regexp", "^filter\\."], options).split("\n");
+				// Every scope, includes followed (git config reads them by default when no file is named).
+				return execFileSync(program, ["config", "--name-only", "--get-regexp", "^(filter|diff)\\."], options).split("\n");
 			} catch {
 				return [];
 			}
 		})();
-		const drivers = [...new Set(names.map((n) => /^filter\.(.+)\.[^.]+$/.exec(n.trim())?.[1]).filter((d): d is string => Boolean(d)))];
-		const off = drivers.flatMap((d) => ["-c", `filter.${d}.clean=`, "-c", `filter.${d}.smudge=`, "-c", `filter.${d}.process=`, "-c", `filter.${d}.required=false`]);
+		const named = (kind: string) => [...new Set(names.map((n) => new RegExp(`^${kind}\\.(.+)\\.[^.]+$`).exec(n.trim())?.[1]).filter((d): d is string => Boolean(d)))];
+		const off = [
+			...named("filter").flatMap((d) => ["-c", `filter.${d}.clean=`, "-c", `filter.${d}.smudge=`, "-c", `filter.${d}.process=`, "-c", `filter.${d}.required=false`]),
+			// The engine's git lists names only (no merges, no diff content), but diff drivers go too.
+			...named("diff").flatMap((d) => ["-c", `diff.${d}.textconv=`, "-c", `diff.${d}.command=`]),
+			"-c",
+			"diff.external=",
+		];
 		return execFileSync(program, [...full.slice(1, 5), ...off, ...full.slice(5)], options).trim();
 	}
 	const launch = contained(full[0]!, full.slice(1), { writable, network: "none" });

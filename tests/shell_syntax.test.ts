@@ -8,7 +8,7 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { LabConfig } from "../packages/engine/src/config.ts";
 import { allowKeys, decide, HIDDEN_REASON, PUSH_REASON } from "../packages/engine/src/permissions.ts";
-import { snapshot } from "../packages/engine/src/git.ts";
+import { restoreSnapshot, snapshot } from "../packages/engine/src/git.ts";
 import { mkdirPhysical, openPhysical, unlinkPhysical } from "../packages/engine/src/tools/anchored.ts";
 import { isReadOnlyCommand } from "../packages/engine/src/tools/shell.ts";
 import type { Tool } from "../packages/engine/src/tools/types.ts";
@@ -324,6 +324,54 @@ describe("round 5: one boundary", () => {
 		} finally {
 			rmSync(repo, { recursive: true, force: true });
 			rmSync(outside, { recursive: true, force: true });
+		}
+	});
+
+	test.skipIf(process.platform !== "darwin")("a .git file or core.worktree pointing elsewhere gives the engine's git nothing more to write", () => {
+		const base = realpathSync(mkdtempSync(join(homedir(), ".el-gitlayout-")));
+		try {
+			const git = trustedGit()!;
+			// A .git file sending git to a repository outside the project.
+			const outsideRepo = join(base, "outside");
+			mkdirSync(outsideRepo);
+			spawnSync(git, ["init", "-q"], { cwd: outsideRepo });
+			const project = join(base, "project");
+			mkdirSync(project);
+			writeFileSync(join(project, ".git"), `gitdir: ${join(outsideRepo, ".git")}\n`);
+			writeFileSync(join(project, "a.txt"), "x");
+			const objects = () => spawnSync("find", [join(outsideRepo, ".git", "objects"), "-type", "f"], { encoding: "utf8" }).stdout;
+			const before = objects();
+			try {
+				snapshot(project, "s1", "test");
+			} catch {
+				// Refused writes make it fail: closed, not open.
+			}
+			expect(objects()).toBe(before);
+			// core.worktree naming a folder outside: a restore can't write there.
+			const repo = join(base, "repo");
+			const tree = join(base, "tree");
+			mkdirSync(repo);
+			mkdirSync(tree);
+			spawnSync(git, ["init", "-q"], { cwd: repo });
+			spawnSync(git, ["config", "core.worktree", tree], { cwd: repo });
+			writeFileSync(join(tree, "f.txt"), "keep");
+			let commit = "";
+			try {
+				commit = snapshot(repo, "s2", "test");
+			} catch {
+				// Either way, the folder outside must stay as it is.
+			}
+			rmSync(join(tree, "f.txt"));
+			if (commit) {
+				try {
+					restoreSnapshot(repo, commit);
+				} catch {
+					// Refused.
+				}
+			}
+			expect(existsSync(join(tree, "f.txt"))).toBe(false);
+		} finally {
+			rmSync(base, { recursive: true, force: true });
 		}
 	});
 });
