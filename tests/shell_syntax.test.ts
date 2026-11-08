@@ -374,5 +374,23 @@ describe("round 5: one boundary", () => {
 			rmSync(base, { recursive: true, force: true });
 		}
 	});
+
+	test("the engine's git runs only the reviewed subcommands, none of which merges or runs a diff driver", () => {
+		// Adding a git command to git.ts means reviewing it here: merge, rebase, cherry-pick or checkout -m would run a
+		// merge driver, and diff or show with content would run a textconv, which the no-facility fallback leaves on.
+		const source = readFileSync(join(import.meta.dir, "..", "packages", "engine", "src", "git.ts"), "utf8");
+		const calls = [...source.matchAll(/git\([a-zA-Z.]+, \[("[a-z-]+")([^\]]*)\]/g)].map((m) => ({ sub: JSON.parse(m[1]!) as string, rest: m[2]! }));
+		const reviewed = new Set(["add", "branch", "bundle", "checkout-index", "commit-tree", "config", "diff", "fetch", "log", "ls-files", "ls-tree", "read-tree", "rev-list", "rev-parse", "rm", "show", "update-index", "update-ref", "worktree", "write-tree"]);
+		expect(calls.length).toBeGreaterThan(20);
+		expect(calls.map((c) => c.sub).filter((s) => !reviewed.has(s))).toEqual([]);
+		for (const c of calls.filter((x) => x.sub === "diff")) expect(c.rest).toContain('"--name-only"');
+		for (const c of calls.filter((x) => x.sub === "show")) expect(c.rest).toContain('"-s"');
+		for (const c of calls.filter((x) => x.sub === "log")) expect(c.rest).not.toMatch(/"-p"|"--patch"|"--stat"|textconv/);
+		// Every process git.ts starts goes through its contained helper.
+		expect((source.match(/execFileSync\(/g) ?? []).length).toBe(4);
+		expect(source.match(/from "node:child_process"/g)?.length).toBe(1);
+		expect(source).toContain('import { execFileSync } from "node:child_process";');
+		expect(source).not.toMatch(/Bun\.spawn|spawnSync\(|execSync\(/);
+	});
 });
 
