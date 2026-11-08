@@ -9,12 +9,12 @@
 
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import type { SessionEvent, SessionSummary } from "@enrichedlab/protocol";
 import { commandWords } from "../tools/shell.ts";
-import { LocalWorkspace } from "../tools/workspace.ts";
+import { contained, physical } from "../tools/workspace.ts";
 
 const CRATE = "https://w3id.org/ro/crate/1.3";
 const PROFILE = "https://w3id.org/ro/wfrun/process/0.6";
@@ -144,6 +144,21 @@ function packaged(folder: string, id: string): string | undefined {
 	return statSync(at).isFile() ? at : undefined;
 }
 
+/** A package file's bytes, opened without following a link and checked again once open; undefined when it isn't safe. */
+function readPackaged(folder: string, id: string): Buffer | undefined {
+	const at = packaged(folder, id);
+	if (!at) return undefined;
+	const fd = openSync(at, constants.O_RDONLY | constants.O_NOFOLLOW);
+	try {
+		const opened = fstatSync(fd);
+		const there = lstatSync(at, { throwIfNoEntry: false });
+		if (!opened.isFile() || !there || there.ino !== opened.ino || there.dev !== opened.dev || packaged(folder, id) !== at) return undefined;
+		return readFileSync(fd);
+	} finally {
+		closeSync(fd);
+	}
+}
+
 /** Write the package into `folder`; answers what it holds. */
 export function writePackage(folder: string, input: PackageInput): { files: number; actions: number; history: boolean } {
 	mkdirSync(join(folder, "images"), { recursive: true });
@@ -165,10 +180,20 @@ export function writePackage(folder: string, input: PackageInput): { files: numb
 	const cwd = input.summary.cwd;
 
 	// The project's package environment, exactly: pixi.toml and pixi.lock (docs/apps.md).
+	// What goes in is read where it really is, and only when that's inside the project and a plain file: a link to a
+	// file elsewhere (a private one, say) is left out.
+	const home = local ? physical(cwd) : cwd;
+	const own = (path: string): Buffer | undefined => {
+		const real = physical(isAbsolute(path) ? path : `${cwd}/${path}`);
+		const inside = relative(home, real);
+		if (!inside || inside.startsWith("..") || isAbsolute(inside)) return undefined;
+		const info = lstatSync(real, { throwIfNoEntry: false });
+		return info?.isFile() ? readFileSync(real) : undefined;
+	};
 	if (local) {
 		for (const name of ["pixi.toml", "pixi.lock"]) {
-			const full = join(cwd, name);
-			if (existsSync(full) && statSync(full).isFile()) file(`environment/${name}`, readFileSync(full), { name, description: name === "pixi.lock" ? "The exact package versions the project's environment had when this was packaged." : "The project's package environment: what it asks for, from which channels." });
+			const bytes = own(name);
+			if (bytes) file(`environment/${name}`, bytes, { name, description: name === "pixi.lock" ? "The exact package versions the project's environment had when this was packaged." : "The project's package environment: what it asks for, from which channels." });
 		}
 	}
 
@@ -188,11 +213,11 @@ export function writePackage(folder: string, input: PackageInput): { files: numb
 		for (const path of [...changed].sort()) {
 			const full = isAbsolute(path) ? path : resolve(cwd, path);
 			const inside = relative(cwd, full);
-			if (inside.startsWith("..") || isAbsolute(inside) || !existsSync(full) || !statSync(full).isFile()) continue;
+			const bytes = inside.startsWith("..") || isAbsolute(inside) ? undefined : own(path);
+			if (!bytes) continue;
 			const target = join("files", inside).split("\\").join("/");
-			const bytes = readFileSync(full);
 			mkdirSync(join(folder, target, ".."), { recursive: true });
-			copyFileSync(full, join(folder, target));
+			writeFileSync(join(folder, target), bytes);
 			graph.push({ "@id": target, "@type": "File", name: inside, contentSize: String(bytes.length), sha256: sha256(bytes), description: "A file the session changed, as it is now." });
 			parts.push({ "@id": target });
 			copied++;
@@ -320,9 +345,9 @@ export interface CheckRow {
 /** Check a run package: every file against its checksum, the history bundle, and every content id the steps name. */
 export function verifyPackage(folder: string): CheckRow[] {
 	const rows: CheckRow[] = [];
-	const metaPath = join(folder, "ro-crate-metadata.json");
-	if (!existsSync(metaPath)) return [{ check: "metadata", ok: false, detail: "no ro-crate-metadata.json" }];
-	const graph = (JSON.parse(readFileSync(metaPath, "utf8")) as { "@graph": Entity[] })["@graph"];
+	const meta = readPackaged(folder, "ro-crate-metadata.json");
+	if (!meta) return [{ check: "metadata", ok: false, detail: "no ro-crate-metadata.json as a plain file in the package" }];
+	const graph = (JSON.parse(meta.toString("utf8")) as { "@graph": Entity[] })["@graph"];
 	const root = graph.find((e) => e["@id"] === "./");
 	rows.push({ check: "metadata", ok: !!root && JSON.stringify(root.conformsTo ?? "").includes(PROFILE), detail: root ? "RO-Crate 1.3, Process Run Crate 0.6" : "no root dataset" });
 	let bad = 0;
@@ -330,11 +355,11 @@ export function verifyPackage(folder: string): CheckRow[] {
 	for (const e of graph) {
 		if (e["@type"] !== "File" || typeof e.sha256 !== "string" || e["@id"].startsWith("#")) continue;
 		checked++;
-		const full = packaged(folder, e["@id"]);
-		if (!full) {
+		const bytes = readPackaged(folder, e["@id"]);
+		if (!bytes) {
 			bad++;
 			rows.push({ check: e["@id"], ok: false, detail: "missing, outside the package, or reached through a link" });
-		} else if (sha256(readFileSync(full)) !== e.sha256) {
+		} else if (sha256(bytes) !== e.sha256) {
 			bad++;
 			rows.push({ check: e["@id"], ok: false, detail: "checksum differs" });
 		}
@@ -390,7 +415,9 @@ const SKIP = [".git", "node_modules", ".venv", "venv", ".pixi", "__pycache__", "
  * environment). Then every file is compared with what the step left. The scratch folder is removed afterwards.
  */
 export async function reproduceStep(folder: string, step: string, options: { prepare?: (dir: string) => Promise<void>; timeoutMs?: number } = {}): Promise<Reproduced> {
-	const graph = (JSON.parse(readFileSync(join(folder, "ro-crate-metadata.json"), "utf8")) as { "@graph": Entity[] })["@graph"];
+	const meta = readPackaged(folder, "ro-crate-metadata.json");
+	if (!meta) throw new Error("The package has no ro-crate-metadata.json as a plain file.");
+	const graph = (JSON.parse(meta.toString("utf8")) as { "@graph": Entity[] })["@graph"];
 	const action = graph.find((e) => e["@id"] === step || e["@id"] === `#call-${step}`);
 	if (!action) throw new Error(`No step ${step} in this package. Its steps are the #call-… entries in ro-crate-metadata.json.`);
 	const command = action[`${TERMS}command`];
@@ -419,8 +446,17 @@ export async function reproduceStep(folder: string, step: string, options: { pre
 		run(["read-tree", before], index);
 		run(["checkout-index", "-a", "-f"], index);
 		await options.prepare?.(work);
-		const ws = new LocalWorkspace(work, "workspace");
-		const ran = await ws.exec(command, { timeoutMs: options.timeoutMs ?? 600_000, signal: AbortSignal.timeout((options.timeoutMs ?? 600_000) + 10_000) });
+		// Its own policy: writes only in the scratch folder (not the system's temp folders), no network, and an
+		// environment of a few plain variables, nothing inherited. No facility here: it doesn't run.
+		const temp = join(work, ".tmp");
+		mkdirSync(temp);
+		const launch = contained("/bin/sh", ["-c", command], { writable: [work], network: "none" });
+		if (!launch.facility || launch.facility === "restricted-token") throw new Error("This computer can't contain the rerun (it needs Seatbelt on macOS or bubblewrap on Linux), so it didn't run.");
+		const env: Record<string, string> = { PATH: "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin", HOME: work, TMPDIR: temp, LANG: process.env.LANG ?? "C.UTF-8", TZ: "UTC" };
+		const timeout = options.timeoutMs ?? 600_000;
+		const proc = spawnSync(launch.file, launch.args, { cwd: work, env, encoding: "utf8", timeout, maxBuffer: 64 * 1024 * 1024 });
+		const ran = { exitCode: proc.status, output: `${proc.stdout ?? ""}${proc.stderr ?? ""}` };
+		rmSync(temp, { recursive: true, force: true });
 		run(["add", "--all", "--force", "--", ".", ...SKIP], index);
 		const now = run(["write-tree"], index).trim();
 		const changedNow = run(["diff", "--name-only", "--no-renames", "-z", before, now]).split("\0").filter(Boolean);

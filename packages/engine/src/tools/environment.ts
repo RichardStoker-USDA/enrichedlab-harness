@@ -3,12 +3,12 @@
 // another project, the install is contained, and pixi.toml with pixi.lock records exactly what is there, so step
 // history can take a change back and a lab can build the same environment.
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { pixi, pixiPresent } from "../apps/environments.ts";
 import { type Tool, ToolError } from "./types.ts";
-import { contained } from "./workspace.ts";
+import { contained, physical } from "./workspace.ts";
 
 /** Where a lab's vetted packages come from (its descriptor's `packages`). */
 export interface PackageSources {
@@ -46,6 +46,8 @@ async function installed(program: string, root: string, env: Record<string, stri
 async function run(program: string, args: string[], root: string, env: Record<string, string>, log: (line: string) => void): Promise<string> {
 	const caches = env.PIXI_CACHE_DIR!;
 	const launch = contained(program, args, { writable: [root, caches], readable: [program], network: "all" });
+	// Package install scripts never run uncontained: no facility here, no install.
+	if (!launch.facility) throw new ToolError("This computer has no sandbox to contain package installs (Seatbelt on macOS, bubblewrap on Linux), so nothing was installed.");
 	const child = Bun.spawn([launch.file, ...launch.args], { cwd: tmpdir(), stdout: "pipe", stderr: "pipe", env });
 	let out = "";
 	let err = "";
@@ -84,7 +86,13 @@ export const environmentTool: Tool<{ action: Action; packages?: string[]; pypi?:
 	async run(args, ctx) {
 		if (ctx.workspace.kind !== "local") throw new ToolError("A lab's sandbox has no network: its packages come from the lab's image. Ask the lab for what's missing.");
 		if (args.folder && !ctx.workspace.inside(args.folder)) throw new ToolError("The folder must be inside the project.");
-		const root = ctx.workspace.resolve(args.folder ?? ".");
+		// Pinned to where the folder leads now, links followed, and kept inside the project for every step below.
+		const root = physical(ctx.workspace.resolve(args.folder ?? "."));
+		const pinned = () => {
+			if (!ctx.workspace.inside(root) || physical(ctx.workspace.resolve(args.folder ?? ".")) !== root) throw new ToolError("The environment's folder moved outside the project (a link may have changed); nothing was installed.");
+			for (const name of ["pixi.toml", "pixi.lock"]) if (lstatSync(join(root, name), { throwIfNoEntry: false })?.isSymbolicLink()) throw new ToolError(`${name} is a link; the environment's files must be the project's own.`);
+		};
+		pinned();
 		const packages = (args.packages ?? []).map((p) => p.trim()).filter(Boolean);
 		for (const p of packages) if (!/^[A-Za-z0-9][A-Za-z0-9_.\-]*(\[[A-Za-z0-9_,.\-]+\])?\s*([=<>!~]=?\s*[A-Za-z0-9_.*+!\-]+(\s*,\s*[=<>!~]=?\s*[A-Za-z0-9_.*+!\-]+)*)?$/.test(p)) throw new ToolError(`“${p}” isn't a package name with an optional version.`);
 		if ((args.action === "add" || args.action === "remove") && !packages.length) throw new ToolError(`Name the packages to ${args.action}.`);
@@ -99,6 +107,7 @@ export const environmentTool: Tool<{ action: Action; packages?: string[]; pypi?:
 		const env: Record<string, string> = { PIXI_NO_PATH_UPDATE: "1", PIXI_CACHE_DIR: caches, PIXI_HOME: caches };
 		for (const key of ["PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "SYSTEMROOT", "SSL_CERT_FILE", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY"]) if (process.env[key]) env[key] = process.env[key]!;
 		const file = join(root, "pixi.toml");
+		pinned();
 		const made = !existsSync(file);
 		if (made) {
 			if (args.action === "list" || args.action === "remove") return { ok: true, content: "This project has no environment yet. Add packages to make one." };
@@ -107,6 +116,7 @@ export const environmentTool: Tool<{ action: Action; packages?: string[]; pypi?:
 		const manifestPath = ["--manifest-path", file];
 		const before = made ? new Map<string, string>() : await installed(program, root, env);
 		const log = (line: string) => ctx.output(`${line}\n`);
+		pinned();
 		switch (args.action) {
 			case "list":
 				break;
