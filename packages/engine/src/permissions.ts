@@ -9,7 +9,8 @@
 // - full: never asks, except pushing to a remote and lab tools the lab hasn't reviewed.
 // "Allow for this session" is remembered per program (python, git commit), per host, per tool, and kept in the log.
 
-import { basename, sep } from "node:path";
+import { realpathSync } from "node:fs";
+import { basename, dirname, join, resolve, sep } from "node:path";
 import type { FolderAccess, LabConfig, PermissionMode } from "./config.ts";
 import { isReadOnlyCommand, pathsInside } from "./tools/shell.ts";
 import type { Tool } from "./tools/types.ts";
@@ -35,14 +36,45 @@ export function modeOf(mode: string | undefined): PermissionMode {
 	return mode === "full" ? "full" : mode === "ask" ? "ask" : "auto";
 }
 
-/** What the person let EnrichedLab do in the folder holding `path`: the nearest granted folder decides. */
+/**
+ * A path as the disk knows it: symlinks followed and letters in the disk's own case (so /tmp and /private/tmp, or
+ * /Project and /project on a case-insensitive disk, are one folder). A path that doesn't exist yet takes its nearest
+ * existing parent's.
+ */
+export function canonical(path: string): string {
+	let at = resolve(path);
+	const rest: string[] = [];
+	for (;;) {
+		try {
+			return join(realpathSync.native(at), ...rest.reverse());
+		} catch {
+			const up = dirname(at);
+			if (up === at) return resolve(path);
+			rest.push(basename(at));
+			at = up;
+		}
+	}
+}
+
+/** What the person let EnrichedLab do at `path`: the nearest folder they answered for decides. */
 export function folderAccess(config: LabConfig, path: string): FolderAccess | undefined {
+	const target = canonical(path);
 	let best: { folder: string; access: FolderAccess } | undefined;
-	for (const [folder, grant] of Object.entries(config.folders ?? {})) {
-		const inside = path === folder || path.startsWith(folder.endsWith(sep) ? folder : folder + sep);
+	for (const [saved, grant] of Object.entries(config.folders ?? {})) {
+		const folder = canonical(saved);
+		const inside = target === folder || target.startsWith(folder.endsWith(sep) ? folder : folder + sep);
 		if (inside && (!best || folder.length > best.folder.length)) best = { folder, access: grant.access };
 	}
 	return best?.access;
+}
+
+/** A folder inside `root` (or `root` itself) set to read only: contained commands there can't be told apart, so they ask. */
+function readOnlyWithin(config: LabConfig, root: string): boolean {
+	const base = canonical(root);
+	return Object.entries(config.folders ?? {}).some(([saved, grant]) => {
+		const folder = canonical(saved);
+		return grant.access === "read" && (folder === base || folder.startsWith(base.endsWith(sep) ? base : base + sep) || base.startsWith(folder + sep));
+	});
 }
 
 /** Tools whose first argument names the action: keyed by both words, so "git status" doesn't allow "git push". */
@@ -54,29 +86,100 @@ const SUBCOMMANDS = new Set([
 /** Tools that change files in the project. Other writes (browser actions, apps, memory, PDF forms) are each their own. */
 const FILE_EDITS = new Set(["write", "edit"]);
 
-/** Shell words that only move around or say something: they don't need their own answer. */
-const QUIET = new Set(["cd", "pushd", "popd", "true", "false", ":", "echo", "printf", "pwd", "test", "["]);
-/** Wrappers whose next word is the program that runs. */
-const WRAPPERS = new Set(["time", "timeout", "nohup", "nice", "command", "builtin"]);
+/** Shell words that only move around or say something: no answer of their own (nothing they print is redirected). */
+const QUIET = new Set(["cd", "pushd", "popd", "pwd", "true", "false", "echo", "printf", "test", "[", ":"]);
+/**
+ * Words that start shell syntax (control flow, grouping, functions) or run what follows them (another program, an
+ * admin, another computer, AppleScript): a command holding one is remembered exactly.
+ */
+const EXACT = new Set([
+	"if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done", "case", "esac", "in", "function", "select", "coproc",
+	"{", "}", "!", "[[", "]]", "time", "exec", "eval", "source", ".", "alias", "sudo", "doas", "su", "ssh", "osascript", "xargs",
+	"env", "watch", "timeout", "nohup", "nice", "command", "builtin", "open", "start", "cmd", "Invoke-Expression", "iex",
+]);
 
-/** The programs a shell command runs: one entry per simple command, keyed as an answer remembers it. */
+/**
+ * The simple commands of a shell line, as their words, quote-aware. Undefined when the line holds anything whose effect
+ * the words don't show: substitutions, process substitution, here-documents, subshells or groups, unbalanced quotes,
+ * or output written to a file (descriptor copies like 2>&1 and writes to /dev/null are fine).
+ */
+function simpleCommands(line: string): string[][] | undefined {
+	const commands: string[][] = [];
+	let words: string[] = [];
+	let word = "";
+	let quoted = false;
+	let quote: "'" | '"' | undefined;
+	const endWord = () => {
+		if (word || quoted) words.push(word);
+		word = "";
+		quoted = false;
+	};
+	const endCommand = () => {
+		endWord();
+		if (words.length) commands.push(words);
+		words = [];
+	};
+	for (let i = 0; i < line.length; i++) {
+		const c = line[i]!;
+		if (quote) {
+			if (c === quote) quote = undefined;
+			else if (quote === '"' && (c === "$" || c === "`")) return undefined;
+			else if (quote === '"' && c === "\\") word += line[++i] ?? "";
+			else word += c;
+			continue;
+		}
+		if (c === "'" || c === '"') {
+			quote = c;
+			quoted = true;
+		} else if (c === "\\") {
+			const next = line[++i];
+			if (next === "\n") continue;
+			word += next ?? "";
+		} else if (c === "`" || c === "(" || c === ")" || (c === "$" && line[i + 1] === "(")) return undefined;
+		else if (c === " " || c === "\t") endWord();
+		else if (c === ";" || c === "\n") endCommand();
+		else if (c === "|" || (c === "&" && line[i + 1] === "&")) {
+			endCommand();
+			if (line[i + 1] === c || line[i + 1] === "&") i++;
+		} else if (c === ">" || c === "<" || (c === "&" && line[i + 1] === ">")) {
+			// A redirection: an optional descriptor number before it, the operator, then its target.
+			const fd = /^\d+$/.test(word) ? word : "";
+			if (fd) word = "";
+			else endWord();
+			let op = c;
+			while (">&|<".includes(line[i + 1] ?? "x") && op.length < 3) op += line[++i];
+			if (op.startsWith("<<") || line[i + 1] === "(") return undefined;
+			let target = "";
+			while (line[i + 1] === " ") i++;
+			while (i + 1 < line.length && !" \t;|&<>()\n".includes(line[i + 1]!)) target += line[++i];
+			const copy = /&$/.test(op) && /^(\d+|-)$/.test(target);
+			const writes = op.includes(">") && !copy && target !== "/dev/null";
+			if (writes || (!copy && !target)) return undefined;
+		} else if (c === "&") endCommand();
+		else word += c;
+	}
+	if (quote) return undefined;
+	endCommand();
+	return commands;
+}
+
+/** The programs a shell line runs, keyed as an answer remembers them; undefined when it must be remembered exactly. */
 function commandKeys(command: string): { keys: string[]; names: string[] } | undefined {
-	// Substitutions and here-documents run code the words don't show: such a command is remembered exactly.
-	if (/\$\(|`|<\(|>\(|<<|\beval\b/.test(command)) return undefined;
+	const commands = simpleCommands(command);
+	if (!commands) return undefined;
 	const keys = new Set<string>();
 	const names = new Set<string>();
-	for (const part of command.split(/&&|\|\||[;|\n&]/)) {
-		const words = part.trim().split(/\s+/).filter(Boolean);
-		while (words.length && /^\w+=/.test(words[0]!)) words.shift();
-		while (words.length && WRAPPERS.has(words[0]!)) {
-			words.shift();
-			while (words.length && (words[0]!.startsWith("-") || /^\d+[smh]?$/.test(words[0]!))) words.shift();
-		}
-		const first = (words[0] ?? "").replace(/^.*\//, "");
-		if (!first || QUIET.has(first) || /^[<>0-9]/.test(first)) continue;
-		// These hand the rest of the line to something else (another computer, an admin, AppleScript): exact only.
-		if (["sudo", "doas", "ssh", "osascript", "exec", "xargs", "env", "watch", "open", "start", "cmd", "Invoke-Expression", "iex"].includes(first)) return undefined;
-		if (SUBCOMMANDS.has(first) && words[1] && !words[1].startsWith("-")) {
+	for (const all of commands) {
+		const words = [...all];
+		while (words.length && /^[A-Za-z_]\w*=/.test(words[0]!)) words.shift();
+		const first = words[0];
+		if (!first) continue;
+		// A program named by a variable, a pattern or a relative path depends on more than the words: exact.
+		if (EXACT.has(first) || /[$*?[\]{}~]/.test(first) || (first.includes("/") && !first.startsWith("/"))) return undefined;
+		if (QUIET.has(first)) continue;
+		if (SUBCOMMANDS.has(first) && words[1]) {
+			// Options before the action (git -C dir reset) would hide which action it is.
+			if (words[1].startsWith("-")) return undefined;
 			keys.add(`shell:${first} ${words[1]}`);
 			names.add(`${first} ${words[1]}`);
 		} else {
@@ -188,9 +291,6 @@ export const PUSH_REASON = "It pushes to a remote.";
 /** Built-in tools that, in a lab's sandbox, act only there: reading, file edits and commands. */
 const IN_SANDBOX = new Set(["read", "sandbox", "exec"]);
 
-/** Writes that aren't file edits but stay in the project, where history can take them back. */
-const PROJECT_WRITES = new Set(["app_create", "pdf_fill"]);
-
 /**
  * `discovery`: the lab where Discovery mode applies to this session now (docs/research.md). `mode`: the session's
  * own mode, when the person set one for it; otherwise the configured one.
@@ -214,6 +314,10 @@ export function decide(tool: Tool, args: Record<string, unknown>, workspace: Wor
 	const askOutside = (reason: string): Verdict => ({ action: "ask", reason, keys: [outside], scope: "this path" });
 	const local = workspace.kind === "local";
 	const access = local ? folderAccess(config, workspace.root) : undefined;
+	// What a write lands on decides, not the session's folder: a read-only folder inside it stays read only.
+	const named = tool.touches?.(args) ?? (typeof args.path === "string" ? [args.path] : []);
+	const targets = local && tool.kind === "write" ? named.filter(Boolean).map((path) => workspace.resolve(path)) : [];
+	const targetAccess = targets.length ? (targets.some((path) => folderAccess(config, path) !== "change") ? (targets.some((path) => folderAccess(config, path) === "read") ? "read" : undefined) : "change") : access;
 	switch (tool.kind) {
 		case "net": {
 			// The engine's own ports show the person's sandbox apps; nothing goes anywhere the person didn't send it.
@@ -233,13 +337,13 @@ export function decide(tool: Tool, args: Record<string, unknown>, workspace: Wor
 			// File edits in a session's own worktree go to its own branch, and work in a lab's sandbox comes home as a
 			// branch: the person reviews them when they merge.
 			if (edit && (ownWorktree(workspace) || workspace.sandboxed === "site")) return { action: "run" };
-			if (mode === "auto" && (edit || PROJECT_WRITES.has(tool.name))) {
+			if (mode === "auto" && edit) {
 				// Kept in history, so it can be taken back: runs where the person let EnrichedLab change the folder.
-				if (!local || access === "change") return { action: "run" };
-				if (access === "read") return ask("It changes a file, and you set this folder to read only.");
-				return ask(`It changes a file in “${basename(workspace.root)}”, a folder you haven't let EnrichedLab change yet.`, workspace.root);
+				if (!local || targetAccess === "change") return { action: "run" };
+				if (targetAccess === "read") return ask("It changes a file in a folder you set to read only.");
+				return ask(`It changes a file in “${basename(workspace.root)}”, a folder you haven't let EnrichedLab change yet.`, access === undefined ? workspace.root : undefined);
 			}
-			// Other writes (a click in the browser, a note to memory) ask in every mode until allowed.
+			// Other writes (a click in the browser, a note to memory, a filled PDF) ask in every mode until allowed.
 			return ask(edit ? "It changes a file." : `It ${WRITES[tool.name] ?? (tool.name.endsWith("_sandbox_download") ? "copies a file from the sandbox into the project" : "changes something")}.`, edit && local && access === undefined ? workspace.root : undefined);
 		}
 		case "exec": {
@@ -250,7 +354,7 @@ export function decide(tool: Tool, args: Record<string, unknown>, workspace: Wor
 			// names a path outside the project or expands variables (the sandbox can still read most of the disk).
 			// Windows contains writes only, so there it still asks. A folder set to read only asks for everything.
 			const contained = workspace.sandboxed && FULL_CONTAINMENT.has(workspace.sandboxed) && args.unsandboxed !== true;
-			if (contained && access !== "read" && pathsInside(command, (path) => workspace.inside(path), workspace.kind === "sandbox" || process.platform !== "win32")) return { action: "run" };
+			if (contained && !(local && readOnlyWithin(config, workspace.root)) && pathsInside(command, (path) => workspace.inside(path), workspace.kind === "sandbox" || process.platform !== "win32")) return { action: "run" };
 			if (isReadOnlyCommand(command, config.permissions.allowCommands, (path) => workspace.inside(path))) return { action: "run" };
 			// In a lab's sandbox whose whole disk is checkpointed, any command can be taken back.
 			if (mode === "auto" && workspace.kind === "sandbox" && workspace.checkpointed === "filesystem" && args.unsandboxed !== true) return { action: "run" };

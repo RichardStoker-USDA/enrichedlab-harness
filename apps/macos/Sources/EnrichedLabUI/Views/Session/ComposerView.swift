@@ -280,7 +280,7 @@ struct ApprovalsMenu: View {
 			Section("Asks Before It Acts") {
 				ForEach(PermissionMode.allCases, id: \.self) { mode in
 					Button {
-						Task { await session.setPermissions(mode == app.ui.permissionMode ? nil : mode) }
+						Task { await session.setPermissions(mode) }
 					} label: {
 						if mode == current { Image(systemName: "checkmark") }
 						Text(mode.title)
@@ -289,7 +289,7 @@ struct ApprovalsMenu: View {
 				}
 			}
 			Divider()
-			Text("New sessions start with “\(app.ui.permissionMode.title)”. Change it in Settings.")
+			Text("New sessions start with “\(app.ui.permissionMode.title)”. Change that in Settings.")
 		} label: {
 			HStack(spacing: 5) {
 				Image(systemName: current == .full ? "bolt.shield" : current == .auto ? "checkmark.shield" : "hand.raised")

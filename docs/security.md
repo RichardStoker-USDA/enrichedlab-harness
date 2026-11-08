@@ -39,10 +39,16 @@ Changes in this folder", which saves the same answer.
 
 "Allow for this session" covers what the button names and nothing wider, and is kept in the session log (an `allow`
 event), so it outlasts a restart. A command is remembered per program it runs (`touch`, `rm`, `git commit`), so
-`python3 a.py | grep x` and `python3 b.py | grep y` share an answer; a command with substitutions or here-documents,
-or one that hands the line to another program (`sudo`, `ssh`, `xargs`, `env`), is remembered exactly. File edits
-share one answer; each other kind of change (a click or typing in the browser, a new app, a memory or skill, a filled
-PDF, a sandbox download) has its own. A session's own worktree runs file edits. In a lab's sandbox, commands and file
+`python3 a.py | grep x` and `python3 b.py | grep y` share an answer. A program named by its full path is remembered
+by that path. A line is remembered exactly when its words don't show everything it runs: substitutions, process
+substitution, here-documents, subshells, groups and functions, control flow, a program named by a variable or a
+relative path, options before a subcommand (`git -C dir reset`), output written to a file, or a program that runs
+what follows it (`sudo`, `ssh`, `env`, `timeout`, `xargs`). File edits share one answer; each other kind of change (a
+click or typing in the browser, a new app, a memory or skill, a filled PDF, a sandbox download) has its own, and asks
+in every mode until allowed. Folder answers apply to what a change lands on, by the folder's real path (symlinks
+followed, the disk's own letter case), so a read-only folder inside one that may change stays read only. A session
+keeps the mode it started with; a subagent asks as much as the session that started it. A session's own worktree
+runs file edits. In a lab's sandbox, commands and file
 edits inside the project run without asking: the sandbox is a separate machine with no network, and its work comes
 home as a branch the person merges. Commands that change lab data outside the project ask, unless the lab
 checkpoints the whole sandbox disk (`endpoints.checkpoints`) and the session is in `auto`. An answer about a path

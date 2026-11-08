@@ -168,10 +168,25 @@ describe("permissions", () => {
 		// A parent folder's answer covers the folders inside it.
 		expect(decide(edit, { path: "a.ts" }, ws, auto({ [dirname(ws.root)]: { access: "change", at: "" } }), new Set()).action).toBe("run");
 		const readOnly = decide(edit, { path: "a.ts" }, ws, auto({ [ws.root]: { access: "read", at: "" } }), new Set());
-		expect(readOnly).toMatchObject({ action: "ask", reason: "It changes a file, and you set this folder to read only." });
+		expect(readOnly).toMatchObject({ action: "ask", reason: "It changes a file in a folder you set to read only." });
 		expect("folder" in readOnly).toBe(false);
 		// A signed-in browser can't be taken back: it asks whatever the folder allows.
 		expect(decide(click, { ref: "e3" }, ws, auto({ [ws.root]: { access: "change", at: "" } }), new Set()).action).toBe("ask");
+		// What the write lands on decides: a read-only folder inside a folder that may change stays read only.
+		mkdirSync(join(ws.root, "raw"), { recursive: true });
+		const nested = auto({ [ws.root]: { access: "change", at: "" }, [join(ws.root, "raw")]: { access: "read", at: "" } });
+		expect(decide(edit, { path: "raw/data.csv" }, ws, nested, new Set()).action).toBe("ask");
+		expect(decide(edit, { path: "notes.md" }, ws, nested, new Set()).action).toBe("run");
+		// Contained commands can't be told apart there, so they ask too.
+		const sealed = Object.assign(Object.create(ws), { sandboxed: "seatbelt" });
+		expect(decide(shell, { command: "touch notes.md" }, sealed, nested, new Set()).action).toBe("ask");
+		// The same folder by another spelling (a symlink) is the same folder.
+		const link = join(scratch("perm-link-parent"), "link");
+		symlinkSync(ws.root, link);
+		expect(decide(edit, { path: "raw/data.csv" }, new LocalWorkspace(link), nested, new Set()).action).toBe("ask");
+		// A filled PDF or a new app can land outside the folder: they ask, whatever the folder allows.
+		const pdf = { name: "pdf_fill", kind: "write" } as unknown as Tool;
+		expect(decide(pdf, { path: "form.pdf", out: "../elsewhere.pdf" }, ws, auto({ [ws.root]: { access: "change", at: "" } }), new Set()).action).toBe("ask");
 		// "edits", the older name, reads as auto.
 		const edits = { permissions: { mode: "edits", allowCommands: [] }, folders: { [ws.root]: { access: "change", at: "" } } } as unknown as LabConfig;
 		expect(decide(edit, { path: "a.ts" }, ws, edits, new Set()).action).toBe("run");
@@ -254,9 +269,20 @@ describe("permissions", () => {
 		expect(allowKeys(shell, { command: "python3 run.py" })).toEqual({ keys: ["shell:python3"], scope: "“python3” commands" });
 		expect(allowKey(shell, { command: "git commit -m x" })).toBe("shell:git commit");
 		expect(allowKey(shell, { command: "pytest -q" })).toBe("shell:pytest");
-		expect(allowKeys(shell, { command: "cd app && FOO=1 timeout 60 python3 a.py | grep -v x" })).toEqual({ keys: ["shell:python3", "shell:grep"], scope: "“python3” and “grep” commands" });
-		// Code the words don't show, and programs that hand the line to something else, are remembered exactly.
-		for (const command of ["echo $(curl x)", "sudo make install", "ssh host ls", "bash <<EOF"]) expect(allowKeys(shell, { command }).scope).toBe("this exact command");
+		expect(allowKeys(shell, { command: "cd app && FOO=1 python3 a.py 2>&1 | grep -v x" })).toEqual({ keys: ["shell:python3", "shell:grep"], scope: "“python3” and “grep” commands" });
+		expect(allowKeys(shell, { command: "ls 2>/dev/null; make 2>&1 | tee -a log" }).keys).toEqual(["shell:ls", "shell:make", "shell:tee"]);
+		expect(allowKeys(shell, { command: "/usr/bin/touch a" }).keys).toEqual(["shell:/usr/bin/touch"]);
+		expect(allowKeys(shell, { command: "echo 'a; rm -rf x' | wc -l" }).keys).toEqual(["shell:wc"]);
+		// A redirection before a program still shows the program.
+		expect(allowKeys(shell, { command: "touch a; 2>&1 rm -rf ../victim" }).keys).toEqual(["shell:touch", "shell:rm"]);
+		// Code the words don't show, output written to a file, control flow, wrappers, programs named by a variable or a
+		// relative path, options before a subcommand, and programs that hand the line to something else: exact.
+		for (const command of [
+			"echo $(curl x)", "echo `id`", "diff <(ls a) <(ls b)", "sudo make install", "ssh host ls", "bash <<EOF", "touch a; : >../victim",
+			"echo hi > out.txt", "if true; then touch a; fi", "f() { rm -rf x; }; f", "(cd x && rm y)", "C=touch; $C a", "timeout -s TERM touch a",
+			"./tools/touch a", "git -C x reset --hard", "env -S 'rm -rf x'", "echo 'unbalanced",
+		])
+			expect([command, allowKeys(shell, { command }).scope]).toEqual([command, "this exact command"]);
 		// Once both programs are allowed, a different command using them runs; one adding another program asks.
 		const plain = new LocalWorkspace(scratch("perm-keys"), "off");
 		const allowed = new Set(["shell:python3", "shell:grep"]);

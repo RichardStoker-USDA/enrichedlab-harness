@@ -25,7 +25,7 @@ import { AppHost, type AppSession } from "./apps/host.ts";
 import { CanvasStore } from "./canvas.ts";
 import { applyBundles, listBundles } from "./bundles.ts";
 import { DEFAULT_CONFIG, type LabConfig, loadConfig, type PermissionMode, type ProviderConfig, saveConfig } from "./config.ts";
-import { folderAccess, modeOf } from "./permissions.ts";
+import { canonical, folderAccess, modeOf } from "./permissions.ts";
 import { McpManager } from "./mcp.ts";
 import { ModelRegistry } from "./models/registry.ts";
 import { LocalModels } from "./models/local_service.ts";
@@ -441,8 +441,9 @@ export class Engine {
 
 	/** Save what EnrichedLab may do in a folder (asked once, when the person adds it); "none" forgets the folder. */
 	private setFolderAccess(path: string, access: "change" | "read" | "none"): void {
-		const folder = resolve(path);
-		const folders = { ...this.config.folders };
+		const folder = canonical(path);
+		// One entry per folder on disk: an older entry under another spelling of the same folder goes.
+		const folders = Object.fromEntries(Object.entries(this.config.folders ?? {}).filter(([saved]) => canonical(saved) !== folder));
 		if (access === "none") delete folders[folder];
 		else folders[folder] = { access, at: new Date().toISOString() };
 		saveConfig(this.paths, { folders });
@@ -566,6 +567,8 @@ export class Engine {
 		// A subagent that may change files gets its own worktree and branch when the folder is a git repository, so
 		// parallel agents never write over each other or the person's checkout.
 		const child = this.createSession(parent.cwd, options.model ?? parent.modelRef, parent.site, { parent: parent.id, mode: options.mode }, options.mode === "full");
+		// A subagent asks as much as the session that started it.
+		child.setPermissionMode(parent.permissionMode ?? modeOf(this.config.permissions.mode));
 		child.prompt(task);
 		return child.id;
 	}
@@ -688,7 +691,10 @@ export class Engine {
 						if (!asked) throw new RpcError(-32602, `${model} isn't offered now. Choose another model.`);
 						if (!this.sites.allows(asked, site)) throw new RpcError(-32602, `${model} can't be used in ${site ? `a ${this.sites.title(site)} session` : "a session on this computer"}.`);
 					}
-					return this.createSession(need("cwd"), model, site, undefined, p.worktree === true).summary();
+					const made = this.createSession(need("cwd"), model, site, undefined, p.worktree === true);
+					// It keeps the mode it started with: changing the default later changes new sessions only.
+					made.setPermissionMode(modeOf(this.config.permissions.mode));
+					return made.summary();
 				}
 				case "session.open": {
 					const id = need("sessionId");
@@ -753,8 +759,8 @@ export class Engine {
 						if (!["change", "read", "none"].includes(access)) throw new RpcError(-32602, "access must be change, read or none.");
 						this.setFolderAccess(path, access as "change" | "read" | "none");
 					}
-					const now = folderAccess(this.config, resolve(path));
-					return { path: resolve(path), ...(now ? { access: now } : {}) };
+					const now = folderAccess(this.config, path);
+					return { path: canonical(path), ...(now ? { access: now } : {}) };
 				}
 				case "folder.list":
 					return Object.entries(this.config.folders ?? {})
