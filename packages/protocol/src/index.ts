@@ -120,7 +120,7 @@ export type SessionEvent =
 	| (EventBase & {
 			t: "checkpoint";
 			callId: string;
-			files: { path: string; existed: boolean; blob?: string }[];
+			files: { path: string; existed: boolean; blob?: string; real?: string }[];
 			/** In a git repository: the working tree before the turn, as a commit on refs/enrichedlab/checkpoints. */
 			git?: string;
 			/** The folder as it was at this point, in the session's step history (docs/history.md); "turn" marks a turn's start. */
@@ -133,7 +133,17 @@ export type SessionEvent =
 			skipped?: string[];
 	  })
 	/** The folder went back to how it was before a step. `saved` is the present just before, so it can come back too. */
-	| (EventBase & { t: "rewind"; before: string; to: string; saved: string; restored: string[]; removed: string[] })
+	| (EventBase & { t: "rewind";
+			before: string;
+			to: string;
+			saved: string;
+			/** `to` and `saved` are the lab's whole-sandbox checkpoints, not history commits. */
+			whole?: boolean;
+			restored: string[];
+			removed: string[];
+			/** Differed but left as they were: never kept (too large), or a folder holding such files. */
+			left?: string[];
+	  })
 	/** File changes since the last message were put back. The model is told on its next request. */
 	| (EventBase & {
 			t: "undo";

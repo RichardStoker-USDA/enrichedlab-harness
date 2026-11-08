@@ -69,8 +69,18 @@ export class SandboxWorkspace implements Workspace {
 		return this.api.checkpoints?.();
 	}
 
+	/** Whole-disk checkpoints that failed last time don't count until one works again: auto then asks as for git history. */
+	private checkpointFailed = false;
+
 	get checkpointed(): "filesystem" | undefined {
-		return this.checkpoints ? "filesystem" : undefined;
+		return this.checkpoints && !this.checkpointFailed ? "filesystem" : undefined;
+	}
+
+	/** Make a whole-disk checkpoint; undefined (and auto stops counting on them) when the lab couldn't. */
+	async checkpoint(label: string): Promise<string | undefined> {
+		const made = await this.checkpoints?.make(label).catch(() => undefined);
+		this.checkpointFailed = this.checkpoints !== undefined && made === undefined;
+		return made;
 	}
 
 	private async run(command: string, timeoutSeconds = 120, signal?: AbortSignal) {

@@ -23,7 +23,9 @@ command (`packages/engine/src/session/history.ts`). Each point is a `checkpoint`
 - **Not kept, and said so.** Files over 25 MB, new data past 1 GB in one snapshot (the first snapshot of a large data
   folder stops there and lists what it left out in the event's `skipped`), repositories inside the folder (kept as a
   pointer, not their files), names with line breaks in a lab sandbox, and folders tools rebuild (`node_modules`,
-  virtual environments, `.pixi`, caches). Going back leaves these as they are, whether they were too large then or now.
+  virtual environments, `.pixi`, caches). Each commit names what it left out on its own `el-kept-out` line, so going
+  back to it, or from it, leaves those as they are, whether they were too large then or now, along with any folder
+  holding them and any file that would take the place of such a folder.
 - **One at a time.** Snapshots and restores of one folder take turns, and going back holds its session like a turn.
 
 ## Going back
@@ -34,6 +36,9 @@ point, so going back can itself be taken back (rewind with `before` set to the `
 the session's line goes on from there, and a `rewind` event records what changed. Files go first, while the folder
 is as the present has it, and never through a link, so a link the target brings back can't carry a removal outside
 the folder. The model is told on its next request.
+
+Undo puts back files outside the folder from their per-file copies first, while links in the folder still lead where
+they did, and only where the path still leads to the file that was kept.
 
 With `retry`, a new session continues from just before that step: the conversation up to there, the same folder
 and model, titled "Retry: …". The original stays as it was, so both tries can be compared. On this computer for now;
@@ -49,4 +54,6 @@ can't be brought back where it works now.
 
 A lab sandbox keeps history with git inside the sandbox, through exec, for `/sandbox/work`. A lab that serves
 whole-disk checkpoints (`endpoints.checkpoints`, [labs.md](labs.md)) covers the rest of the sandbox too, and there
-`auto` runs any command, since all of it can be taken back.
+`auto` runs any command, since all of it can be taken back. If the lab can't make a checkpoint (quota, an outage),
+the session says so and commands outside the project ask again until a checkpoint works. Going back from a go-back
+there returns to the checkpoint it made of the present (`rewind.whole`).

@@ -6,6 +6,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Checkpoints } from "../packages/engine/src/session/checkpoint.ts";
 import { localHistory, MAX_FILE } from "../packages/engine/src/session/history.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "el-history-"));
@@ -100,5 +101,62 @@ describe("step history", () => {
 		expect(readFileSync(join(folder, "crlf.txt"), "utf8")).toBe("a\r\nb\r\n");
 		expect(existsSync(join(folder, "big.bin"))).toBe(true);
 		expect(back.removed).not.toContain("big.bin");
+	});
+
+	test("what a snapshot left out stays left out: through a file in its place, past 200 files, when it shrinks, and going back from going back", async () => {
+		const folder = join(dir, "kept");
+		mkdirSync(join(folder, "many"), { recursive: true });
+		writeFileSync(join(folder, "data"), "a file named data\n");
+		writeFileSync(join(folder, "grows.csv"), "small\n");
+		const history = localHistory(join(dir, "store"), folder, "s4");
+		const target = await history.snapshot("target");
+		// Since: data became a folder holding a file too large to keep; 201 large files; a kept file grew too large.
+		rmSync(join(folder, "data"));
+		mkdirSync(join(folder, "data"));
+		const big = (path: string) => (writeFileSync(path, ""), truncateSync(path, MAX_FILE + 1));
+		big(join(folder, "data", "raw.bin"));
+		for (let i = 0; i < 201; i++) big(join(folder, "many", `f${i}.bin`));
+		big(join(folder, "grows.csv"));
+		const grew = await history.snapshot("grew");
+		expect(grew.changed).toBe(true);
+		expect(await history.keptOut(grew.commit)).toHaveLength(203);
+		// A nested repository made since isn't the history's to remove.
+		mkdirSync(join(folder, "vendor"));
+		execFileSync("git", ["init", "-q", join(folder, "vendor")]);
+		writeFileSync(join(folder, "vendor", "lib.py"), "x = 1\n");
+		execFileSync("git", ["-C", join(folder, "vendor"), "add", "."]);
+		execFileSync("git", ["-C", join(folder, "vendor"), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "x"]);
+		const back = await history.restore(target.commit, "back");
+		expect(readFileSync(join(folder, "data", "raw.bin")).length).toBe(MAX_FILE + 1);
+		expect(existsSync(join(folder, "many", "f200.bin"))).toBe(true);
+		expect(readFileSync(join(folder, "grows.csv")).length).toBe(MAX_FILE + 1);
+		expect(existsSync(join(folder, "vendor", "lib.py"))).toBe(true);
+		expect(back.left).toContain("data");
+		// The 201st shrinks and grows.csv is small again. Going back from going back (to the present it kept) leaves them:
+		// that present couldn't hold them, so it has nothing to put in their place.
+		writeFileSync(join(folder, "many", "f200.bin"), "small now\n");
+		writeFileSync(join(folder, "grows.csv"), "small again\n");
+		const undo = await history.restore(back.saved, "undo going back");
+		expect(undo.left).toEqual(expect.arrayContaining(["grows.csv", "many/f200.bin"]));
+		expect(readFileSync(join(folder, "many", "f200.bin"), "utf8")).toBe("small now\n");
+		expect(readFileSync(join(folder, "grows.csv"), "utf8")).toBe("small again\n");
+	});
+
+	test("a per-file copy comes back only while its path leads where it did", () => {
+		const root = join(dir, "links");
+		const a = join(dir, "outside-a");
+		const b = join(dir, "outside-b");
+		mkdirSync(root);
+		mkdirSync(a);
+		mkdirSync(b);
+		symlinkSync(b, join(root, "link"));
+		const copies = new Checkpoints(join(dir, "copies"));
+		const kept = copies.capture([join(root, "link", "report.txt")]);
+		// The link moves to a, where a file of that name was never kept; undo leaves it.
+		rmSync(join(root, "link"));
+		symlinkSync(a, join(root, "link"));
+		writeFileSync(join(a, "report.txt"), "not ours\n");
+		copies.restore([kept]);
+		expect(readFileSync(join(a, "report.txt"), "utf8")).toBe("not ours\n");
 	});
 });

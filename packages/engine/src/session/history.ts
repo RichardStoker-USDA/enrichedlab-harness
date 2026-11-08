@@ -2,16 +2,17 @@
 //
 // A git store of EnrichedLab's own, one per folder, separate from any repository the person keeps there: snapshots
 // never touch their branches, index or refs. Each session keeps its own index (so sessions in one folder never wait
-// on each other's lock) and its own line of commits, refs/sessions/<id>; objects are shared, so a file kept once is
+// on each other's index) and its own line of commits, refs/sessions/<id>; objects are shared, so a file kept once is
 // kept once. The index remembers each file's size and time, so a snapshot hashes only what changed since the last.
 //
 // What isn't kept, and says so: files larger than MAX_FILE, new data past MAX_STEP in one snapshot, and folders that
 // are rebuilt rather than written (node_modules, virtual environments, caches). Ignore files don't apply: a data
-// folder a repository ignores is exactly what a person would want back.
+// folder a repository ignores is exactly what a person would want back. Each commit names what it left out (its
+// "el-kept-out" line), so going back to it, or from it, never deletes or overwrites what it couldn't hold.
 
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, lstatSync, mkdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 /** Files larger than this aren't kept (25 MB, as the per-file copies before). */
@@ -39,6 +40,8 @@ export interface GitPlace {
 	git(args: string[], env?: Record<string, string>): Promise<string>;
 	sizes(paths: string[]): Promise<Map<string, number>>;
 	remove(paths: string[]): Promise<void>;
+	/** Of these paths, the ones that are folders with something in them now (not links). */
+	occupied(paths: string[]): Promise<Set<string>>;
 }
 
 export interface Snapshot {
@@ -47,6 +50,26 @@ export interface Snapshot {
 	changed: boolean;
 	/** Files left out: larger than MAX_FILE, or past MAX_STEP. */
 	skipped: string[];
+	/** Repositories inside the folder: kept as a pointer, not their files. */
+	nested: string[];
+}
+
+const KEPT_OUT = "el-kept-out: ";
+
+export interface Restored {
+	/** The present, kept just before going back. */
+	saved: string;
+	/** The folder after going back. */
+	now: string;
+	restored: string[];
+	removed: string[];
+	/** Differed, but left as they are: never kept, or a folder holding what was never kept. */
+	left: string[];
+}
+
+/** True when `path` is `other`, inside it, or holds it. */
+function overlaps(path: string, other: string): boolean {
+	return path === other || path.startsWith(`${other}/`) || other.startsWith(`${path}/`);
 }
 
 export class History {
@@ -117,18 +140,44 @@ export class History {
 		const left = skipped.map((path) => `:(exclude,literal)${path}`);
 		await this.place.git(["add", "--all", "--force", "--", ".", ...excluded, ...left], this.env());
 		// A repository inside the folder is kept as a pointer, not its files: said so.
-		const nested = (await this.place.git(["ls-files", "-s", "-z"], this.env())).split("\0").filter((line) => line.startsWith("160000 ")).map((line) => `${line.split("\t")[1]}/ (its own repository)`);
-		skipped.push(...nested);
+		const nested = (await this.place.git(["ls-files", "-s", "-z"], this.env())).split("\0").filter((line) => line.startsWith("160000 ")).map((line) => line.slice(line.indexOf("\t") + 1));
+		// Files kept out earlier and unchanged since aren't listed again by git: the parent's list carries them on.
+		const before = parent ? await this.keptOut(parent) : [];
+		const listed = new Set([...candidates, ...skipped, ...nested]);
+		const still = before.filter((path) => !listed.has(path));
+		const out = [...new Set([...skipped, ...nested, ...(await this.present(still))])].sort();
 		const tree = await this.place.git(["write-tree"], this.env());
-		if (parent && (await this.place.git(["rev-parse", `${parent}^{tree}`])) === tree) return { commit: parent, changed: false, skipped };
-		const commit = await this.place.git(["commit-tree", tree, ...(parent ? ["-p", parent] : []), "-m", label.slice(0, 200) || "step"], {
+		const same = parent && (await this.place.git(["rev-parse", `${parent}^{tree}`])) === tree && JSON.stringify(out) === JSON.stringify(before);
+		if (parent && same) return { commit: parent, changed: false, skipped, nested };
+		const message = `${label.slice(0, 200) || "step"}${out.length ? `\n\n${KEPT_OUT}${JSON.stringify(out)}` : ""}`;
+		const commit = await this.place.git(["commit-tree", tree, ...(parent ? ["-p", parent] : []), "-m", message], {
 			GIT_AUTHOR_NAME: "EnrichedLab",
 			GIT_AUTHOR_EMAIL: "history@enrichedlab.invalid",
 			GIT_COMMITTER_NAME: "EnrichedLab",
 			GIT_COMMITTER_EMAIL: "history@enrichedlab.invalid",
 		});
 		await this.place.git(["update-ref", this.ref, commit]);
-		return { commit, changed: true, skipped };
+		return { commit, changed: true, skipped, nested };
+	}
+
+	/** What a snapshot left out, from its own message. */
+	async keptOut(commit: string): Promise<string[]> {
+		const body = await this.place.git(["log", "-1", "--format=%B", commit]).catch(() => "");
+		const line = body.split("\n").find((l) => l.startsWith(KEPT_OUT));
+		try {
+			const list = line ? JSON.parse(line.slice(KEPT_OUT.length)) : [];
+			return Array.isArray(list) ? list.filter((p): p is string => typeof p === "string") : [];
+		} catch {
+			return [];
+		}
+	}
+
+	/** Of paths kept out before, the ones still on disk (a file or folder). */
+	private async present(paths: string[]): Promise<string[]> {
+		if (!paths.length) return [];
+		const sizes = await this.place.sizes(paths);
+		const folders = await this.place.occupied(paths);
+		return paths.filter((path) => sizes.has(path) || folders.has(path));
 	}
 
 	/** Paths that differ between two snapshots. */
@@ -141,21 +190,26 @@ export class History {
 	 * Put the folder back as it was at `target`. The present is kept first, so going back can itself be undone; files
 	 * the snapshots never held (too large, rebuilt folders) are left as they are.
 	 */
-	async restore(target: string, label: string, keep: string[] = []): Promise<{ saved: string; now: string; restored: string[]; removed: string[] }> {
+	async restore(target: string, label: string, keep: string[] = []): Promise<Restored> {
 		return locked(this.store, () => this.bringBack(target, label, keep));
 	}
 
-	private async bringBack(target: string, label: string, keep: string[]): Promise<{ saved: string; now: string; restored: string[]; removed: string[] }> {
+	private async bringBack(target: string, label: string, keep: string[]): Promise<Restored> {
 		const present = await this.take(`before going back: ${label}`);
 		const saved = present.commit;
-		// Files the snapshots couldn't hold, then or now, stay as they are: their bytes were never kept.
-		const untouched = new Set([...keep, ...present.skipped]);
+		// What either snapshot couldn't hold stays as it is, with whatever holds it or sits inside it: those bytes were
+		// never kept, so neither overwritten nor removed.
+		const untouched = [...new Set([...keep, ...(await this.keptOut(target)), ...(await this.keptOut(saved))])];
 		const lines = (await this.place.git(["diff", "--name-status", "--no-renames", "-z", target, saved])).split("\0").filter(Boolean);
 		const restored: string[] = [];
 		const removed: string[] = [];
+		const left: string[] = [];
 		for (let i = 0; i + 1 < lines.length; i += 2) {
 			const [status, path] = [lines[i]!, lines[i + 1]!];
-			if (untouched.has(path)) continue;
+			if (untouched.some((kept) => overlaps(path, kept))) {
+				left.push(path);
+				continue;
+			}
 			// Added since the target: it goes. Changed or deleted since: it comes back.
 			if (status === "A") removed.push(path);
 			else restored.push(path);
@@ -163,6 +217,11 @@ export class History {
 		// Removals first, while the folder is as the present snapshot has it: a link the target brings back can't
 		// carry a removal outside the folder.
 		if (removed.length) await this.place.remove(removed);
+		// A file coming back where a folder still holds something (files never kept, a rebuilt folder) would take the
+		// folder with it: that one stays.
+		const blocked = await this.place.occupied(restored);
+		left.push(...blocked);
+		restored.splice(0, restored.length, ...restored.filter((path) => !blocked.has(path)));
 		for (let i = 0; i < restored.length; i += 200) {
 			await this.place.git(["restore", `--source=${target}`, "--worktree", "--", ...restored.slice(i, i + 200).map((path) => `:(literal)${path}`)], this.env());
 		}
@@ -171,7 +230,7 @@ export class History {
 		await this.place.git(["read-tree", target], this.env());
 		await this.place.git(["update-index", "-q", "--refresh"], this.env()).catch(() => "");
 		const now = (await this.take(`went back: ${label}`)).commit;
-		return { saved, now, restored, removed };
+		return { saved, now, restored, removed, left };
 	}
 }
 
@@ -214,8 +273,16 @@ export function localHistory(storeRoot: string, folder: string, session: string)
 				const parts = path.split("/").slice(0, -1);
 				let through = false;
 				for (let i = 1; i <= parts.length && !through; i++) through = lstatSync(join(folder, ...parts.slice(0, i)), { throwIfNoEntry: false })?.isSymbolicLink() ?? false;
-				if (!through) rmSync(join(folder, path), { force: true });
+				if (!through && !lstatSync(join(folder, path), { throwIfNoEntry: false })?.isDirectory()) rmSync(join(folder, path), { force: true });
 			}
+		},
+		async occupied(paths) {
+			const found = new Set<string>();
+			for (const path of paths) {
+				const info = lstatSync(join(folder, path), { throwIfNoEntry: false });
+				if (info?.isDirectory() && readdirSync(join(folder, path)).length) found.add(path);
+			}
+			return found;
 		},
 	};
 	return new History(store, place, session, async () => {
@@ -247,13 +314,13 @@ function quote(word: string): string {
  */
 export function sandboxHistory(exec: (command: string) => Promise<{ exitCode: number | null; output: string }>, folder: string, session: string): History {
 	const store = `/sandbox/.el-history/${createHash("sha256").update(folder).digest("hex").slice(0, 20)}`;
-	const errors = `/tmp/el-history-err-${session}`;
-	// The shell gives one stream back: errors go to a file, read only when a command fails.
+	// The shell gives one stream back: errors go to a file of their own, made fresh by mktemp (never a name someone
+	// could have put a link at), and come back only when the command fails.
 	const run = async (command: string) => {
-		const result = await exec(`{ ${command} ; } 2>${quote(errors)}`);
+		const result = await exec(`e=$(mktemp) || exit 97; { ${command} ; } 2>"$e"; s=$?; if [ $s -ne 0 ]; then head -c 4000 "$e"; fi; rm -f "$e"; exit $s`);
 		if (result.exitCode !== 0) {
-			const said = await exec(`cat ${quote(errors)} 2>/dev/null`).catch(() => ({ output: "" }));
-			throw new Error(said.output.trim() || `exit ${result.exitCode}`);
+			const said = result.output.trim().split("\n").slice(-20).join("\n");
+			throw new Error(said || `exit ${result.exitCode}`);
 		}
 		return result.output.replace(/\n$/, "");
 	};
@@ -280,8 +347,16 @@ export function sandboxHistory(exec: (command: string) => Promise<{ exitCode: nu
 			// Only where the file's folder resolves inside this one: never through a link.
 			const root = quote(folder);
 			for (let i = 0; i < paths.length; i += 200) {
-				await run(`cd ${root} && for f in ${paths.slice(i, i + 200).map(quote).join(" ")}; do d=$(cd -P -- "$(dirname -- "$f")" 2>/dev/null && pwd -P) || continue; case "$d" in ${root}|${root}/*) rm -f -- "$f";; esac; done`);
+				await run(`cd ${root} && for f in ${paths.slice(i, i + 200).map(quote).join(" ")}; do [ -d "$f" ] && [ ! -L "$f" ] && continue; d=$(cd -P -- "$(dirname -- "$f")" 2>/dev/null && pwd -P) || continue; case "$d" in ${root}|${root}/*) rm -f -- "$f";; esac; done`);
 			}
+		},
+		async occupied(paths) {
+			const found = new Set<string>();
+			for (let i = 0; i < paths.length; i += 200) {
+				const out = await run(`cd ${quote(folder)} && for f in ${paths.slice(i, i + 200).map(quote).join(" ")}; do if [ -d "$f" ] && [ ! -L "$f" ] && [ -n "$(ls -A -- "$f" 2>/dev/null)" ]; then printf '%s\\0' "$f"; fi; done`);
+				for (const path of out.split("\0")) if (path) found.add(path);
+			}
+			return found;
 		},
 	};
 	return new History(store, place, session, async () => {

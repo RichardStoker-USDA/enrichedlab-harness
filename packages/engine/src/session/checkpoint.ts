@@ -4,12 +4,17 @@
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { physical } from "../tools/workspace.ts";
 
-/** One file as it was before a change. `blob` names the stored bytes; absent when the file didn't exist. */
+/**
+ * One file as it was before a change. `blob` names the stored bytes; absent when the file didn't exist. `real` is
+ * where the path led then, links followed: undo puts the file back only while it still leads there.
+ */
 export interface FileBefore {
 	path: string;
 	existed: boolean;
 	blob?: string;
+	real?: string;
 }
 
 /** Files larger than this aren't kept; undo leaves them as they are and says so. */
@@ -22,8 +27,9 @@ export class Checkpoints {
 	capture(paths: string[]): FileBefore[] {
 		const out: FileBefore[] = [];
 		for (const path of paths) {
+			const real = physical(path);
 			if (!existsSync(path)) {
-				out.push({ path, existed: false });
+				out.push({ path, existed: false, real });
 				continue;
 			}
 			const info = statSync(path);
@@ -35,7 +41,7 @@ export class Checkpoints {
 				mkdirSync(this.dir, { recursive: true, mode: 0o700 });
 				writeFileSync(file, bytes, { mode: 0o600 });
 			}
-			out.push({ path, existed: true, blob });
+			out.push({ path, existed: true, blob, real });
 		}
 		return out;
 	}
@@ -45,6 +51,8 @@ export class Checkpoints {
 		const restored = new Set<string>();
 		for (const files of [...changes].reverse()) {
 			for (const file of files) {
+				// A link on the way now leads somewhere else: that isn't the file that was kept.
+				if (file.real && physical(file.path) !== file.real) continue;
 				if (file.existed && file.blob) {
 					mkdirSync(dirname(file.path), { recursive: true });
 					writeFileSync(file.path, readFileSync(join(this.dir, file.blob)));

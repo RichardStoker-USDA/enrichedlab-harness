@@ -220,6 +220,18 @@ describe("permissions", () => {
 		expect(decide(shell, { command: "rm -rf /sandbox/data/raw" }, new SandboxWorkspace(api, "/sandbox/work/project-1"), auto, new Set()).action).toBe("ask");
 	});
 
+	test("when the lab can't checkpoint the sandbox, commands outside the project ask until it can again", async () => {
+		let works = false;
+		const api = { title: "Field Lab", run: async () => ({ exitCode: 0, stdout: "", stderr: "" }), checkpoints: () => ({ make: async () => (works ? "k2" : Promise.reject(new Error("quota"))), restore: async () => undefined }) } as unknown as SandboxApi;
+		const lab = new SandboxWorkspace(api, "/sandbox/work/project-1");
+		const auto = { permissions: { mode: "auto", allowCommands: [] } } as unknown as LabConfig;
+		expect(await lab.checkpoint("start of turn")).toBeUndefined();
+		expect(decide(shell, { command: "rm -rf /sandbox/data/raw" }, lab, auto, new Set()).action).toBe("ask");
+		works = true;
+		expect(await lab.checkpoint("next step")).toBe("k2");
+		expect(decide(shell, { command: "rm -rf /sandbox/data/raw" }, lab, auto, new Set()).action).toBe("run");
+	});
+
 	test("in a lab's sandbox, code handed to an interpreter or a quoted script asks: its paths aren't in its words", () => {
 		const api = { title: "Field Lab", run: async () => ({ exitCode: 0, stdout: "", stderr: "" }) } as unknown as SandboxApi;
 		const lab = new SandboxWorkspace(api, "/sandbox/work/project-1");
