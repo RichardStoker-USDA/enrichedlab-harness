@@ -2,7 +2,8 @@
 // without changing its tools. The local workspace acts in the project folder with the person's own rights.
 
 import { spawn } from "node:child_process";
-import { closeSync, constants, existsSync, fstatSync, ftruncateSync, lstatSync, readFileSync, readlinkSync, realpathSync, statSync, writeSync } from "node:fs";
+import type { Dirent } from "node:fs";
+import { accessSync, closeSync, constants, existsSync, fstatSync, ftruncateSync, lstatSync, readdirSync, readFileSync, readlinkSync, realpathSync, statSync, writeSync } from "node:fs";
 import { readdir, readFile, stat } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -19,6 +20,18 @@ export interface ExecResult {
 	exitCode: number | null;
 	output: string;
 	timedOut: boolean;
+}
+
+export interface ExecOptions {
+	timeoutMs: number;
+	signal: AbortSignal;
+	onOutput?: (text: string) => void;
+	unsandboxed?: boolean;
+	env?: Record<string, string>;
+	fence?: { text: string; pattern?: string }[];
+	readOnly?: boolean;
+	/** Literal argv from allowCommands. A local workspace starts it without a shell. */
+	argv?: string[];
 }
 
 export interface Workspace {
@@ -39,7 +52,7 @@ export interface Workspace {
 	 * must lead inside the project, links followed, or it doesn't run.
 	 */
 	/** `readOnly`: the command runs contained with nothing in the project writable (a read-only subagent), or not at all. */
-	exec(command: string, options: { timeoutMs: number; signal: AbortSignal; onOutput?: (text: string) => void; unsandboxed?: boolean; env?: Record<string, string>; fence?: { text: string; pattern?: string }[]; readOnly?: boolean }): Promise<ExecResult>;
+	exec(command: string, options: ExecOptions): Promise<ExecResult>;
 	/** The worktree EnrichedLab made for this session (known from the session's own record, never from the path). */
 	readonly worktree?: { path: string; gitDir: string };
 	/** Set when commands run contained: by the OS ("seatbelt", "bwrap") or in a site's sandbox ("site"). */
@@ -233,6 +246,41 @@ export type NetworkAccess = "none" | "loopback" | "all";
  */
 export const GIT_SETTINGS_PATTERNS = ["/\\.git/(modules/.+/)?(config|hooks|info)(/|$)", "/\\.git/worktrees/[^/]+/config\\.worktree$"];
 
+const GIT_SCAN_MAX = 50_000;
+const GIT_SCAN_DEPTH = 64;
+
+/** Existing .git entries below a project, without following links during the scan. Linux protects this launch-time set. */
+export function projectGitPaths(root: string): string[] {
+	const found: string[] = [];
+	const pending: { path: string; depth: number }[] = [{ path: real(root), depth: 0 }];
+	let seen = 0;
+	while (pending.length && seen < GIT_SCAN_MAX) {
+		const next = pending.pop()!;
+		let entries: Dirent<string>[];
+		try {
+			entries = readdirSync(next.path, { withFileTypes: true, encoding: "utf8" });
+		} catch {
+			continue;
+		}
+		for (const entry of entries) {
+			if (++seen > GIT_SCAN_MAX) break;
+			const path = join(next.path, entry.name);
+			if (entry.name.toLowerCase() === ".git") {
+				if (entry.isDirectory() || entry.isFile() || entry.isSymbolicLink()) found.push(path);
+				continue;
+			}
+			if (entry.isDirectory() && next.depth < GIT_SCAN_DEPTH) pending.push({ path, depth: next.depth + 1 });
+		}
+	}
+	return found;
+}
+
+/** Seatbelt deny pattern for every case spelling of a .git component below this project root. */
+export function projectGitPattern(root: string): string {
+	const escaped = real(root).replace(/[\\^$.*+?()[\]{}|]/g, "\\$&").replaceAll('"', '\\"');
+	return `^${escaped}/([^/]+/)*\\.[gG][iI][tT](/|$)`;
+}
+
 function seatbeltProfile(writable: string[], network: NetworkAccess, readable: string[] = [], protect: string[] = [], patterns: string[] = []): string {
 	const quote = (p: string) => JSON.stringify(p);
 	const hidden = PRIVATE_DIRS.map((d) => `(subpath ${quote(join(homedir(), d))})`).join(" ");
@@ -289,7 +337,7 @@ export function contained(file: string, args: string[], options: { writable: str
 	}
 	const writable = [...resolved, ...(options.temp === false ? [] : [safeTemp(), "/private/tmp", "/tmp"])].filter((p, i, all) => existsSync(p) && all.indexOf(p) === i);
 	const readable = [...resolved, ...(options.readable ?? []).map(real)].filter((p) => existsSync(p));
-	const protect = (options.protect ?? []).map(real);
+	const protect = [...new Set((options.protect ?? []).map(real))];
 	if (facility === "seatbelt") return { file: "/usr/bin/sandbox-exec", args: ["-p", seatbeltProfile(writable, options.network, readable, protect, options.protectPatterns), file, ...args], facility };
 	// Read-only root, the writable folders bound, a private /tmp, credential folders hidden, every namespace unshared
 	// (network, pids, IPC, user) so host sockets under /tmp and /run are out of reach. Loopback can't be split from
@@ -336,10 +384,10 @@ export class LocalWorkspace implements Workspace {
 	readonly sandboxed?: Facility;
 
 	/**
-	 * The session's own worktree: its folder, the repository's git folder, the worktree's own folder in it (`admin`),
-	 * and the folder holding its branch's ref (refs/heads/enrichedlab).
+	 * The session's own worktree and repository git folder, used only to decide whether engine git may commit without
+	 * asking. Agent commands receive no repository metadata write grant.
 	 */
-	readonly worktree?: { path: string; gitDir: string; admin: string; branchDir: string };
+	readonly worktree?: { path: string; gitDir: string };
 
 	/** `worktree`: the one EnrichedLab made for this session, from the session's record (engine.ts). */
 	constructor(
@@ -350,42 +398,53 @@ export class LocalWorkspace implements Workspace {
 		this.label = `this computer, in ${root}`;
 		if (sandbox === "workspace") this.sandboxed = sandboxer();
 		if (worktree) {
-			const gitDir = real(join(worktree.repo, ".git"));
-			const path = real(worktree.path);
-			const here = real(root);
-			// Where git keeps this worktree's own state, from its .git file: it must be a folder under .git/worktrees.
-			const dotGit = join(path, ".git");
-			const pointer = lstatSync(dotGit, { throwIfNoEntry: false })?.isFile() ? /^gitdir: (.+)$/m.exec(readFileSync(dotGit, "utf8"))?.[1]?.trim() : undefined;
-			const admin = pointer ? real(resolve(path, pointer)) : "";
-			const branch = worktree.branch ?? "";
-			const branchDir = dirname(branch);
-			// Only a worktree inside the repository's own .git, holding this folder, on an EnrichedLab branch.
-			if (statSync(gitDir, { throwIfNoEntry: false })?.isDirectory() && path.startsWith(`${gitDir}${sep}`) && (here === path || here.startsWith(`${path}${sep}`)) && dirname(admin) === join(gitDir, "worktrees") && /^enrichedlab\/[a-z0-9-]+$/.test(branch)) {
-				this.worktree = { path, gitDir, admin, branchDir: join(gitDir, "refs", "heads", branchDir) };
+			try {
+				const gitDir = real(join(worktree.repo, ".git"));
+				const path = real(worktree.path);
+				const here = real(root);
+				// Where git keeps this worktree's own state, from its .git file: it must be a folder under .git/worktrees.
+				const dotGit = join(path, ".git");
+				const pointer = lstatSync(dotGit, { throwIfNoEntry: false })?.isFile() ? /^gitdir: (.+)$/m.exec(readFileSync(dotGit, "utf8"))?.[1]?.trim() : undefined;
+				const admin = pointer ? real(resolve(path, pointer)) : "";
+				const branch = worktree.branch ?? "";
+				// The admin folder must point back to this worktree, not another one.
+				const back = admin ? readFileSync(join(admin, "gitdir"), "utf8").trim() : "";
+				if (statSync(gitDir, { throwIfNoEntry: false })?.isDirectory() && path.startsWith(`${gitDir}${sep}`) && (here === path || here.startsWith(`${path}${sep}`)) && dirname(admin) === join(gitDir, "worktrees") && real(back) === real(dotGit) && /^enrichedlab\/[a-z0-9-]+$/.test(branch)) {
+					this.worktree = { path, gitDir };
+				}
+			} catch {
+				// A session record that no longer names its own valid worktree gets no worktree privilege.
 			}
 		}
 	}
 
 	/**
-	 * What contained commands may write: the project, and in the session's worktree what a commit on its branch needs
-	 * (the object store, the worktree's own state, and EnrichedLab's branch refs and their logs), not the person's
-	 * branches, HEAD or index. Never a repository's settings, hooks or info folder, which make git run programs later.
+	 * Agent commands may write the project but no path below its root with a .git component. Engine git has a separate
+	 * containment path and is the only way an agent commits.
 	 */
 	private writable(): { writable: string[]; protect: string[]; protectPatterns: string[] } {
-		const tree = this.worktree;
-		const writable = [this.root, ...(tree ? [join(tree.gitDir, "objects"), tree.admin, tree.branchDir, join(tree.gitDir, "logs", relative(tree.gitDir, tree.branchDir))] : [])];
-		const gitDirs = [...(tree ? [tree.gitDir] : []), join(this.root, ".git")].filter((g) => statSync(g, { throwIfNoEntry: false })?.isDirectory());
-		const protect = gitDirs.flatMap((g) => [join(g, "config"), join(g, "hooks"), join(g, "info")]);
-		if (tree) protect.push(join(tree.admin, "config.worktree"));
-		return { writable, protect, protectPatterns: GIT_SETTINGS_PATTERNS };
+		return { writable: [this.root], protect: projectGitPaths(this.root), protectPatterns: [projectGitPattern(this.root)] };
 	}
 
 	/** The program and arguments that run `command`, contained when the workspace is sandboxed. */
-	private launch(command: string, contain: boolean, readOnly = false): { file: string; args: string[] } {
-		const plain = { file: this.shell.file, args: this.shell.args(command) };
+	private launch(command: string, contain: boolean, readOnly = false, argv?: string[]): ReturnType<typeof contained> {
+		const plain = argv ? { file: argv[0]!, args: argv.slice(1) } : { file: this.shell.file, args: this.shell.args(command) };
 		if (!contain || !this.sandboxed) return plain;
 		if (readOnly) return contained(plain.file, plain.args, { writable: [], network: "none" });
 		return contained(plain.file, plain.args, { ...this.writable(), network: "none" });
+	}
+
+	/** A path as named, with dots settled but links not followed. */
+	private lexical(path: string): string {
+		const expanded = path === "~" ? homedir() : path.startsWith("~/") ? join(homedir(), path.slice(2)) : path;
+		return resolve(isAbsolute(expanded) ? expanded : join(this.root, expanded));
+	}
+
+	/** True only for a .git component below the project root. The root may itself sit below a repository's .git. */
+	private gitPath(path: string, linksFollowed = false): boolean {
+		const root = linksFollowed ? physical(resolve(this.root)) : resolve(this.root);
+		const rest = relative(root, path);
+		return rest !== "" && !rest.startsWith("..") && !isAbsolute(rest) && rest.split(/[\\/]/).some((part) => part.toLowerCase() === ".git");
 	}
 
 	resolve(path: string): string {
@@ -476,6 +535,7 @@ export class LocalWorkspace implements Workspace {
 	}
 
 	async write(path: string, data: string | Buffer, options: { outside?: boolean } = {}): Promise<void> {
+		if (this.gitPath(this.lexical(path))) throw new Error(`${this.display(path)} has a .git path component; EnrichedLab doesn't edit repository metadata.`);
 		const full = this.open(path);
 		// Where it leads now, links followed once, judged before anything is made: a link changed since the decision
 		// isn't followed out of the project.
@@ -484,7 +544,7 @@ export class LocalWorkspace implements Workspace {
 		const rest = relative(home, real);
 		if (!options.outside && (rest.startsWith("..") || isAbsolute(rest))) throw new Error(`${this.display(full)} now leads outside the project (a link may have moved); nothing was written.`);
 		// A repository's git folder holds what git runs later (settings, hooks): file edits never go there.
-		if (rest.split(/[\\/]/).some((part) => part.toLowerCase() === ".git")) throw new Error(`${this.display(full)} is inside a repository's .git folder; EnrichedLab doesn't edit files there.`);
+		if (this.gitPath(real, true)) throw new Error(`${this.display(full)} has a .git path component; EnrichedLab doesn't edit repository metadata.`);
 		// Then made and opened at that physical path without following a link anywhere (anchored.ts): a folder swapped
 		// for a link meanwhile makes it fail instead of writing somewhere else.
 		let fd: number;
@@ -527,21 +587,31 @@ export class LocalWorkspace implements Workspace {
 		return out.sort((a, b) => (a.type === "dir" ? 0 : 1) - (b.type === "dir" ? 0 : 1) || a.name.localeCompare(b.name));
 	}
 
-	exec(command: string, options: { timeoutMs: number; signal: AbortSignal; onOutput?: (text: string) => void; unsandboxed?: boolean; env?: Record<string, string>; readOnly?: boolean }): Promise<ExecResult> {
+	exec(command: string, options: ExecOptions): Promise<ExecResult> {
 		if (options.signal.aborted) return Promise.resolve({ exitCode: null, output: "", timedOut: false });
 		// Read only is the OS's to enforce: where nothing can contain the command, it doesn't run.
 		if (options.readOnly && (!this.sandboxed || !FULL_CONTAINMENT.has(this.sandboxed) || options.unsandboxed)) return Promise.resolve({ exitCode: 125, output: "A read-only subagent runs commands only where the OS can keep them from writing (macOS Seatbelt, Linux bubblewrap), so this didn't run.", timedOut: false });
-		const { file, args } = this.launch(command, !options.unsandboxed, options.readOnly);
 		// A contained command runs without asking, so it never sees the engine's keys and tokens: `env` would show them.
 		const base = shellSafe(options.env ?? process.env);
 		const env = this.sandboxed && !options.unsandboxed ? withoutSecrets(base) : base;
+		const childEnv: Record<string, string> = { ...(this.sandboxed && !options.unsandboxed ? activated(this.root, env) : env), LAB_AGENT: "1", PAGER: "cat", GIT_PAGER: "cat", TERM: "dumb", NO_COLOR: "1" };
+		let argv = options.argv;
+		if (argv) {
+			if (process.platform === "win32") return Promise.resolve({ exitCode: 126, output: "allowCommands is off on Windows, so this command didn't run.\n", timedOut: false });
+			try {
+				argv = [this.program(argv[0]!, childEnv.PATH), ...argv.slice(1)];
+			} catch (error) {
+				return Promise.resolve({ exitCode: 126, output: `${(error as Error).message}\n`, timedOut: false });
+			}
+		}
+		const launch = this.launch(command, !options.unsandboxed, options.readOnly, argv);
 		return new Promise((done) => {
-			const child = spawn(file, args, {
+			const child = spawn(launch.file, launch.args, {
 				cwd: this.root,
 				// Inside the project's own package environment when it has one (tools/environment.ts), for contained
 				// commands only: its programs are the project's, so they never run uncontained in place of the system's.
-				env: { ...(this.sandboxed && !options.unsandboxed ? activated(this.root, env) : env), LAB_AGENT: "1", PAGER: "cat", GIT_PAGER: "cat", TERM: "dumb", NO_COLOR: "1" },
-				stdio: ["ignore", "pipe", "pipe"],
+				env: childEnv,
+				stdio: ["ignore", "pipe", "pipe", ...(launch.pass ?? [])],
 				windowsHide: true,
 				detached: process.platform !== "win32",
 			});
@@ -565,8 +635,8 @@ export class LocalWorkspace implements Workspace {
 				}
 				options.onOutput?.(text);
 			};
-			child.stdout.on("data", take);
-			child.stderr.on("data", take);
+			child.stdout!.on("data", take);
+			child.stderr!.on("data", take);
 			const kill = () => {
 				if (closed || !child.pid) return;
 				try {
@@ -601,6 +671,7 @@ export class LocalWorkspace implements Workspace {
 				failure = `\n${error.message}`;
 			});
 			child.on("close", (code) => {
+				launch.release?.();
 				closed = true;
 				clearTimeout(timer);
 				options.signal.removeEventListener("abort", onAbort);
@@ -608,6 +679,29 @@ export class LocalWorkspace implements Workspace {
 				done({ exitCode: code, output: output + failure, timedOut });
 			});
 		});
+	}
+
+	/** Resolve an allowCommands executable once through PATH, and refuse project-owned programs. */
+	private program(name: string, pathValue: string | undefined): string {
+		const candidates = name.includes("/") || (process.platform === "win32" && name.includes("\\"))
+			? [isAbsolute(name) ? name : resolve(this.root, name)]
+			: (pathValue ?? "").split(delimiter).map((dir) => join(isAbsolute(dir) ? dir : resolve(this.root, dir || "."), name));
+		for (const candidate of candidates) {
+			try {
+				const named = resolve(candidate);
+				const namedRoot = resolve(this.root);
+				if (named === namedRoot || named.startsWith(`${namedRoot}${sep}`)) throw new Error(`Refused ${name}: allowCommands never runs a program from the project.`);
+				accessSync(candidate, constants.X_OK);
+				if (!statSync(candidate).isFile()) continue;
+				const program = realpathSync.native(candidate);
+				const root = real(this.root);
+				if (program === root || program.startsWith(`${root}${sep}`)) throw new Error(`Refused ${name}: allowCommands never runs a program from the project.`);
+				return program;
+			} catch (error) {
+				if ((error as Error).message.startsWith("Refused ")) throw error;
+			}
+		}
+		throw new Error(`Refused ${name}: it wasn't an executable on PATH.`);
 	}
 }
 

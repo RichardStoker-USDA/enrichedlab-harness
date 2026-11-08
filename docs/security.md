@@ -18,7 +18,7 @@ for each operating system.
 | | macOS | Linux | Windows |
 | --- | --- | --- | --- |
 | Facility | Seatbelt (`sandbox-exec`) | bubblewrap, when user namespaces work | a write-restricted copy of the person's token |
-| Writes | project and temp folders, not a repository's git settings or hooks | the same (settings and hooks that exist) | project and temp folders |
+| Writes | project and temp folders, except any `.git` component below the project root | the same for `.git` files and folders found when the command starts | project and temp folders |
 | Credential folders (`~/.ssh`, `~/.aws`, key stores, browser profiles) | hidden | hidden | readable |
 | Network | off unless allowed | off unless allowed | open |
 | Commands inside the project | run | run | ask first |
@@ -54,7 +54,10 @@ computer.
 Containment is the boundary: nothing runs outside the OS sandbox or a lab's fence without a yes. The exceptions are
 the person's own settings:
 
-- commands listed in `allowCommands` (a whole-word prefix, with no globs, chaining or expansion in the command);
+- commands listed exactly in `allowCommands` on macOS and Linux: bash must parse one simple command of literal
+  words, then EnrichedLab resolves its program through `PATH` and starts that argv without a shell. Assignments,
+  redirects, globs, expansions, control characters and Unicode spaces do not match. A program inside the project is
+  refused. This path is off on Windows and for a lab command API that accepts shell text;
 - `full` mode, which runs everything except pushes the line shows and lab tools the lab hasn't reviewed;
 - Discovery mode, for what acts inside the lab it applies to;
 - `auto` in a lab sandbox that checkpoints its whole disk, where commands run unfenced. A checkpoint brings the
@@ -62,35 +65,47 @@ the person's own settings:
 
 The engine's own work stays inside the same line:
 
-- Its git on a project's repository (worktrees, snapshots, sending a project to a lab) runs only under Seatbelt or
+- Its git on a project's repository (worktrees, turn snapshots, commits, and sending a project to a lab) runs only
+  under Seatbelt or
   bubblewrap, because the repository's settings and attributes are project content and can name programs (filter
-  and diff drivers). It may write that repository and the temp folders, with hooks and fsmonitor off, no network and
+  and diff drivers). It may write that repository and its named scratch folders, with hooks, fsmonitor and signing
+  off, no network and
   no keys or tokens in its environment, and the repository's settings, hooks and info folder read only. Where the
   repository's folders are is asked again on every call, and each is granted as the folder just checked (bound by
   handle on Linux). It widens past the folder only in layouts git makes itself (the folder's own `.git`, a
   repository above it whose `.git` sits in its top folder, or an EnrichedLab worktree inside `.git`), so a `.git`
   file or `core.worktree` pointing elsewhere grants nothing. Where this computer can't contain it (Windows, Linux
-  without bubblewrap) it doesn't run, so snapshots and worktrees are off there. Its only fetch reads a bundle file
+  without bubblewrap) it doesn't run, so turn snapshots, commits and worktrees are off there. On Linux its temporary
+  indexes and bundle folders are bound into bubblewrap even though bubblewrap has a private `/tmp`. Its only fetch
+  reads a bundle file
   over the file transport, a test pins the git subcommands it uses (none merges or prints file content), and its
-  own folder work (making the worktrees folder, removing files on undo) never follows a link.
+  own folder work (making the worktrees folder and removing files on undo) never follows a link.
+- Step history has its own bare git store, separate from the project's repository. It uses a trusted system git by
+  absolute path with hooks, fsmonitor, filters and line conversion off, and a scrubbed environment. Its local remove
+  is one anchored unlink. In a lab, its remove step runs under the fence when the fence holds.
 - Bringing work back from a lab (committing what's left, then bundling) runs only under the lab's fence, with
   hooks, fsmonitor and signing off. A lab where the fence doesn't hold refuses it.
 - App backends (`bun`, `command`, `serve`) run contained or not at all. On Windows, where servers run as the person,
   the consent card says so before anything starts.
 - Package installs and listings run contained with the pinned pixi, checked against its SHA-256 before each use. A
   listing never downloads it and gets no network.
-- In a session's own worktree (known from the session's record, not its path) commands run contained and may write
-  what a commit on its branch needs: the object store, the worktree's own state, and EnrichedLab's branch refs and
-  their logs (every session's EnrichedLab branches, not only its own). The person's branches, HEAD and index stay
-  read only.
-- Git's settings, hooks and info folder and a worktree's `config.worktree` stay read only for contained commands,
-  since git runs programs from them the next time the person uses git. On macOS that holds in any repository at
-  any depth, including nested ones, submodules and ones made later. On Linux it holds for the repository at the
-  project's top and the worktree's repository, as they are when the command starts. File edits never write inside
-  a `.git` folder. A project kept in a temp folder gets none of this (temp folders stay writable).
+- Agent commands get no repository metadata grants, including in a session worktree. On macOS, Seatbelt denies a
+  write to any path below the project root with a case-insensitive `.git` component, including a `.git` file and a
+  repository made during the command. The rule is anchored at the project root, so a worktree stored below its
+  repository's `.git` is still writable while its own `.git` pointer is not.
+- On Linux, bubblewrap read-only binds every case spelling of a `.git` entry found below the project when
+  the command starts. The scan does not follow links and stops after 50,000 entries or 64 levels. Bubblewrap cannot
+  deny a name pattern, so a `.git` path first created during that command is writable until the command ends. The
+  next command finds and protects it. File tools check for a `.git` component before and after following links on
+  every platform. Lab file tools do the same; Landlock cannot subtract a `.git` name from a writable project for a
+  general writing command.
+- Commits use `git_commit`, not shell `git commit`. It stages all changes and commits the current branch through the
+  contained engine git path as the person's configured identity. It runs without asking only in the session worktree
+  recorded in the session, except that Allow Everything keeps its usual no-ask behavior.
 - A read-only subagent's commands run contained with nothing in the project writable, or not at all. In a lab they
   run under the fence with no project rights, and a seccomp filter there refuses changes to modes, owners, times and
-  extended attributes (on x86_64 and arm64; other machines don't run them). Temp folders stay writable. Their words
+  extended attributes and ACL changes (on x86_64 and arm64; other machines don't run them). The filter also denies
+  `io_uring_setup`, `io_uring_enter` and `io_uring_register`. Temp folders stay writable. Their words
   decide nothing.
 
 Reading a command's words still decides three things: which lines are pushes (they ask in every mode), what may
@@ -112,7 +127,8 @@ Accepted residuals, each with its reason:
 - Metadata and running programs. Landlock doesn't restrict modes, owners, times, extended attributes or ACLs, so a
   fenced command that may write its project can change those on other projects' files in the same sandbox (files
   the sandbox user owns). A filter can't tell which file a mode change is for, and ordinary work needs one in its
-  own project (`chmod +x`), so this stays for writing commands; read-only subagents' commands get the filter. That
+  own project (`chmod +x`), so this stays for writing commands; read-only subagents' commands get the direct syscall
+  and io_uring filter. That
   can change who may read them and their recorded times, and a project's checkpoints don't undo it. Running programs
   isn't restricted either; that is needed, and whatever they start inherits the fence.
 - Hard links and mounts. A file in the project is in the project, whatever other names it has: a hard link that
@@ -123,8 +139,8 @@ Accepted residuals, each with its reason:
   counts as part of the project for commands and file operations alike; the Linux walk crosses mount points.
 - Races with an uncontained process. A second process running outside containment at the same moment (an approved
   background command) isn't defended against. File operations refuse links and hard links, not a real folder
-  renamed into place. Contained commands can't win these races: a folder granted by its checked path is bound by
-  handle (bubblewrap `--bind-fd`) or judged by real path (Seatbelt).
+  renamed into place. Engine git grants exact folders by a held handle on Linux or by real path on macOS. Local and
+  lab step-history removals use an anchored unlink or the lab fence, so a contained process cannot redirect them.
 - Windows. File operations there follow links and junctions, and any user can make a junction (`mklink /J`).
   Commands on Windows aren't fully contained and ask first, so a junction in a project comes from the person or a
   command they approved, and a write through one lands where it leads.
@@ -149,7 +165,10 @@ any macOS privacy prompt then, not mid-task. A question about a change in a fold
 Changes in this folder", which saves the same answer.
 
 A command that would run outside containment (the sandbox off for this folder, or `unsandboxed`) asks even when it
-only reads, unless the person listed it in `allowCommands` (no globs, chaining or expansion in it).
+only reads, unless its exact text is in `allowCommands` and parses as one literal argv. EnrichedLab compares the
+exact string, without trimming it, resolves the program through `PATH` to an absolute path outside the project, and
+starts it without a shell. `allowCommands` is off on Windows and does not apply to lab command APIs that take shell
+text.
 "Allow for this session" covers what the button names and nothing wider, and is kept in the session log (an `allow`
 event), so it outlasts a restart. A command is remembered per program it runs (`touch`, `rm`, `git commit`), so
 `python3 a.py | grep x` and `python3 b.py | grep y` share an answer. Lines are read the way the shell reads them:
@@ -182,7 +201,7 @@ a wrapper given an expanded word (`command "$CMD" push`, `xargs "$P"`), git sett
 git given an expanded word, a word after git that isn't one of git's own commands (an alias, from settings a file
 edit can change), a git setting that runs a program (`-c alias.*`, `-c core.sshCommand=...`, `GIT_*` set in front or
 exported), code for `eval` or a shell that expands or arrives on its input (`curl x | env bash`), or a line that
-doesn't parse. A lab's own command tools pass the same check. File edits share one answer; each other kind of change (a
+doesn't parse. A lab's own command tools pass the same publishing check. File edits share one answer; each other kind of change (a
 click or typing in the browser, a new app, a memory or skill, a filled PDF, a sandbox download) has its own, and asks
 in every mode until allowed. Session answers hold where they were given: a move to a lab or back, or a "Try Again"
 session, starts them over. Folder answers apply to what a change lands on, by the folder's real path (symlinks
@@ -197,7 +216,7 @@ swapped for a link after the check makes the write fail instead of landing elsew
 refused, and a file with a second name (a hard link) isn't written unless its outside path was approved.
 Without step history (its store failed), a contained command that changes things asks too. A session
 keeps the mode it started with; a subagent asks as much as the session that started it. A session's own worktree
-runs file edits, and its commits run contained like any command. In a lab's sandbox, commands and file
+runs file edits, and its commits use `git_commit`. In a lab's sandbox, commands and file
 edits inside the project run without asking: the sandbox is a separate machine with no network, and its work comes
 home as a branch the person merges. There the fence is Linux Landlock, ABI 3 or later (`sites/sandbox_fence.ts`):
 the image's own `/usr/bin/python3` or `/usr/local/bin/python3` (root-owned, in a root-owned folder, writable by no one
@@ -218,8 +237,8 @@ File edits in the sandbox run under it as well, after a check of where their fol
 the end instead of following it; where the fence doesn't hold, each file edit asks. `full` and Discovery mode don't fence (the person let the session act outside the
 project), and in `auto` a sandbox whose whole disk is checkpointed runs changes unfenced, because the disk can be
 put back. A lab's own command tools (`<lab>_sandbox_run`, `<lab>_sandbox_job_start`) run
-outside any project and outside the fence: only what the person listed in `allowCommands` runs unasked, and the
-rest ask, remembered per program apart from this computer's answers.
+outside any project and outside the fence. Their API accepts shell text, so `allowCommands` does not apply. They ask
+unless Allow Everything, Discovery mode or a working whole-sandbox checkpoint permits them.
 Commands that change lab data outside the project ask, unless the lab checkpoints the whole sandbox disk
 (`endpoints.checkpoints`) and the session is in `auto`. An answer about a path
 outside the project covers that path. Pushes and unreviewed lab tools ask every time, in every mode.

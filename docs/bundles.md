@@ -13,13 +13,14 @@ How EnrichedLab handles git on a person's computer and in a lab sandbox, and how
   repository) works in `<repo>/.git/enrichedlab-worktrees/<id>` on its own branch `enrichedlab/<title>-<id>`. Parallel
   agents never write over each other or the person's checkout. `el worktrees` lists them; `--prune` removes the
   ones merged into the current branch.
-- **What asks.** In its own worktree the agent edits files and commits without asking: its commands run contained
-  and may write what a commit on an EnrichedLab branch needs (objects, the worktree's state, EnrichedLab's branch
-  refs), not the person's branches, HEAD, index, settings or hooks; the person reviews the branch when merging.
-  Worktrees need Seatbelt or bubblewrap: elsewhere sessions work in the checkout and commits ask like any command. `git push` (and
-  `send-pack`, `svn dcommit` and the like) asks in every mode, every time, and "allow for this session" doesn't
+- **What asks.** In its own worktree the agent edits files and uses the built-in `git_commit` tool without asking.
+  Agent commands cannot write any `.git` path below the worktree root. `git_commit` stages all changes and commits
+  through the engine's contained git path, with hooks, fsmonitor and signing off and the person's identity. Outside
+  the session's recorded worktree it asks, except in Allow Everything mode. Worktrees need Seatbelt or bubblewrap;
+  elsewhere sessions work in the checkout. `git push` (and `send-pack`, `svn dcommit` and the like) asks in every
+  mode, every time, and "allow for this session" doesn't
   cover it; `el run` refuses pushes unless `--push` is given.
-- **Commit messages** follow the prompt's rule: one imperative subject under 80 characters, no AI attribution.
+- **Commit messages** follow the prompt's rule: one imperative subject under 80 characters, no attribution footer.
 
 ## Git with a lab sandbox
 

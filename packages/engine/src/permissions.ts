@@ -12,7 +12,7 @@
 import { lstatSync, readlinkSync, realpathSync, statSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import type { FolderAccess, LabConfig, PermissionMode } from "./config.ts";
-import { isReadOnlyCommand, type Judging, pathsInside, personAllows } from "./tools/shell.ts";
+import { allowedCommand, isReadOnlyCommand, type Judging, pathsInside } from "./tools/shell.ts";
 import { everyCommand, plainCommands } from "./tools/shell_syntax.ts";
 import type { Tool } from "./tools/types.ts";
 import { isOpenPort } from "./sites/port_proxy.ts";
@@ -24,7 +24,7 @@ export type Verdict =
 	 * `fence`: it runs because of the paths it names, in a lab's sandbox, so the sandbox checks where they lead first.
 	 * `readOnly`: it runs contained with nothing in the project writable (it only reads, where nothing may change).
 	 */
-	| { action: "run"; fence?: boolean; readOnly?: boolean }
+	| { action: "run"; fence?: boolean; readOnly?: boolean; argv?: string[] }
 	| {
 			action: "ask";
 			reason: string;
@@ -211,7 +211,7 @@ const GIT_PUBLISHERS = PUBLISH.flatMap((p) => [`git-${p}`, `git-${p}.exe`]);
 const BRIDGES: Record<string, string> = { svn: "dcommit", p4: "submit" };
 
 /** Settings that make git run a program (or rename a command): set on the command line, git could push unseen. */
-const GIT_RUNS = /^(alias\.|core\.(sshcommand|fsmonitor|pager|editor|askpass|hookspath|gitproxy|alternaterefscommand)|diff\.|difftool\.|filter\.|merge\.|mergetool\.|gpg\.|credential\.|uploadpack\.|receivepack\.|sequence\.|interactive\.|remote\.|protocol\.|url\.|include|pager\.|log\.showsignature|submodule\.|tar\.|sendemail\.|lfs\.|web\.browser|browser\.|man\.|instaweb\.|ssh\.)/i;
+const GIT_RUNS = /^(alias\.|core\.(sshcommand|fsmonitor|pager|editor|askpass|hookspath|gitproxy|alternaterefscommand)|diff\.|difftool\.|filter\.|gc\.|merge\.|mergetool\.|gpg\.|credential\.|uploadpack\.|receivepack\.|sequence\.|interactive\.|remote\.|protocol\.|url\.|include|pager\.|log\.showsignature|submodule\.|tar\.|sendemail\.|lfs\.|web\.browser|browser\.|man\.|instaweb\.|ssh\.)/i;
 /** Programs that never run their arguments, so a shell's name among them is just a name. */
 // Not sort (--compress-program), bat (--pager), man (a pager) or find (-exec): those can run a program.
 const NON_RUNNING = new Set(["ls", "cat", "head", "tail", "wc", "echo", "printf", "which", "whereis", "type", "file", "stat", "grep", "egrep", "fgrep", "cut", "tr", "diff", "cmp", "basename", "dirname", "realpath", "readlink", "nl", "jq", "eza", "tree", "du", "df", "apropos", "whatis", "test", "[", "true", "false", "pwd", "date", "uname", "id", "whoami"]);
@@ -272,6 +272,11 @@ function publishing(command: string, depth = 0): "push" | "hidden" | undefined {
 		if (!argv.length) continue;
 		if (argv[0] === undefined || patterns[0] !== undefined) hidden = true;
 		const lead = argv[0] === undefined ? "" : argv[0].replace(/^.*\//, "");
+		const declaration = lead === "builtin" ? argv[1] : argv[0];
+		if (["export", "declare", "typeset", "local", "readonly"].includes(declaration ?? "")) {
+			const start = lead === "builtin" ? 2 : 1;
+			if (argv.slice(start).some((w) => w !== undefined && /^GIT_\w*(=|$)/.test(w))) hidden = true;
+		}
 		// A wrapper given an expanded word (command "$CMD" push), env splitting a string into a command (env -S), or
 		// git settings handed to env (env GIT_SSH_COMMAND=...): what runs depends on more than the line.
 		if (WRAPPERS.has(lead) && argv.includes(undefined)) hidden = true;
@@ -287,6 +292,10 @@ function publishing(command: string, depth = 0): "push" | "hidden" | undefined {
 					sawGit = true;
 					sawPush = true;
 				}
+			}
+			if (could(argv[i], patterns[i], ["p4", "p4.exe"]) && argv.slice(i + 1).some((w) => w === undefined || w === "submit")) {
+				sawGit = true;
+				sawPush = true;
 			}
 			// git settings handed in by name anywhere a wrapper passes them on (timeout 5 env GIT_X=..., builtin export).
 			if (argv[i] !== undefined && /^GIT_\w*=/.test(argv[i]!)) hidden = true;
@@ -414,6 +423,7 @@ const SCOPES: Record<string, string> = {
 	remember: "notes to memory",
 	skill_create: "new skills",
 	pdf_fill: "filling PDF forms",
+	git_commit: "commits",
 };
 
 function host(args: Record<string, unknown>): string {
@@ -495,6 +505,8 @@ export function decide(tool: Tool, args: Record<string, unknown>, workspace: Wor
 	if (keys[0] === "shell!hidden" || keys[0] === "sandbox!hidden") return ask(HIDDEN_REASON);
 	if (tool.unreviewed) return { action: "ask", reason: "The lab hasn't reviewed this tool yet, so it asks every time.", keys: [`unreviewed!${tool.name}`], scope: "this call" };
 	if (mode === "full") return { action: "run" };
+	// Agent shell commands cannot write .git. Commits use the engine path, free only in the recorded session worktree.
+	if (tool.name === "git_commit" && ownWorktree(workspace)) return { action: "run" };
 	// Discovery mode: what acts inside the lab the session works at runs without asking (the lab's filters, checks and
 	// audit stay on there). Anything on this computer still asks.
 	if (discovery && (tool.site === discovery || (!tool.site && workspace.kind === "sandbox" && (IN_SANDBOX.has(tool.kind) || keys[0] === "write")))) return { action: "run" };
@@ -502,6 +514,7 @@ export function decide(tool: Tool, args: Record<string, unknown>, workspace: Wor
 	const outside = `${keys.join(" ")}:outside:${String(args.path ?? args.url ?? "")}`;
 	const remembered = (list: string[]) => list.every((key) => !key.includes("!") && allowed.has(key));
 	if (extra ? allowed.has(outside) : remembered(keys)) return { action: "run" };
+	if (tool.name === "git_commit") return ask("It stages and commits this project's current changes.");
 	const askOutside = (reason: string): Verdict => ({ action: "ask", reason, keys: [outside], scope: "this path" });
 	const local = workspace.kind === "local";
 	const access = local ? folderAccess(config, workspace.root) : undefined;
@@ -520,10 +533,8 @@ export function decide(tool: Tool, args: Record<string, unknown>, workspace: Wor
 		case "sandbox": {
 			const command = typeof args.command === "string" ? args.command : undefined;
 			if (!command) return extra ? askOutside(extra) : { action: "run" };
-			// A lab tool that runs a command in the person's sandbox, outside any session's project folder (where other
-			// sessions' projects live) and outside the fence: only what the person listed in allowCommands runs; in auto,
-			// a sandbox whose whole disk is checkpointed runs anything; the rest asks, remembered per program.
-			if (personAllows(command, config.permissions.allowCommands)) return { action: "run" };
+			// A lab tool takes shell text outside any session project and fence, so exact-argv allowCommands cannot apply.
+			// In auto a sandbox whose whole disk is checkpointed runs it; the rest asks, remembered per program.
 			if (mode === "auto" && workspace.kind === "sandbox" && workspace.checkpointed === "filesystem") return { action: "run" };
 			return ask("It runs a command in the lab's sandbox, outside this session's project folder, where other sessions' work can be.");
 		}
@@ -550,6 +561,9 @@ export function decide(tool: Tool, args: Record<string, unknown>, workspace: Wor
 		}
 		case "exec": {
 			const command = String(args.command ?? "");
+			// allowCommands is an exact POSIX argv path. It is off for Windows and for lab command APIs that take shell text.
+			const argv = local ? allowedCommand(command, config.permissions.allowCommands) : undefined;
+			if (argv) return { action: "run", argv };
 			// Contained by the OS: writes stay in the project and temp folders, no network. Runs without asking unless it
 			// names a path outside the project or expands variables (the sandbox can still read most of the disk).
 			// Windows contains writes only, so there it still asks. A folder set to read only asks for everything.
@@ -567,16 +581,15 @@ export function decide(tool: Tool, args: Record<string, unknown>, workspace: Wor
 			// program does can't be read from its words, so nothing runs uncontained without a yes, except what the
 			// person listed in allowCommands.
 			const runsContained = fenced || Boolean(local && workspace.sandboxed && FULL_CONTAINMENT.has(workspace.sandboxed) && args.unsandboxed !== true);
-			if (runsContained && isReadOnlyCommand(command, config.permissions.allowCommands, inside, judging)) {
+			if (runsContained && isReadOnlyCommand(command, [], inside, judging)) {
 				// In a folder set to read only, or without history to take a change back, the OS keeps it from writing:
 				// what a program does isn't decided by its words.
 				const sealed = !recoverable || (local && readOnlyWithin(config, workspace.root));
 				return { action: "run", ...(fenced ? { fence: true } : {}), ...(sealed ? { readOnly: true } : {}) };
 			}
-			if (personAllows(command, config.permissions.allowCommands)) return { action: "run" };
 			// In a lab's sandbox whose whole disk is checkpointed, any command can be taken back.
 			if (mode === "auto" && workspace.kind === "sandbox" && workspace.checkpointed === "filesystem" && args.unsandboxed !== true) return { action: "run" };
-			const reads = isReadOnlyCommand(command, config.permissions.allowCommands, () => true);
+			const reads = isReadOnlyCommand(command, [], () => true);
 			if (reads) return ask("It reads outside the project folder.");
 			return ask(contained || workspace.kind === "sandbox" ? "It runs a command that changes things outside the project folder." : "It runs a command on this computer outside the sandbox, where it can change anything you can.");
 		}

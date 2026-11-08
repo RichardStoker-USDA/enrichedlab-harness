@@ -12,7 +12,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { posix } from "node:path";
-import type { Entry, ExecResult, Workspace } from "../tools/workspace.ts";
+import type { Entry, ExecOptions, ExecResult, Workspace } from "../tools/workspace.ts";
 import { fencedCommand, fencePython, probeCommand } from "./sandbox_fence.ts";
 
 /** What a site's sandbox offers. Gate implements it; other lab adapters will too. */
@@ -165,6 +165,12 @@ export class SandboxWorkspace implements Workspace {
 		return full === this.root ? "." : full.startsWith(`${this.root}/`) ? full.slice(this.root.length + 1) : full;
 	}
 
+	/** True only for a .git component below this project root, using the sandbox's POSIX paths. */
+	private gitPath(path: string): boolean {
+		const rel = posix.relative(this.root, path);
+		return rel !== "" && !rel.startsWith("../") && !posix.isAbsolute(rel) && rel.split("/").some((part) => part.toLowerCase() === ".git");
+	}
+
 	async stat(path: string): Promise<{ type: Entry["type"]; size: number } | undefined> {
 		const r = await this.run(`stat -c '%F|%s' -- ${shq(this.resolve(path))} 2>/dev/null`, 30);
 		const [kind, size] = r.stdout.trim().split("|");
@@ -211,12 +217,13 @@ export class SandboxWorkspace implements Workspace {
 
 	async write(path: string, data: string | Buffer, options: { outside?: boolean } = {}): Promise<void> {
 		const full = this.resolve(path);
+		if (this.gitPath(full)) throw new Error(`${this.display(full)} has a .git path component; EnrichedLab doesn't edit repository metadata.`);
 		const bytes = typeof data === "string" ? Buffer.from(data, "utf8") : data;
 		// Where its folder leads once links are followed, checked before anything is made: a link on the way out of the
 		// project isn't followed unless the outside path was approved.
 		const guard = options.outside
 			? ""
-			: `__el_d=$(realpath -m -- ${shq(posix.dirname(full))}) && case "$__el_d/" in "$(pwd -P)/"*) ;; *) echo ${shq(`${this.display(full)} leads outside the project (a link on the way); nothing was written.`)} >&2; exit 3;; esac && `;
+			: `__el_root=$(pwd -P) && __el_d=$(realpath -m -- ${shq(posix.dirname(full))}) && case "$__el_d/" in "$__el_root/"*) ;; *) echo ${shq(`${this.display(full)} leads outside the project (a link on the way); nothing was written.`)} >&2; exit 3;; esac && __el_rel=\${__el_d#"$__el_root/"} && case "/$__el_rel/" in *"/."[gG][iI][tT]"/"*) echo ${shq(`${this.display(full)} leads through a .git path; nothing was written.`)} >&2; exit 3;; esac && `;
 		const dir = shq(posix.dirname(full));
 		// Where the fence holds, each step runs under it, so nothing it makes or replaces can land outside the project
 		// whatever a link on the way does; the folder check above still refuses early.
@@ -255,7 +262,8 @@ export class SandboxWorkspace implements Workspace {
 		if (done.exitCode !== 0) throw new Error(done.stderr.trim() || `Can't write ${this.display(full)}.`);
 	}
 
-	async exec(command: string, options: { timeoutMs: number; signal: AbortSignal; onOutput?: (text: string) => void; fence?: FenceWord[]; readOnly?: boolean }): Promise<ExecResult> {
+	async exec(command: string, options: ExecOptions): Promise<ExecResult> {
+		if (options.argv) return { exitCode: 126, output: "allowCommands exact argv is not available through a lab's shell API, so this command didn't run.\n", timedOut: false };
 		// Fenced: under Landlock, writes land only in the project and temp folders (sandbox_fence.ts); a sandbox where the
 		// fence doesn't hold runs nothing fenced. A read-only subagent's command is always fenced, with no project rights.
 		if (options.fence || options.readOnly) {

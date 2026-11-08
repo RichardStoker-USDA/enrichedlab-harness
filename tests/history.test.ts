@@ -3,17 +3,49 @@
 
 import { afterAll, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Checkpoints } from "../packages/engine/src/session/checkpoint.ts";
-import { localHistory, MAX_FILE } from "../packages/engine/src/session/history.ts";
+import { fencedHistoryRemoval, localHistory, MAX_FILE } from "../packages/engine/src/session/history.ts";
 import { LocalWorkspace } from "../packages/engine/src/tools/workspace.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "el-history-"));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
 
 describe("step history", () => {
+	test.skipIf(process.platform === "win32")("uses trusted git instead of a project PATH entry", async () => {
+		const folder = join(dir, "trusted-project");
+		const bin = join(dir, "project-bin");
+		const marker = join(dir, "path-git-ran");
+		mkdirSync(folder);
+		mkdirSync(bin);
+		writeFileSync(join(folder, "a.txt"), "one\n");
+		writeFileSync(join(bin, "git"), `#!/bin/sh\nprintf x > ${JSON.stringify(marker)}\nexit 99\n`);
+		chmodSync(join(bin, "git"), 0o755);
+		const before = process.env.PATH;
+		process.env.PATH = bin;
+		try {
+			const point = await localHistory(join(dir, "trusted-store"), folder, "trusted").snapshot("start");
+			expect(point.changed).toBe(true);
+			expect(existsSync(marker)).toBe(false);
+		} finally {
+			if (before === undefined) delete process.env.PATH;
+			else process.env.PATH = before;
+		}
+	});
+
+	test("wraps lab removal in the fence when it holds", async () => {
+		let seen = "";
+		const wrapped = await fencedHistoryRemoval("rm -f -- a", async (script) => {
+			seen = script;
+			return `fenced { ${script}; }`;
+		});
+		expect(seen).toBe("rm -f -- a");
+		expect(wrapped).toBe("fenced { rm -f -- a; }");
+		expect(await fencedHistoryRemoval("rm -f -- a", async () => undefined)).toBe("rm -f -- a");
+	});
+
 	test("brings back a step: edits, new and deleted files, and data the repository ignores; leaves the rest", async () => {
 		const folder = join(dir, "project");
 		mkdirSync(join(folder, "data"), { recursive: true });

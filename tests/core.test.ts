@@ -17,11 +17,13 @@ import { type SandboxApi, SandboxWorkspace } from "../packages/engine/src/sites/
 import { openPort } from "../packages/engine/src/sites/port_proxy.ts";
 import { unifiedDiff } from "../packages/engine/src/tools/diff.ts";
 import { editTool, globToRegex } from "../packages/engine/src/tools/files.ts";
+import { gitCommitTool } from "../packages/engine/src/tools/git_commit.ts";
 import { splitBlocks } from "../packages/web/src/lib/blocks.ts";
 import { Sites } from "../packages/engine/src/sites/sites.ts";
 import { Checkpoints } from "../packages/engine/src/session/checkpoint.ts";
 import { findSkills } from "../packages/engine/src/skills.ts";
 import { runHooks } from "../packages/engine/src/hooks.ts";
+import { systemPrompt } from "../packages/engine/src/prompt.ts";
 
 // The shell checks and hooks below are written for sh-style shells; on Windows every command asks.
 const posix = process.platform !== "win32";
@@ -324,10 +326,10 @@ describe("permissions", () => {
 		const lab = new SandboxWorkspace(api, "/sandbox/work/project-1");
 		const run = { name: "field_sandbox_run", kind: "sandbox" } as unknown as Tool;
 		const askMode = { permissions: { mode: "ask", allowCommands: [] } } as unknown as LabConfig;
-		// Round 6: they run outside the fence, so even a read asks unless the person listed it.
+		// They run outside the fence through a shell API, so allowCommands does not apply there.
 		expect(decide(run, { command: "ls /sandbox/work" }, lab, askMode, new Set()).action).toBe("ask");
 		expect(decide(run, { command: "bat --paging=always --pager /sandbox/work/p/pager README.md" }, lab, askMode, new Set()).action).toBe("ask");
-		expect(decide(run, { command: "ls /sandbox/work" }, lab, { permissions: { mode: "ask", allowCommands: ["ls"] } } as unknown as LabConfig, new Set()).action).toBe("run");
+		expect(decide(run, { command: "ls /sandbox/work" }, lab, { permissions: { mode: "ask", allowCommands: ["ls /sandbox/work"] } } as unknown as LabConfig, new Set()).action).toBe("ask");
 		expect(decide(run, { command: "rm -rf /sandbox/work/other" }, lab, askMode, new Set())).toMatchObject({ action: "ask", keys: ["sandbox:rm"] });
 		expect(decide(run, { command: "rm -rf /sandbox/work/other" }, lab, askMode, new Set(["shell:rm"])).action).toBe("ask");
 		// B3: in a lab whose fence isn't known to hold, nothing runs on its words alone, checkpointed or not.
@@ -709,9 +711,41 @@ describe("git push", () => {
 });
 
 describe("own-branch commits", () => {
-	test.if(process.platform === "darwin")("in a session's own worktree, commits run contained; its git settings and hooks stay read only", async () => {
+	test("the worktree prompt directs commits through the built-in tool", () => {
+		const prompt = systemPrompt({ cwd: scratch("prompt-worktree"), shell: "bash", workspaceLabel: "test", globalInstructions: [], sites: [], worktree: { branch: "enrichedlab/test", repo: "/repo" } });
+		expect(prompt).toContain("Commit with git_commit, never git commit in shell");
+		expect(prompt).toContain("Use git_commit when a piece of work is done and tested");
+	});
+
+	test("a worktree record accepts only its own admin back-reference", async () => {
+		const repo = scratch("worktree-record");
+		const gitDir = join(repo, ".git");
+		const path = join(gitDir, "enrichedlab-worktrees", "s1");
+		const ownAdmin = join(gitDir, "worktrees", "s1");
+		const otherAdmin = join(gitDir, "worktrees", "person");
+		mkdirSync(path, { recursive: true });
+		mkdirSync(ownAdmin, { recursive: true });
+		mkdirSync(otherAdmin, { recursive: true });
+		writeFileSync(join(path, ".git"), `gitdir: ${ownAdmin}\n`);
+		writeFileSync(join(ownAdmin, "gitdir"), `${join(path, ".git")}\n`);
+		writeFileSync(join(otherAdmin, "gitdir"), `${join(repo, "person", ".git")}\n`);
+		const record = { path, repo, branch: "enrichedlab/test-s1" };
+		const valid = new LocalWorkspace(path, "off", record);
+		expect(valid.worktree).toEqual({ path: realpathSync(path), gitDir: realpathSync(gitDir) });
+		expect(decide(gitCommitTool, { message: "Test" }, valid, { permissions: { mode: "ask", allowCommands: [] } } as unknown as LabConfig, new Set())).toEqual({ action: "run" });
+		await expect(valid.write(".git", `gitdir: ${otherAdmin}\n`)).rejects.toThrow(".git path");
+		writeFileSync(join(path, ".git"), `gitdir: ${otherAdmin}\n`);
+		const redirected = new LocalWorkspace(path, "off", record);
+		expect(redirected.worktree).toBeUndefined();
+		expect(decide(gitCommitTool, { message: "Test" }, redirected, { permissions: { mode: "ask", allowCommands: [] } } as unknown as LabConfig, new Set()).action).toBe("ask");
+		expect(decide(gitCommitTool, { message: "Test" }, redirected, { permissions: { mode: "ask", allowCommands: [] } } as unknown as LabConfig, new Set(["write:git_commit"])).action).toBe("run");
+		expect(decide(gitCommitTool, { message: "Test" }, redirected, { permissions: { mode: "full", allowCommands: [] } } as unknown as LabConfig, new Set()).action).toBe("run");
+	});
+
+	test.skipIf(process.platform !== "darwin")("agent commands cannot write git metadata; the engine commit tool owns commits", async () => {
 		const { execFileSync } = await import("node:child_process");
 		const { createWorktree } = await import("../packages/engine/src/git.ts");
+		const { gitCommitTool } = await import("../packages/engine/src/tools/git_commit.ts");
 		const config = { permissions: { mode: "ask", allowCommands: [] } } as unknown as LabConfig;
 		const shell = { name: "shell", kind: "exec" } as unknown as Tool;
 		// Outside the temp folders, which contained commands may always write.
@@ -725,30 +759,35 @@ describe("own-branch commits", () => {
 		const own = new LocalWorkspace(made.path, "workspace", { ...made, repo });
 		expect(own.worktree?.gitDir).toBe(join(repo, ".git"));
 		const run = (ws: LocalWorkspace, command: string) => decide(shell, { command }, ws, config, new Set()).action;
-		expect(run(own, "git add -A && git commit -m 'Fix the parser'")).toBe("run");
 		expect(run(own, "git push origin HEAD")).toBe("ask");
+		expect(decide(gitCommitTool, { message: "Fix the parser" }, own, config, new Set())).toEqual({ action: "run" });
 		// A folder that only looks like one (no record that the engine made it) isn't the session's worktree.
 		const lookalike = join(repo, ".git", "enrichedlab-worktrees", "w9");
 		mkdirSync(lookalike, { recursive: true });
 		expect(new LocalWorkspace(lookalike).worktree).toBeUndefined();
 		expect(run(new LocalWorkspace(lookalike), "git commit -m x")).toBe("ask");
-		// The commit itself works under the sandbox; the repository's settings and hooks can't be changed from there.
+		expect(decide(gitCommitTool, { message: "Fix" }, new LocalWorkspace(lookalike), config, new Set()).action).toBe("ask");
+		// Shell git cannot change the worktree pointer or index. The engine tool stages and commits with engine git.
 		writeFileSync(join(made.path, "b.txt"), "two\n");
 		const opts = { timeoutMs: 30_000, signal: new AbortController().signal };
-		const commit = await own.exec("git add -A && git -c user.name=t -c user.email=t@t commit -q -m 'Add b' && git log --oneline -1", opts);
-		expect([commit.exitCode, commit.output]).toEqual([0, expect.stringContaining("Add b")]);
+		const pointer = readFileSync(join(made.path, ".git"), "utf8");
+		expect((await own.exec("printf 'gitdir: /tmp/other\\n' > .git", opts)).exitCode).not.toBe(0);
+		expect(readFileSync(join(made.path, ".git"), "utf8")).toBe(pointer);
+		const committed = await gitCommitTool.run({ message: "Add b" }, { workspace: own } as never);
+		expect(committed.ok).toBe(true);
+		expect(execFileSync("git", ["-C", made.path, "log", "--format=%s", "-1"], { encoding: "utf8" }).trim()).toBe("Add b");
 		const before = readFileSync(join(repo, ".git", "config"), "utf8");
 		expect((await own.exec("git config core.hooksPath /tmp/elsewhere", opts)).exitCode).not.toBe(0);
 		expect((await own.exec(`printf x > ${join(repo, ".git", "hooks", "pre-commit")}`, opts)).exitCode).not.toBe(0);
 		expect(readFileSync(join(repo, ".git", "config"), "utf8")).toBe(before);
 		expect(existsSync(join(repo, ".git", "hooks", "pre-commit"))).toBe(false);
-		// The person's own branch and index aren't the session's to change; settings in a repository made later aren't either.
+		// The person's own branch and index aren't the session's to change. A later mixed-case .git is read only too.
 		const main = git("rev-parse", "HEAD").trim();
 		expect((await own.exec("git update-ref refs/heads/main HEAD", opts)).exitCode).not.toBe(0);
 		expect(git("rev-parse", "HEAD").trim()).toBe(main);
-		expect((await own.exec("mkdir -p nested && cd nested && git init -q && git config core.hooksPath /tmp/elsewhere", opts)).exitCode).not.toBe(0);
+		expect((await own.exec("mkdir -p nested/.GiT && printf x > nested/.GiT/config", opts)).exitCode).not.toBe(0);
 		// File edits never go into a .git folder.
-		await expect(own.write(".git", "gitdir: /tmp/elsewhere\n")).rejects.toThrow(".git folder");
+		await expect(own.write(".git", "gitdir: /tmp/elsewhere\n")).rejects.toThrow(".git path");
 		rmSync(repo, { recursive: true, force: true });
 	});
 });

@@ -112,10 +112,11 @@ export function systemPrompt(input: PromptInput): string {
 			"# Git",
 			"- Commit messages: one imperative subject line under 80 characters, a body only when the diff doesn't explain itself. No AI attribution, co-author or \"generated with\" lines.",
 			"- Never push, force-push, rebase or merge into a branch you didn't create unless the person asks. Undo restores the working tree, so don't stash or reset to get back to a clean state.",
+			"- Commit with git_commit, never git commit in shell. Agent shell commands cannot write repository metadata.",
 		);
 		if (input.worktree)
 			lines.push(
-				`- You work in your own worktree on branch ${input.worktree.branch}; the person's checkout at ${input.worktree.repo} is untouched. Commit here when a piece of work is done and tested; the person merges the branch.`,
+				`- You work in your own worktree on branch ${input.worktree.branch}; the person's checkout at ${input.worktree.repo} is untouched. Use git_commit when a piece of work is done and tested; the person merges the branch.`,
 			);
 	}
 	if (input.notes?.trim()) lines.push("", "# Notes from earlier sessions in this project", "", input.notes.trim());

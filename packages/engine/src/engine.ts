@@ -46,6 +46,7 @@ import type { ModelProfile } from "./models/types.ts";
 import { editTool, globTool, grepTool, lsTool, readTool, writeTool } from "./tools/files.ts";
 import { fetchTool, planTool, recallTool, showTool } from "./tools/harness.ts";
 import { shellTool } from "./tools/shell.ts";
+import { gitCommitTool } from "./tools/git_commit.ts";
 import { appCreateTool, appOpenTool } from "./tools/apps.ts";
 import { environmentTool } from "./tools/environment.ts";
 import type { Tool } from "./tools/types.ts";
@@ -61,7 +62,7 @@ import { RESOURCE as CHATGPT_API, signIn as chatgptSignIn, signOut as chatgptSig
 import { errorText, newId, readJson, sleep, VERSION, writeJson } from "./util.ts";
 import { verifyPackage, writePackage } from "./session/package.ts";
 
-export const BUILT_IN_TOOLS: Tool[] = [readTool, writeTool, editTool, lsTool, globTool, grepTool, shellTool, fetchTool, showTool, recallTool, planTool, agentStartTool, agentWaitTool, rememberTool, skillCreateTool, appCreateTool, appOpenTool, environmentTool, pdfFieldsTool, pdfFillTool, ...BROWSER_TOOLS];
+export const BUILT_IN_TOOLS: Tool[] = [readTool, writeTool, editTool, lsTool, globTool, grepTool, shellTool, gitCommitTool, fetchTool, showTool, recallTool, planTool, agentStartTool, agentWaitTool, rememberTool, skillCreateTool, appCreateTool, appOpenTool, environmentTool, pdfFieldsTool, pdfFillTool, ...BROWSER_TOOLS];
 
 export class RpcError extends Error {
 	constructor(

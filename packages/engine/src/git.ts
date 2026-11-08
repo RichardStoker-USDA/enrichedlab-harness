@@ -6,7 +6,7 @@ import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, isAbsolute, join, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { mkdirPhysical, unlinkPhysical } from "./tools/anchored.ts";
 import { contained, FULL_CONTAINMENT, GIT_SETTINGS_PATTERNS, physical, sandboxer, shellSafe, trustedGit } from "./tools/workspace.ts";
 import { SECRET_NAME, withoutSecrets } from "./util.ts";
@@ -18,10 +18,10 @@ import { SECRET_NAME, withoutSecrets } from "./util.ts";
  * no network, no keys or tokens in its environment, hooks and fsmonitor off, and the repository's settings, hooks and
  * info folder read only. Where this computer can't contain it, it doesn't run (snapshots and worktrees are off there).
  */
-function git(cwd: string, args: string[], env?: Record<string, string>): string {
+function git(cwd: string, args: string[], env?: Record<string, string>, scratch: string[] = []): string {
 	const program = trustedGit();
 	if (!program) throw new Error("No git from the system's or Homebrew's own folders was found, so the engine's git work didn't run.");
-	const full = ["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", ...args];
+	const full = ["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgSign=false", ...args];
 	const facility = sandboxer();
 	if (!facility || !FULL_CONTAINMENT.has(facility)) throw new Error("This computer has no sandbox for the engine's git work (Seatbelt on macOS, bubblewrap on Linux), so it didn't run.");
 	const options = { cwd, env: { ...withoutSecrets(shellSafe({ ...process.env, ...env })), ...env, GIT_TERMINAL_PROMPT: "0" }, encoding: "utf8" as const };
@@ -31,12 +31,13 @@ function git(cwd: string, args: string[], env?: Record<string, string>): string 
 	// the folder's own .git, a repository above it whose .git sits directly in its top folder, or an EnrichedLab
 	// worktree inside the repository's .git.
 	const within = (p: string, dir: string) => p === dir || p.startsWith(`${dir}${sep}`);
-	let writable = [here];
-	const probe = contained(program, ["rev-parse", "--show-toplevel", "--git-common-dir"], { writable: [], network: "none" });
+	const scratchFolders = [...scratch, ...(env?.GIT_INDEX_FILE ? [dirname(env.GIT_INDEX_FILE)] : [])].map(physical);
+	let writable = [here, ...scratchFolders];
+	const probe = contained(program, ["rev-parse", "--show-toplevel", "--git-common-dir"], { writable: [], readable: [here], network: "none" });
 	try {
 		const [top = "", common = ""] = execFileSync(probe.file, probe.args, { ...options, stdio: ["ignore", "pipe", "pipe"] }).trim().split("\n").map((p) => physical(resolve(cwd, p)));
-		if (common === join(top, ".git") && within(here, top)) writable = [...new Set([here, top, common])];
-		else if (within(common, here) || within(here, common)) writable = [...new Set([here, common])];
+		if (common === join(top, ".git") && within(here, top)) writable = [...new Set([here, top, common, ...scratchFolders])];
+		else if (within(common, here) || within(here, common)) writable = [...new Set([here, common, ...scratchFolders])];
 	} catch {
 		// Not a repository yet: the folder itself.
 	}
@@ -151,6 +152,15 @@ export function identity(cwd: string): { name: string; email: string } {
 	return { name: read("user.name") || "EnrichedLab", email: read("user.email") || "enrichedlab@localhost" };
 }
 
+/** Stage the session worktree and commit it on its current branch as the person. */
+export function commit(cwd: string, message: string): string {
+	const who = identity(cwd);
+	const as = { GIT_AUTHOR_NAME: who.name, GIT_AUTHOR_EMAIL: who.email, GIT_COMMITTER_NAME: who.name, GIT_COMMITTER_EMAIL: who.email };
+	git(cwd, ["add", "-A"]);
+	// No signing (the sandbox hides the signing keys) and no hooks: the commit is the session's work as it stands.
+	return git(cwd, ["commit", "--no-gpg-sign", "--no-verify", "-q", "-m", message], as);
+}
+
 /** Git pathspecs for the names SECRET_NAME matches, so history is searched by name without walking every tree. */
 const SECRET_SPECS = [".env", ".env.*", "*.pem", "*.key", "id_*", "credentials", "credentials.json", "*.tfstate", ".netrc", ".npmrc", ".pypirc"].map((g) => `:(glob,icase)**/${g}`);
 
@@ -215,7 +225,7 @@ export function packForSend(repo: string, bundle: string): Pack {
 		const commit = history ? home : git(repo, ["commit-tree", tree, "-m", `The project at ${head!.slice(0, 7)}, without its history (it has files that look like secrets)`], as);
 		git(repo, ["update-ref", ref, commit]);
 		if (home !== commit) git(repo, ["update-ref", `${ref}-home`, home]);
-		git(repo, ["bundle", "create", "-q", bundle, ref]);
+		git(repo, ["bundle", "create", "-q", bundle, ref], undefined, [dirname(bundle)]);
 		return { id, ref, commit, home, skipped, history };
 	} finally {
 		rmSync(scratch, { recursive: true, force: true });
@@ -232,7 +242,7 @@ export function fetchBundle(repo: string, bundle: string, source: string, branch
 	// The bundle is a file EnrichedLab downloaded: only the file transport, never a network or helper transport.
 	// A folder would make git start upload-pack there; only a plain file is a bundle.
 	if (!isAbsolute(bundle) || !statSync(bundle, { throwIfNoEntry: false })?.isFile()) throw new Error(`${bundle} isn't a bundle file.`);
-	git(repo, ["fetch", "-q", "--no-recurse-submodules", bundle, `${source}:${temp}`], { GIT_ALLOW_PROTOCOL: "file" });
+	git(repo, ["fetch", "-q", "--no-recurse-submodules", bundle, `${source}:${temp}`], { GIT_ALLOW_PROTOCOL: "file" }, [dirname(bundle)]);
 	try {
 		const tip = home === base ? git(repo, ["rev-parse", temp]) : rebuild(repo, base, home, temp);
 		git(repo, ["update-ref", `refs/heads/${branch}`, tip]);

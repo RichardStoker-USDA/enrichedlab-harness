@@ -3,16 +3,16 @@
 
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { closeSync, constants, existsSync, linkSync, mkdirSync, readdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, constants, existsSync, linkSync, mkdirSync, readdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { LabConfig } from "../packages/engine/src/config.ts";
 import { allowKeys, decide, HIDDEN_REASON, PUSH_REASON } from "../packages/engine/src/permissions.ts";
 import { restoreSnapshot, snapshot } from "../packages/engine/src/git.ts";
 import { mkdirPhysical, openPhysical, unlinkPhysical } from "../packages/engine/src/tools/anchored.ts";
-import { isReadOnlyCommand } from "../packages/engine/src/tools/shell.ts";
+import { allowedCommand, isReadOnlyCommand } from "../packages/engine/src/tools/shell.ts";
 import type { Tool } from "../packages/engine/src/tools/types.ts";
-import { LocalWorkspace, trustedGit } from "../packages/engine/src/tools/workspace.ts";
+import { LocalWorkspace, projectGitPaths, projectGitPattern, trustedGit } from "../packages/engine/src/tools/workspace.ts";
 import { everyCommand, plainCommands } from "../packages/engine/src/tools/shell_syntax.ts";
 import { FENCE_PY } from "../packages/engine/src/sites/sandbox_fence.ts";
 import { bashPattern, type SandboxApi, SandboxWorkspace } from "../packages/engine/src/sites/sandbox_workspace.ts";
@@ -89,8 +89,10 @@ describe("lab sandbox file fence", () => {
 		await spoofed.prepare();
 		expect(spoofed.fenced).toBe(false);
 		const lab = new SandboxWorkspace(api("el-fence ok NONCE abi 6 py /usr/bin/python3\n"), "/sandbox/work/p");
+		await expect(lab.write("nested/.GiT/config", "x")).rejects.toThrow(".git path");
 		await lab.write("alias/marker.txt", "x");
 		expect(commands.some((c) => c.includes("realpath -m --") && c.includes("/sandbox/work/p/alias") && c.includes("leads outside the project"))).toBe(true);
+		expect(commands.some((c) => c.includes("[gG][iI][tT]") && c.includes("leads through a .git path"))).toBe(true);
 		commands.length = 0;
 		await lab.write("/sandbox/data/x.txt", "x", { outside: true });
 		expect(commands.some((c) => c.includes("leads outside"))).toBe(false);
@@ -380,7 +382,7 @@ describe("round 5: one boundary", () => {
 		// merge driver, and diff or show with content would run a textconv, which the no-facility fallback leaves on.
 		const source = readFileSync(join(import.meta.dir, "..", "packages", "engine", "src", "git.ts"), "utf8");
 		const calls = [...source.matchAll(/git\([a-zA-Z.]+, \[("[a-z-]+")([^\]]*)\]/g)].map((m) => ({ sub: JSON.parse(m[1]!) as string, rest: m[2]! }));
-		const reviewed = new Set(["add", "branch", "bundle", "checkout-index", "commit-tree", "config", "diff", "fetch", "log", "ls-files", "ls-tree", "read-tree", "rev-list", "rev-parse", "rm", "show", "update-index", "update-ref", "worktree", "write-tree"]);
+		const reviewed = new Set(["add", "branch", "bundle", "checkout-index", "commit", "commit-tree", "config", "diff", "fetch", "log", "ls-files", "ls-tree", "read-tree", "rev-list", "rev-parse", "rm", "show", "update-index", "update-ref", "worktree", "write-tree"]);
 		expect(calls.length).toBeGreaterThan(20);
 		expect(calls.map((c) => c.sub).filter((s) => !reviewed.has(s))).toEqual([]);
 		for (const c of calls.filter((x) => x.sub === "diff")) expect(c.rest).toContain('"--name-only"');
@@ -477,23 +479,80 @@ describe("round 6: containment is the boundary", () => {
 		}
 	});
 
-	test("round 7: allowCommands holds one statement, and more publishing forms count", () => {
+	test("round 8: allowCommands is one exact literal argv, and publishing forms stay visible", async () => {
 		const root = realpathSync(mkdtempSync(join(tmpdir(), "el-allow-")));
 		try {
 			const off = new LocalWorkspace(root, "off");
-			const listed = { permissions: { mode: "ask", allowCommands: ["Write-Output", "ls"] } } as unknown as LabConfig;
-			for (const command of ["Write-Output a\rWrite-Output b", "ls ls", "ls\u0085x", "ls\tx\0"]) {
+			const listed = { permissions: { mode: "ask", allowCommands: ["ls -la"] } } as unknown as LabConfig;
+			for (const command of ["ls", "ls -la ", "ls\r-la", "ls ls", "ls\u0085x", "ls\tx\0", "ls $HOME", "ls *", "ls ~", "printf $'\\n'", "A=1 ls", "ls > out"]) {
 				expect([JSON.stringify(command), decide(shell, { command }, off, listed, new Set()).action]).toEqual([JSON.stringify(command), "ask"]);
 			}
-			expect(decide(shell, { command: "ls -la" }, off, listed, new Set()).action).toBe("run");
+			if (process.platform === "win32") expect(decide(shell, { command: "ls -la" }, off, listed, new Set()).action).toBe("ask");
+			else expect(decide(shell, { command: "ls -la" }, off, listed, new Set())).toEqual({ action: "run", argv: ["ls", "-la"] });
+			expect(allowedCommand("\u00a0/usr/bin/ls", ["\u00a0/usr/bin/ls"])).toBeUndefined();
+			expect(allowedCommand("ls ~", ["ls ~"])).toBeUndefined();
+			expect(allowedCommand("printf $'\\n'", ["printf $'\\n'"])).toBeUndefined();
+
+			if (process.platform !== "win32") {
+				const bin = join(root, "outside-bin");
+				const project = join(root, "project");
+				mkdirSync(bin);
+				mkdirSync(project);
+				const program = join(bin, "literal-argv");
+				writeFileSync(program, "#!/bin/sh\nprintf '<%s>' \"$1\"\n");
+				chmodSync(program, 0o755);
+				const command = "literal-argv 'a b; $HOME'";
+				const argv = allowedCommand(command, [command]);
+				expect(argv).toEqual(["literal-argv", "a b; $HOME"]);
+				const result = await new LocalWorkspace(project, "off").exec(command, { argv, env: { PATH: bin }, timeoutMs: 5_000, signal: AbortSignal.timeout(5_000) });
+				expect([result.exitCode, result.output]).toEqual([0, "<a b; $HOME>"]);
+				const projectProgram = join(project, "owned");
+				writeFileSync(projectProgram, "#!/bin/sh\nexit 0\n");
+				chmodSync(projectProgram, 0o755);
+				const refused = await new LocalWorkspace(project, "off").exec("owned", { argv: ["owned"], env: { PATH: project }, timeoutMs: 5_000, signal: AbortSignal.timeout(5_000) });
+				expect([refused.exitCode, refused.output]).toEqual([126, expect.stringContaining("never runs a program from the project")]);
+				const refusedRelative = await new LocalWorkspace(project, "off").exec("owned", { argv: ["owned"], env: { PATH: "." }, timeoutMs: 5_000, signal: AbortSignal.timeout(5_000) });
+				expect([refusedRelative.exitCode, refusedRelative.output]).toEqual([126, expect.stringContaining("never runs a program from the project")]);
+				symlinkSync(program, join(project, "linked-program"));
+				const refusedLink = await new LocalWorkspace(project, "off").exec("linked-program", { argv: ["linked-program"], env: { PATH: project }, timeoutMs: 5_000, signal: AbortSignal.timeout(5_000) });
+				expect([refusedLink.exitCode, refusedLink.output]).toEqual([126, expect.stringContaining("never runs a program from the project")]);
+			}
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}
-		for (const command of ["/usr/lib/git-core/git-svn dcommit", "/usr/lib/git-core/git-p4 submit"]) {
+		for (const command of ["/usr/lib/git-core/git-svn dcommit", "/usr/lib/git-core/git-p4 submit", "p4 submit"]) {
 			expect([command, allowKeys(shell, { command }).keys[0]]).toEqual([command, "shell!push"]);
 		}
-		for (const command of ["timeout 5 env GIT_SSH_COMMAND=./x git fetch", "nice env GIT_CONFIG_COUNT=1 git status", "builtin export GIT_CONFIG_COUNT=1", "git -c tar.x.command=./y archive HEAD", "git -c difftool.t.cmd=./y difftool"]) {
+		for (const command of ["timeout 5 env GIT_SSH_COMMAND=./x git fetch", "nice env GIT_CONFIG_COUNT=1 git status", "export GIT_SSH_COMMAND", "declare -x GIT_CONFIG_COUNT", "readonly GIT_ASKPASS", "builtin export GIT_CONFIG_COUNT", "builtin declare -x GIT_SSH_COMMAND", "git -c gc.recentObjectsHook=./x gc", "git -c tar.x.command=./y archive HEAD", "git -c difftool.t.cmd=./y difftool"]) {
 			expect([command, allowKeys(shell, { command }).keys[0]]).toEqual([command, "shell!hidden"]);
+		}
+		expect(FENCE_PY.match(/425, 426, 427/g)).toHaveLength(2);
+	});
+
+	test("round 8: file writes reject .git before and after following links, without blocking an ancestor .git", async () => {
+		const base = realpathSync(mkdtempSync(join(tmpdir(), "el-git-paths-")));
+		try {
+			const root = join(base, "repo", ".git", "enrichedlab-worktrees", "s1");
+			mkdirSync(root, { recursive: true });
+			mkdirSync(join(root, "nested", ".GiT"), { recursive: true });
+			mkdirSync(join(root, "control"));
+			writeFileSync(join(root, "control", ".git"), "gitdir: elsewhere\n");
+			const ws = new LocalWorkspace(root);
+			await ws.write("ok.txt", "ok\n");
+			await expect(ws.write("nested/.GiT/config", "x")).rejects.toThrow(".git path");
+			symlinkSync(join(root, "nested", ".GiT"), join(root, "alias"));
+			await expect(ws.write("alias/config", "x")).rejects.toThrow(".git path");
+			mkdirSync(join(root, "linked"));
+			symlinkSync(join(root, "nested"), join(root, "linked", ".git"));
+			expect(projectGitPaths(root)).toContain(join(root, "nested", ".GiT"));
+			expect(projectGitPaths(root)).toContain(join(root, "control", ".git"));
+			expect(projectGitPaths(root)).toContain(join(root, "linked", ".git"));
+			const pattern = new RegExp(projectGitPattern(root));
+			expect(pattern.test(join(root, ".git"))).toBe(true);
+			expect(pattern.test(join(root, "a", ".GIT", "config"))).toBe(true);
+			expect(pattern.test(join(base, "repo", ".git", "config"))).toBe(false);
+		} finally {
+			rmSync(base, { recursive: true, force: true });
 		}
 	});
 

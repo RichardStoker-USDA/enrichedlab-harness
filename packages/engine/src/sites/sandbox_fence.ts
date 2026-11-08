@@ -74,8 +74,8 @@ def fence(rules):
 # Read mode: no changes to modes, owners, times or extended attributes anywhere (Landlock has no right for them), by
 # seccomp: these system calls fail with EPERM; a process of another architecture is stopped.
 META = {
-    "x86_64": (0xC000003E, [90, 91, 92, 93, 94, 132, 188, 189, 190, 197, 198, 199, 235, 260, 261, 268, 280, 452, 463, 466]),
-    "aarch64": (0xC00000B7, [5, 6, 7, 14, 15, 16, 52, 53, 54, 55, 88, 452, 463, 466]),
+    "x86_64": (0xC000003E, [90, 91, 92, 93, 94, 132, 188, 189, 190, 197, 198, 199, 235, 260, 261, 268, 280, 425, 426, 427, 452, 463, 466]),
+    "aarch64": (0xC00000B7, [5, 6, 7, 14, 15, 16, 52, 53, 54, 55, 88, 425, 426, 427, 452, 463, 466]),
 }
 
 class SockFilter(ctypes.Structure):

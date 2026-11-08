@@ -80,11 +80,23 @@ function eachName(text: string, pattern: string | undefined, ok: (path: string) 
 
 const looksLikePath = (t: string) => /^(~|\/|\\\\|[A-Za-z]:[\\/])/.test(t) || /(^|[\\/])\.\.([\\/]|$)/.test(t);
 
-/** True when the command is one the person listed in allowCommands (a whole word prefix, nothing chained). */
+const FORBIDDEN_ALLOW_TEXT = /[\x00-\x1f\x7f-\x9f\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]/;
+
+/** Literal argv when the exact command is listed in allowCommands. Windows stays off until it has this same path. */
+export function allowedCommand(command: string, extra: string[]): string[] | undefined {
+	if (process.platform === "win32" || !extra.includes(command)) return undefined;
+	// Bash does not split these Unicode spaces. A project could otherwise make the resulting relative program name.
+	if (FORBIDDEN_ALLOW_TEXT.test(command)) return undefined;
+	const commands = plainCommands(command);
+	if (commands?.length !== 1) return undefined;
+	const one = commands[0]!;
+	if (one.background || one.assigns.length || one.redirects.length || one.patterns.some(Boolean) || !one.words.length || one.words.some((word) => word.startsWith("~") || FORBIDDEN_ALLOW_TEXT.test(word))) return undefined;
+	return one.words;
+}
+
+/** True when the exact command has a safe allowCommands argv. */
 export function personAllows(command: string, extra: string[]): boolean {
-	const text = command.trim();
-	// Any control character (a carriage return ends a statement in PowerShell, as a newline does in bash) refuses.
-	return Boolean(text) && extra.some((prefix) => text === prefix || text.startsWith(`${prefix} `)) && !/[;&|<>`$*?[\]{}~\x00-\x1f\x7f\u0085\u2028\u2029]/.test(text);
+	return allowedCommand(command, extra) !== undefined;
 }
 
 /** True when every part of a command only reads, inside the project when `inside` is given. Anything unusual
@@ -92,7 +104,7 @@ export function personAllows(command: string, extra: string[]): boolean {
 export function isReadOnlyCommand(command: string, extra: string[] = [], inside?: (path: string) => boolean, judging: Judging = {}): boolean {
 	const text = command.trim();
 	if (!text) return false;
-	if (extra.some((prefix) => text === prefix || text.startsWith(`${prefix} `)) && !/[;&|<>`$\n]/.test(text)) return true;
+	if (allowedCommand(command, extra)) return true;
 	// The check below parses POSIX shell. PowerShell escapes with a backtick and treats \ as a path separator, so on
 	// Windows nothing runs unasked except the person's own allowCommands.
 	if (process.platform === "win32") return false;
@@ -242,7 +254,7 @@ export const shellTool: Tool = {
 		if (!command.trim()) throw new ToolError("The command is empty.");
 		const timeout = Math.min(MAX_TIMEOUT_S, Math.max(1, num(args, "timeout") ?? DEFAULT_TIMEOUT_S));
 		const started = Date.now();
-		const result = await ctx.workspace.exec(command, { timeoutMs: timeout * 1_000, signal: ctx.signal, onOutput: ctx.output, unsandboxed: args.unsandboxed === true, ...(ctx.fence ? { fence: wordsOf(command) } : {}), ...(ctx.readOnly ? { readOnly: true } : {}) });
+		const result = await ctx.workspace.exec(command, { timeoutMs: timeout * 1_000, signal: ctx.signal, onOutput: ctx.output, unsandboxed: args.unsandboxed === true, ...(ctx.fence ? { fence: wordsOf(command) } : {}), ...(ctx.readOnly ? { readOnly: true } : {}), ...(ctx.argv ? { argv: ctx.argv } : {}) });
 		const seconds = ((Date.now() - started) / 1000).toFixed(1);
 		const status = result.timedOut ? `stopped after ${timeout}s` : ctx.signal.aborted ? "cancelled" : `exit ${result.exitCode ?? "?"}`;
 		const output = result.output.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "");

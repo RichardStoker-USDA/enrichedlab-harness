@@ -591,7 +591,12 @@ export class SessionRuntime {
 			this.history =
 				place.kind === "local"
 					? localHistory(this.deps.historyRoot ?? join(dirname(dirname(this.log.dir)), "history"), canonical(place.root), this.id)
-					: sandboxHistory((command) => place.exec(command, { timeoutMs: 120_000, signal: AbortSignal.timeout(130_000) }), place.root, this.id);
+					: sandboxHistory(
+						(command) => place.exec(command, { timeoutMs: 120_000, signal: AbortSignal.timeout(130_000) }),
+						place.root,
+						this.id,
+						place instanceof SandboxWorkspace ? (script) => place.fencedScript(script) : undefined,
+					);
 		}
 		return this.historyOff ? undefined : this.history;
 	}
@@ -1101,7 +1106,8 @@ export class SessionRuntime {
 		const before = touched.length ? this.checkpoints.capture(touched) : [];
 		if (before.length) this.append({ t: "checkpoint", id: newId("e"), at: now(), callId: call.id, files: before });
 		// Decided again just before it runs: a path that now leads elsewhere (a link changed meanwhile) isn't followed.
-		if (verdict.action === "run" && decide(tool, args, this.workspace, this.deps.config(), this.allowed, this.discovering, this.permissionMode, !this.historyOff).action !== "run") {
+		const latest = verdict.action === "run" ? decide(tool, args, this.workspace, this.deps.config(), this.allowed, this.discovering, this.permissionMode, !this.historyOff) : verdict;
+		if (verdict.action === "run" && (latest.action !== "run" || JSON.stringify(latest.argv) !== JSON.stringify(verdict.argv))) {
 			return { ok: false, content: "Refused: where this call acts changed while it waited (a link may have moved). Send it again.", decision: "refused", tool, args };
 		}
 		try {
@@ -1114,6 +1120,7 @@ export class SessionRuntime {
 				sealed: this.deps.sealed?.(this.site),
 				fence: verdict.action === "run" && verdict.fence === true,
 				readOnly: this.agentMode === "read" || (verdict.action === "run" && verdict.readOnly === true),
+				argv: verdict.action === "run" ? verdict.argv : undefined,
 				outside: Boolean(tool.ask?.(args, { workspace: this.workspace })),
 				tools: this.deps.toolsDir,
 				packages: this.deps.packageSources?.(this.site),

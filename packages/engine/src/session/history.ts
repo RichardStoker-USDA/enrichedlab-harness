@@ -12,8 +12,11 @@
 
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, lstatSync, mkdirSync, readdirSync, rmdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, rmdirSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { unlinkPhysical } from "../tools/anchored.ts";
+import { physical, shellSafe, trustedGit } from "../tools/workspace.ts";
+import { withoutSecrets } from "../util.ts";
 
 /** Files larger than this aren't kept (25 MB, as the per-file copies before). */
 export const MAX_FILE = 25 * 1024 * 1024;
@@ -248,9 +251,12 @@ export function storeFor(root: string, folder: string): string {
 export function localHistory(storeRoot: string, folder: string, session: string): History {
 	const store = storeFor(storeRoot, folder);
 	const base = ["--git-dir", store, "--work-tree", folder, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "core.autocrlf=false", "-c", "core.quotepath=false", "-c", "gc.auto=0"];
+	const program = trustedGit();
+	const clean = withoutSecrets(shellSafe(process.env));
 	const run = (args: string[], env: Record<string, string> = {}) =>
 		new Promise<string>((resolve, reject) => {
-			const child = spawn("git", [...base, ...args], { cwd: folder, env: { ...process.env, GIT_TERMINAL_PROMPT: "0", ...Object.fromEntries(Object.entries(env).map(([k, v]) => [k, k === "GIT_INDEX_FILE" ? join(store, v) : v])) } });
+			if (!program) return reject(new Error("No trusted system git was found, so step history is off."));
+			const child = spawn(program, [...base, ...args], { cwd: folder, env: { ...clean, GIT_TERMINAL_PROMPT: "0", ...Object.fromEntries(Object.entries(env).map(([k, v]) => [k, k === "GIT_INDEX_FILE" ? join(store, v) : v])) } });
 			const out: Buffer[] = [];
 			const err: Buffer[] = [];
 			child.stdout.on("data", (d: Buffer) => out.push(d));
@@ -274,11 +280,8 @@ export function localHistory(storeRoot: string, folder: string, session: string)
 		},
 		async remove(paths) {
 			for (const path of paths) {
-				// Never through a link: every folder above the file must be a real folder inside this one.
-				const parts = path.split("/").slice(0, -1);
-				let through = false;
-				for (let i = 1; i <= parts.length && !through; i++) through = lstatSync(join(folder, ...parts.slice(0, i)), { throwIfNoEntry: false })?.isSymbolicLink() ?? false;
-				if (!through && !lstatSync(join(folder, path), { throwIfNoEntry: false })?.isDirectory()) rmSync(join(folder, path), { force: true });
+				// One anchored unlink. A folder or a link swapped into any parent makes it fail.
+				unlinkPhysical(join(physical(folder), path));
 			}
 		},
 		async occupied(paths) {
@@ -305,6 +308,7 @@ export function localHistory(storeRoot: string, folder: string, session: string)
 		},
 	};
 	return new History(store, place, session, async () => {
+		if (!program) throw new Error("No trusted system git was found, so step history is off.");
 		const attributes = join(store, "info", "attributes");
 		if (existsSync(join(store, "HEAD"))) {
 			if (!existsSync(attributes)) writeFileSync(attributes, RAW_ATTRIBUTES);
@@ -312,7 +316,7 @@ export function localHistory(storeRoot: string, folder: string, session: string)
 		}
 		mkdirSync(store, { recursive: true, mode: 0o700 });
 		await new Promise<void>((resolve, reject) => {
-			const child = spawn("git", ["init", "--quiet", "--bare", store]);
+			const child = spawn(program, ["init", "--quiet", "--bare", store], { env: { ...clean, GIT_TERMINAL_PROMPT: "0" } });
 			child.on("error", reject);
 			child.on("close", (code) => (code === 0 ? resolve() : reject(new Error("git init failed"))));
 		});
@@ -327,11 +331,16 @@ function quote(word: string): string {
 	return `'${word.replaceAll("'", `'\\''`)}'`;
 }
 
+/** Wrap a lab history removal in its current fence when that fence holds. */
+export async function fencedHistoryRemoval(script: string, fencedScript?: (script: string) => Promise<string | undefined>): Promise<string> {
+	return (await fencedScript?.(script)) ?? script;
+}
+
 /**
  * git in a lab's sandbox, through its shell: the store sits beside the work at /sandbox/.el-history, so it lives as
  * long as the sandbox's files do.
  */
-export function sandboxHistory(exec: (command: string) => Promise<{ exitCode: number | null; output: string }>, folder: string, session: string): History {
+export function sandboxHistory(exec: (command: string) => Promise<{ exitCode: number | null; output: string }>, folder: string, session: string, fencedScript?: (script: string) => Promise<string | undefined>): History {
 	const store = `/sandbox/.el-history/${createHash("sha256").update(folder).digest("hex").slice(0, 20)}`;
 	// The shell gives one stream back: errors go to a file of their own, made fresh by mktemp (never a name someone
 	// could have put a link at), and come back only when the command fails.
@@ -363,10 +372,11 @@ export function sandboxHistory(exec: (command: string) => Promise<{ exitCode: nu
 			return sizes;
 		},
 		async remove(paths) {
-			// Only where the file's folder resolves inside this one: never through a link.
+			// The fence closes the check-to-remove race when it holds in this sandbox.
 			const root = quote(folder);
 			for (let i = 0; i < paths.length; i += 200) {
-				await run(`cd ${root} && for f in ${paths.slice(i, i + 200).map(quote).join(" ")}; do [ -d "$f" ] && [ ! -L "$f" ] && continue; d=$(cd -P -- "$(dirname -- "$f")" 2>/dev/null && pwd -P) || continue; case "$d" in ${root}|${root}/*) rm -f -- "$f";; esac; done`);
+				const script = `cd ${root} && for f in ${paths.slice(i, i + 200).map(quote).join(" ")}; do [ -d "$f" ] && [ ! -L "$f" ] && continue; d=$(cd -P -- "$(dirname -- "$f")" 2>/dev/null && pwd -P) || continue; case "$d" in ${root}|${root}/*) rm -f -- "$f";; esac; done`;
+				await run(await fencedHistoryRemoval(script, fencedScript));
 			}
 		},
 		async occupied(paths) {
