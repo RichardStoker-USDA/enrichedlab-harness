@@ -210,7 +210,9 @@ describe("permissions", () => {
 
 	test("a lab sandbox whose whole disk is checkpointed runs any command in auto mode", () => {
 		const api = { title: "Field Lab", run: async () => ({ exitCode: 0, stdout: "", stderr: "" }) } as unknown as SandboxApi;
-		const lab = Object.assign(new SandboxWorkspace(api, "/sandbox/work/project-1"), { checkpointed: "filesystem" as const });
+		const whole = { ...api, checkpoints: () => ({ make: async () => "k1", restore: async () => undefined }) } as unknown as SandboxApi;
+		const lab = new SandboxWorkspace(whole, "/sandbox/work/project-1");
+		expect(lab.checkpointed).toBe("filesystem");
 		const auto = { permissions: { mode: "auto", allowCommands: [] } } as unknown as LabConfig;
 		expect(decide(shell, { command: "rm -rf /sandbox/data/raw" }, lab, auto, new Set()).action).toBe("run");
 		expect(decide(shell, { command: "rm -rf /sandbox/data/raw" }, new SandboxWorkspace(api, "/sandbox/work/project-1"), auto, new Set()).action).toBe("ask");
