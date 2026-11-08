@@ -17,7 +17,9 @@
         "attach": { "type": "boolean" }, "files": { "type": "boolean" }, "apps": { "type": "boolean" },
         "signers": { "type": "boolean" }, "usage": { "type": "boolean" }, "agents": { "type": "boolean" },
         "runs": { "type": "boolean" },
-        "openapi": { "type": "boolean", "description": "GET /v1/openapi.json serves the API as OpenAPI 3.1" }
+        "openapi": { "type": "boolean", "description": "GET /v1/openapi.json serves the API as OpenAPI 3.1" },
+        "chat_completions": { "type": "boolean", "description": "POST /v1/chat/completions, OpenAI-compatible with stream, tools and reasoning_content; a descriptor that lists only models serves it too" },
+        "checkpoints": { "type": "boolean", "description": "POST/GET /v1/containers/{id}/checkpoints and POST .../checkpoints/{cp}/restore: whole-filesystem snapshots of a sandbox (checkpoint.schema.json)" }
       }
     },
     "sign_in": { "type": "object", "required": ["kind"], "properties": { "kind": { "type": "string", "enum": ["cloudflare-access-oauth", "oauth"] } } },
@@ -90,6 +92,17 @@
             "properties": { "protocol": { "type": "string" }, "port": { "type": "integer", "minimum": 1 }, "version": { "type": "string" } }
           }
         }
+      }
+    },
+    "packages": {
+      "type": "object",
+      "description": "Package sources the lab vets and scans; clients point sandbox and local environments at these instead of public ones",
+      "properties": {
+        "conda": { "type": "array", "items": { "type": "string", "format": "uri" }, "description": "conda channels, in priority order (pixi, conda, mamba)" },
+        "pypi": { "type": "string", "format": "uri", "description": "a PEP 503 or PEP 691 simple index" },
+        "cran": { "type": "string", "format": "uri", "description": "a CRAN-like R repository" },
+        "npm": { "type": "string", "format": "uri", "description": "an npm registry" },
+        "only": { "type": "boolean", "description": "true when the lab's sandboxes reach these and no public package source" }
       }
     },
     "conformance": {

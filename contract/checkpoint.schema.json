@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://enrichedlab.org/contract/2026-11/checkpoint.schema.json",
+  "title": "A sandbox checkpoint",
+  "description": "POST /v1/containers/{id}/checkpoints {label?} answers 201 with one; GET .../checkpoints answers {checkpoints: [...]}, newest first; POST .../checkpoints/{checkpoint}/restore answers 202 {id, status: \"restoring\"} and the sandbox is running again from that checkpoint, under the same id; DELETE .../checkpoints/{checkpoint} answers 204. A sandbox that is changing state answers 409 sandbox_busy.",
+  "type": "object",
+  "required": ["id", "container", "at"],
+  "properties": {
+    "id": { "type": "string" },
+    "container": { "type": "string" },
+    "at": { "type": "string", "format": "date-time" },
+    "label": { "type": "string", "maxLength": 200, "description": "what the client said it was for, such as the step it came before" },
+    "kind": { "type": "string", "enum": ["filesystem", "workspace"], "description": "filesystem: the whole sandbox disk; workspace: /sandbox only" },
+    "bytes": { "type": "integer", "minimum": 0, "description": "storage this checkpoint adds beyond the one before it" },
+    "expires_at": { "type": "string", "format": "date-time", "description": "when the lab removes it; absent while the sandbox is kept" }
+  }
+}

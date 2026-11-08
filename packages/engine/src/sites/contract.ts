@@ -58,7 +58,7 @@ export interface LabSigner {
 	revoked_at?: string | null;
 }
 
-export type Endpoint = "models" | "mcp" | "bundles" | "events" | "guard" | "devices" | "containers" | "stop" | "ports" | "attach" | "files" | "apps" | "signers" | "usage" | "agents" | "runs" | "openapi";
+export type Endpoint = "models" | "mcp" | "bundles" | "events" | "guard" | "devices" | "containers" | "stop" | "ports" | "attach" | "files" | "apps" | "signers" | "usage" | "agents" | "runs" | "openapi" | "chat_completions" | "checkpoints";
 
 export interface SandboxProfile {
 	name: string;
@@ -94,6 +94,8 @@ export interface LabDescriptor {
 	sandbox_desktop?: DesktopInfo;
 	/** Every desktop the lab offers (sandbox_desktop repeats the first). */
 	sandbox_desktops?: DesktopInfo[];
+	/** Package sources the lab vets and scans, for sandbox and local environments. */
+	packages?: { conda?: string[]; pypi?: string; cran?: string; npm?: string; only?: boolean };
 }
 
 /** Whose agents use a lab's sandboxes: only the lab's models, or a person's own agents too. */
