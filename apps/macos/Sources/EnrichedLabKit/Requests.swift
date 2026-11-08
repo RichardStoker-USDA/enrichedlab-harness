@@ -228,6 +228,19 @@ extension EngineConnection {
 		return try await call("ui.set", P(theme: theme, showReasoning: showReasoning, permissions: permissions?.rawValue))
 	}
 
+	public struct RewindResult: Decodable, Sendable {
+		public var ok: Bool
+		public var detail: String
+		public var files: [String]
+		public var session: SessionSummary?
+	}
+
+	/// Put the session's folder back as it was before a step; with `retry`, a new session continues from there.
+	public func rewind(_ id: String, before: String, retry: Bool) async throws -> RewindResult {
+		struct P: Encodable, Sendable { var sessionId: String; var before: String; var retry: Bool }
+		return try await call("session.rewind", P(sessionId: id, before: before, retry: retry))
+	}
+
 	/// Set how much a session asks; nil returns it to the default for new sessions.
 	public func setPermissions(_ id: String, mode: PermissionMode?) async throws -> SessionSummary {
 		struct P: Encodable, Sendable { var sessionId: String; var mode: String? }

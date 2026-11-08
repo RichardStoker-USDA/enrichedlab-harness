@@ -1,0 +1,46 @@
+# Step history
+
+Every step an agent takes that can change files is kept, so the person or the agent can go back to before any step
+and try again. It is what lets the `auto` approval mode run file changes and contained commands without asking
+([security.md](security.md#how-much-it-asks)).
+
+## What is kept, and when
+
+A session keeps the folder it works in at the start of each turn and after every step that wrote a file or ran a
+command (`packages/engine/src/session/history.ts`). Each point is a `checkpoint` event in the session log with its
+`history` commit, so the run sheet can offer "Go Back to Before This Step" on every step.
+
+- **Where.** On this computer, in a git store of EnrichedLab's own at `~/.el/history/<folder id>`, one per folder. The
+  person's own repository in that folder is never touched: no commits, refs, index or stash. In a lab's sandbox, the
+  same store sits at `/sandbox/.el-history`, run through the sandbox's shell, and lives as long as the sandbox's files.
+- **Sessions apart.** Each session keeps its own index and its own line of commits (`refs/sessions/<id>`); the
+  objects are shared, so a file kept once is kept once, and two sessions in one folder never wait on each other.
+- **Fast after the first.** The index remembers each file's size and time, so a snapshot hashes only what changed.
+- **Everything the person made.** Ignore files don't apply: a data folder a repository ignores is what a person
+  would want back.
+- **Not kept, and said so.** Files over 25 MB, new data past 1 GB in one snapshot (the first snapshot of a large data
+  folder stops there and lists what it left out in the event's `skipped`), and folders tools rebuild
+  (`node_modules`, virtual environments, `.pixi`, caches, nested `.git`). Going back leaves these as they are.
+
+## Going back
+
+`session.rewind {sessionId, before, retry?}` puts the folder back as it was at the newest point before the step
+`before` (an event id). Files changed since come back, files made since go. The present is kept first, as its own
+point, so going back can itself be taken back; the session's line goes on from there, and a `rewind` event records
+what changed. The model is told on its next request.
+
+With `retry`, a new session continues from just before that step: the conversation up to there, the same folder
+and model, titled "Retry: …". The original stays as it was, so both tries can be compared. On this computer for now;
+at a lab, go back and continue in the same session.
+
+Undo (Session ▸ Undo Last Changes) goes back to the start of the last turn the same way, shell changes included.
+Sessions from before step history keep their older undo (per-file copies, or a git snapshot in the repository).
+
+History belongs to the place it was kept in: after a session moves to a lab or back, steps from before the move
+can't be brought back where it works now.
+
+## At a lab
+
+A lab sandbox keeps history with git inside the sandbox, through exec, for `/sandbox/work`. A lab that serves
+whole-disk checkpoints (`endpoints.checkpoints`, [labs.md](labs.md)) covers the rest of the sandbox too, and there
+`auto` runs any command, since all of it can be taken back.

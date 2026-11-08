@@ -191,6 +191,34 @@ public final class SessionModel {
 		do { status = try await app.connection.setModel(id, model: model, effort: effort) } catch { app.said(error) }
 	}
 
+	/// Ask, then put the folder back as it was before a step; with `retry`, open a new session that continues from there.
+	public func confirmRewind(before: String, retry: Bool) {
+		app.confirmation = Confirmation(
+			title: retry ? "Try again from before this step?" : "Go back to before this step?",
+			facts: [
+				(label: "Files", text: "The folder goes back to how it was before this step. Files changed since come back as they were; files made since go."),
+				(label: "Nothing is lost", text: "The present is kept in history first, so you can come back to it."),
+			] + (retry ? [(label: "Conversation", text: "A new session continues from just before this step. This one stays as it is.")] : [(label: "Conversation", text: "The agent is told, and continues from the files as they are.")]),
+			action: retry ? "Try Again" : "Go Back",
+			destructive: false
+		) { [weak self] in
+			await self?.rewind(before: before, retry: retry)
+		}
+	}
+
+	func rewind(before: String, retry: Bool) async {
+		do {
+			let result = try await app.connection.rewind(id, before: before, retry: retry)
+			app.say(result.detail)
+			if let fork = result.session {
+				app.upsert(fork)
+				app.selection = fork.id
+			}
+		} catch {
+			app.said(error, prefix: "Couldn't go back")
+		}
+	}
+
 	public func compact() async {
 		do { app.say(try await app.connection.compact(id).detail) } catch { app.said(error, prefix: "Summarizing didn't work") }
 	}

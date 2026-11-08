@@ -3,7 +3,7 @@
 // for every later session; auto mode asks once per folder, then file changes there run.
 
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { PermissionDecision, PermissionRequest } from "../packages/protocol/src/index.ts";
@@ -126,5 +126,24 @@ describe("approvals", () => {
 		expect(session.runtime.summary().permissions).toBe("ask");
 		await turn(session.runtime, "write: third.txt");
 		expect(session.asked).toHaveLength(2);
+	});
+
+	test("every step is kept: going back to before a shell step brings back what it deleted, and the model is told", async () => {
+		const root = join(dir, "p3");
+		mkdirSync(root);
+		const full = { ...DEFAULT_CONFIG, permissions: { ...DEFAULT_CONFIG.permissions, mode: "full" as const } };
+		const { log } = SessionLog.create(join(dir, "logs"), root, model.ref, "You help.");
+		const { runtime: session } = runtime(log, root, () => full, () => "allow");
+		await turn(session, "write: notes.txt");
+		await turn(session, "shell: rm notes.txt");
+		expect(existsSync(join(root, "notes.txt"))).toBe(false);
+		const step = session.events.findLast((e) => e.t === "tool" && e.name === "shell")!;
+		const back = await session.rewind(step.id);
+		expect(back).toMatchObject({ ok: true, files: ["notes.txt"] });
+		expect(readFileSync(join(root, "notes.txt"), "utf8")).toBe("x\n");
+		expect(session.events.at(-1)).toMatchObject({ t: "rewind", before: step.id, restored: ["notes.txt"] });
+		// Each step that changed files left a point to go back to, and the history is outside the folder.
+		expect(session.events.filter((e) => e.t === "checkpoint" && e.history).length).toBeGreaterThanOrEqual(3);
+		expect(existsSync(join(root, ".git"))).toBe(false);
 	});
 });

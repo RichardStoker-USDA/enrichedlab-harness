@@ -190,6 +190,14 @@ struct StepRow: View {
 		if case let .done(tool) = step, let output = tool.view?.detail ?? (tool.content.isEmpty ? nil : tool.content) {
 			Button("Copy Output") { copyText(output, what: "the output", app: app) }
 		}
+		// Every step is kept in history: the folder can go back to how it was before this one ran.
+		if case let .done(tool) = step {
+			Divider()
+			Button("Go Back to Before This Step") { session.confirmRewind(before: tool.id, retry: false) }
+				.disabled(session.busy)
+			Button("Try Again From Here…") { session.confirmRewind(before: tool.id, retry: true) }
+				.disabled(session.busy || !session.place.isLocal)
+		}
 	}
 
 	private func lastLines(_ text: String, _ n: Int) -> String {
