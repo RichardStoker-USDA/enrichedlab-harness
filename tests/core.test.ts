@@ -349,6 +349,10 @@ describe("permissions", () => {
 		expect(commandWords("printf x > output.txt")).toEqual(["printf", "x", "output.txt"]);
 		// A $ inside single quotes isn't expansion: a git read stays a git read.
 		expect(pushes("git log --format='$%s'")).toBe(false);
+		// A program the project holds isn't read-only because it was asked its version.
+		expect(isReadOnlyCommand("python3 --version")).toBe(true);
+		expect(isReadOnlyCommand("/sandbox/work/P/payload --version")).toBe(false);
+		expect(isReadOnlyCommand("./payload --version")).toBe(false);
 		expect(pushes("git $'push' origin HEAD")).toBe(true);
 	});
 

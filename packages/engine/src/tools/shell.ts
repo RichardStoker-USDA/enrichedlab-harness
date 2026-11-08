@@ -156,7 +156,8 @@ export function isReadOnlyCommand(command: string, extra: string[] = [], inside?
 		if (extra.some((prefix) => joined === prefix || joined.startsWith(`${prefix} `))) return true;
 		const [cmd, ...args] = words;
 		if (!cmd || /^\w+=/.test(cmd)) return false;
-		if (args.length === 1 && VERSION_ONLY.test(args[0]!)) return true;
+		// "--version" says nothing about a program the project holds: only a bare name found on PATH counts.
+		if (args.length === 1 && VERSION_ONLY.test(args[0]!) && /^[A-Za-z0-9][\w.+-]*$/.test(cmd)) return true;
 		if (cmd === "git") {
 			const [sub, ...rest] = args;
 			if (!sub || /^-/.test(sub)) return false;
