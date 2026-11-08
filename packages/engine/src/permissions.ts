@@ -17,14 +17,14 @@ import { everyCommand, plainCommands } from "./tools/shell_syntax.ts";
 import type { Tool } from "./tools/types.ts";
 import { isOpenPort } from "./sites/port_proxy.ts";
 import { FULL_CONTAINMENT, physical } from "./tools/workspace.ts";
-import type { Workspace } from "./tools/workspace.ts";
+import type { CommitTarget, Workspace } from "./tools/workspace.ts";
 
 export type Verdict =
 	/**
 	 * `fence`: it runs because of the paths it names, in a lab's sandbox, so the sandbox checks where they lead first.
 	 * `readOnly`: it runs contained with nothing in the project writable (it only reads, where nothing may change).
 	 */
-	| { action: "run"; fence?: boolean; readOnly?: boolean; argv?: string[] }
+	| { action: "run"; fence?: boolean; readOnly?: boolean; argv?: string[]; commit?: CommitTarget }
 	| {
 			action: "ask";
 			reason: string;
@@ -34,6 +34,8 @@ export type Verdict =
 			scope: string;
 			/** Set when the call changes files in a folder the person hasn't let EnrichedLab change: the folder to offer. */
 			folder?: string;
+			/** The exact repository and branch named by a git_commit question. */
+			commit?: CommitTarget;
 	  };
 
 /** "edits", the old name for auto, reads as auto. */
@@ -236,7 +238,7 @@ function patternRegex(pattern: string): RegExp | undefined {
 		} else out += c.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&");
 	}
 	try {
-		return new RegExp(`^${out}$`);
+		return new RegExp(`^${out}$`, process.platform === "win32" ? "i" : "");
 	} catch {
 		return undefined;
 	}
@@ -253,12 +255,16 @@ function patternRegex(pattern: string): RegExp | undefined {
  */
 function publishing(command: string, depth = 0): "push" | "hidden" | undefined {
 	const line = everyCommand(command);
-	if (!line || depth > 4) return /\bgit\b|\bpush\b|\bsend-pack\b/.test(command) ? "push" : "hidden";
-	const name = (w: string) => w.replace(/^.*\//, "");
+	if (!line || depth > 4) return /\bgit\b|\bpush\b|\bsend-pack\b/i.test(command) ? "push" : "hidden";
+	const name = (w: string) => {
+		const base = w.replace(process.platform === "win32" ? /^.*[\\/]/ : /^.*\//, "");
+		return process.platform === "win32" ? base.toLowerCase() : base;
+	};
 	const could = (text: string | undefined, pattern: string | undefined, names: string[]) => {
 		if (text === undefined) return false;
 		if (!pattern) return names.includes(name(text));
-		const last = pattern.slice(pattern.lastIndexOf("/") + 1);
+		const slash = process.platform === "win32" ? Math.max(pattern.lastIndexOf("/"), pattern.lastIndexOf("\\")) : pattern.lastIndexOf("/");
+		const last = pattern.slice(slash + 1);
 		const re = patternRegex(last);
 		return !re || names.some((n) => re.test(n));
 	};
@@ -268,19 +274,19 @@ function publishing(command: string, depth = 0): "push" | "hidden" | undefined {
 	let sawGit = false;
 	let sawPush = false;
 	for (const { words: argv, patterns, assigns } of line.commands) {
-		if (assigns.some((a) => /^GIT_/.test(a))) hidden = true;
+		if (assigns.some((a) => /^GIT_/i.test(a))) hidden = true;
 		if (!argv.length) continue;
 		if (argv[0] === undefined || patterns[0] !== undefined) hidden = true;
-		const lead = argv[0] === undefined ? "" : argv[0].replace(/^.*\//, "");
+		const lead = argv[0] === undefined ? "" : name(argv[0]);
 		const declaration = lead === "builtin" ? argv[1] : argv[0];
 		if (["export", "declare", "typeset", "local", "readonly"].includes(declaration ?? "")) {
 			const start = lead === "builtin" ? 2 : 1;
-			if (argv.slice(start).some((w) => w !== undefined && /^GIT_\w*(=|$)/.test(w))) hidden = true;
+			if (argv.slice(start).some((w) => w !== undefined && /^GIT_\w*(=|$)/i.test(w))) hidden = true;
 		}
 		// A wrapper given an expanded word (command "$CMD" push), env splitting a string into a command (env -S), or
 		// git settings handed to env (env GIT_SSH_COMMAND=...): what runs depends on more than the line.
 		if (WRAPPERS.has(lead) && argv.includes(undefined)) hidden = true;
-		if (lead === "env" && argv.some((w) => w !== undefined && (/^(-[a-zA-Z]*S|--split-string)/.test(w) || /^GIT_/.test(w)))) hidden = true;
+		if (lead === "env" && argv.some((w) => w !== undefined && (/^(-[a-zA-Z]*S|--split-string)/.test(w) || /^GIT_/i.test(w)))) hidden = true;
 		for (let i = 0; i < argv.length; i++) {
 			// git's publishing programs named directly (git-send-pack, git-push).
 			if (could(argv[i], patterns[i], GIT_PUBLISHERS)) {
@@ -288,26 +294,26 @@ function publishing(command: string, depth = 0): "push" | "hidden" | undefined {
 				sawPush = true;
 			}
 			for (const [bridge, word] of Object.entries(BRIDGES)) {
-				if (could(argv[i], patterns[i], [`git-${bridge}`, `git-${bridge}.exe`]) && argv.slice(i + 1).some((w) => w === undefined || w === word)) {
+				if (could(argv[i], patterns[i], [`git-${bridge}`, `git-${bridge}.exe`]) && argv.slice(i + 1).some((w, offset) => w === undefined || could(w, patterns[i + 1 + offset], [word]))) {
 					sawGit = true;
 					sawPush = true;
 				}
 			}
-			if (could(argv[i], patterns[i], ["p4", "p4.exe"]) && argv.slice(i + 1).some((w) => w === undefined || w === "submit")) {
+			if (could(argv[i], patterns[i], ["p4", "p4.exe"]) && argv.slice(i + 1).some((w, offset) => w === undefined || could(w, patterns[i + 1 + offset], ["submit"]))) {
 				sawGit = true;
 				sawPush = true;
 			}
 			// git settings handed in by name anywhere a wrapper passes them on (timeout 5 env GIT_X=..., builtin export).
-			if (argv[i] !== undefined && /^GIT_\w*=/.test(argv[i]!)) hidden = true;
+			if (argv[i] !== undefined && /^GIT_\w*=/i.test(argv[i]!)) hidden = true;
 			if (could(argv[i], patterns[i], ["git", "git.exe"])) {
 				sawGit = true;
 				let j = i + 1;
 				for (; j < argv.length; j++) {
 					const w = argv[j];
 					if (w === undefined) break;
-					if (w === "-c" && (argv[j + 1] === undefined || GIT_RUNS.test(argv[j + 1]!))) hidden = true;
+					if (w === "-c" && (argv[j + 1] === undefined || patterns[j + 1] !== undefined || GIT_RUNS.test(argv[j + 1]!))) hidden = true;
 					// Attached forms: -cname=value, --config-env=..., --exec-path=...
-					if (/^-c./.test(w) && GIT_RUNS.test(w.slice(2))) hidden = true;
+					if (/^-c./.test(w) && (patterns[j] !== undefined || GIT_RUNS.test(w.slice(2)))) hidden = true;
 					if (/^--(exec-path|config-env)(=|$)/.test(w)) hidden = true;
 					if (GIT_VALUE_OPTIONS.has(w)) j++;
 					else if (!w.startsWith("-")) break;
@@ -315,7 +321,7 @@ function publishing(command: string, depth = 0): "push" | "hidden" | undefined {
 				const sub = argv[j];
 				if (j < argv.length && (sub === undefined || patterns[j] !== undefined || !GIT_COMMANDS.has(sub))) hidden = true;
 				// git svn dcommit and git p4 submit publish too.
-				if ((sub === "svn" && argv.slice(j).includes("dcommit")) || (sub === "p4" && argv.slice(j).includes("submit"))) sawPush = true;
+				if ((sub === "svn" && argv.slice(j + 1).some((w, offset) => could(w, patterns[j + 1 + offset], ["dcommit"]))) || (sub === "p4" && argv.slice(j + 1).some((w, offset) => could(w, patterns[j + 1 + offset], ["submit"])))) sawPush = true;
 				if (argv.slice(i + 1).includes(undefined)) hidden = true;
 			}
 			if (isPush(argv[i], patterns[i])) sawPush = true;
@@ -499,22 +505,30 @@ export function decide(tool: Tool, args: Record<string, unknown>, workspace: Wor
 	const mode = chosen === "auto" && !recoverable ? "ask" : chosen;
 	const extra = tool.ask?.(args, { workspace });
 	const { keys, scope } = allowKeys(tool, args);
-	const ask = (reason: string, folder?: string): Verdict => ({ action: "ask", reason, keys, scope, ...(folder ? { folder } : {}) });
+	const ask = (reason: string, folder?: string, commit?: CommitTarget, askKeys = keys, askScope = scope): Verdict => ({ action: "ask", reason, keys: askKeys, scope: askScope, ...(folder ? { folder } : {}), ...(commit ? { commit } : {}) });
+	const remembered = (list: string[]) => list.every((key) => !key.includes("!") && allowed.has(key));
 	// Pushing publishes work, and an unreviewed lab tool hasn't been checked by anyone: both ask in every mode, every time.
 	if (keys[0] === "shell!push" || keys[0] === "sandbox!push") return ask(PUSH_REASON);
 	if (keys[0] === "shell!hidden" || keys[0] === "sandbox!hidden") return ask(HIDDEN_REASON);
 	if (tool.unreviewed) return { action: "ask", reason: "The lab hasn't reviewed this tool yet, so it asks every time.", keys: [`unreviewed!${tool.name}`], scope: "this call" };
+	if (tool.name === "git_commit") {
+		const commit = workspace.commitTarget?.();
+		// Allow Everything keeps its no-question behavior, but the tool still refuses unless this exact target survives
+		// execution-time validation.
+		if (mode === "full") return { action: "run", ...(commit ? { commit } : {}) };
+		if (commit?.recorded) return { action: "run", commit };
+		if (!commit) return ask("The current folder is not on a branch in the repository this session names.");
+		const commitKeys = [`write:git_commit:${commit.repo}\0${commit.branch}`];
+		if (remembered(commitKeys)) return { action: "run", commit };
+		return ask(`It stages and commits the current changes in ${commit.repo} on branch ${commit.branch}.`, undefined, commit, commitKeys, `commits in ${commit.repo} on ${commit.branch}`);
+	}
 	if (mode === "full") return { action: "run" };
-	// Agent shell commands cannot write .git. Commits use the engine path, free only in the recorded session worktree.
-	if (tool.name === "git_commit" && ownWorktree(workspace)) return { action: "run" };
 	// Discovery mode: what acts inside the lab the session works at runs without asking (the lab's filters, checks and
 	// audit stay on there). Anything on this computer still asks.
 	if (discovery && (tool.site === discovery || (!tool.site && workspace.kind === "sandbox" && (IN_SANDBOX.has(tool.kind) || keys[0] === "write")))) return { action: "run" };
 	// An answer about something outside the project is remembered for that path only; "!" keys never are.
 	const outside = `${keys.join(" ")}:outside:${String(args.path ?? args.url ?? "")}`;
-	const remembered = (list: string[]) => list.every((key) => !key.includes("!") && allowed.has(key));
 	if (extra ? allowed.has(outside) : remembered(keys)) return { action: "run" };
-	if (tool.name === "git_commit") return ask("It stages and commits this project's current changes.");
 	const askOutside = (reason: string): Verdict => ({ action: "ask", reason, keys: [outside], scope: "this path" });
 	const local = workspace.kind === "local";
 	const access = local ? folderAccess(config, workspace.root) : undefined;

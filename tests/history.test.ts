@@ -3,7 +3,7 @@
 
 import { afterAll, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Checkpoints } from "../packages/engine/src/session/checkpoint.ts";
@@ -43,7 +43,40 @@ describe("step history", () => {
 		});
 		expect(seen).toBe("rm -f -- a");
 		expect(wrapped).toBe("fenced { rm -f -- a; }");
-		expect(await fencedHistoryRemoval("rm -f -- a", async () => undefined)).toBe("rm -f -- a");
+		expect(await fencedHistoryRemoval("rm -f -- a", async () => undefined)).toBeUndefined();
+	});
+
+	test.skipIf(process.platform === "win32")("ignores caller Git and loader variables", async () => {
+		const folder = join(dir, "clean-env-project");
+		const store = join(dir, "clean-env-store");
+		const redirected = join(dir, "redirected-objects");
+		const config = join(dir, "redirected-gitconfig");
+		mkdirSync(folder);
+		mkdirSync(redirected);
+		writeFileSync(join(folder, "a.txt"), "one\n");
+		writeFileSync(config, "[core]\n\thooksPath = /does/not/exist\n");
+		const hostile = {
+			GIT_DIR: join(folder, "redirected-git"),
+			GIT_WORK_TREE: redirected,
+			GIT_OBJECT_DIRECTORY: redirected,
+			GIT_ALTERNATE_OBJECT_DIRECTORIES: redirected,
+			GIT_CONFIG_GLOBAL: config,
+			GIT_TEMPLATE_DIR: folder,
+			DYLD_INSERT_LIBRARIES: join(folder, "project.dylib"),
+			LD_PRELOAD: join(folder, "project.so"),
+		};
+		const saved = Object.fromEntries(Object.keys(hostile).map((name) => [name, process.env[name]]));
+		Object.assign(process.env, hostile);
+		try {
+			const point = await localHistory(store, folder, "clean").snapshot("start");
+			expect(point.changed).toBe(true);
+			expect(readdirSync(redirected)).toEqual([]);
+		} finally {
+			for (const [name, value] of Object.entries(saved)) {
+				if (value === undefined) delete process.env[name];
+				else process.env[name] = value;
+			}
+		}
 	});
 
 	test("brings back a step: edits, new and deleted files, and data the repository ignores; leaves the rest", async () => {

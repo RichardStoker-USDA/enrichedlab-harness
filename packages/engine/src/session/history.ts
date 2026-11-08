@@ -12,11 +12,10 @@
 
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, lstatSync, mkdirSync, readdirSync, rmdirSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { unlinkPhysical } from "../tools/anchored.ts";
-import { physical, shellSafe, trustedGit } from "../tools/workspace.ts";
-import { withoutSecrets } from "../util.ts";
+import { removeEmptyTreePhysical, unlinkPhysical } from "../tools/anchored.ts";
+import { engineEnvironment, physical, trustedGit } from "../tools/workspace.ts";
 
 /** Files larger than this aren't kept (25 MB, as the per-file copies before). */
 export const MAX_FILE = 25 * 1024 * 1024;
@@ -252,11 +251,16 @@ export function localHistory(storeRoot: string, folder: string, session: string)
 	const store = storeFor(storeRoot, folder);
 	const base = ["--git-dir", store, "--work-tree", folder, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "core.autocrlf=false", "-c", "core.quotepath=false", "-c", "gc.auto=0"];
 	const program = trustedGit();
-	const clean = withoutSecrets(shellSafe(process.env));
+	const clean = engineEnvironment({
+		GIT_CONFIG_NOSYSTEM: "1",
+		GIT_CONFIG_GLOBAL: "/dev/null",
+		GIT_ATTR_NOSYSTEM: "1",
+		GIT_TERMINAL_PROMPT: "0",
+	});
 	const run = (args: string[], env: Record<string, string> = {}) =>
 		new Promise<string>((resolve, reject) => {
 			if (!program) return reject(new Error("No trusted system git was found, so step history is off."));
-			const child = spawn(program, [...base, ...args], { cwd: folder, env: { ...clean, GIT_TERMINAL_PROMPT: "0", ...Object.fromEntries(Object.entries(env).map(([k, v]) => [k, k === "GIT_INDEX_FILE" ? join(store, v) : v])) } });
+			const child = spawn(program, [...base, ...args], { cwd: folder, env: { ...clean, ...Object.fromEntries(Object.entries(env).map(([k, v]) => [k, k === "GIT_INDEX_FILE" ? join(store, v) : v])) } });
 			const out: Buffer[] = [];
 			const err: Buffer[] = [];
 			child.stdout.on("data", (d: Buffer) => out.push(d));
@@ -295,16 +299,7 @@ export function localHistory(storeRoot: string, folder: string, session: string)
 			return found;
 		},
 		async clearEmpty(paths) {
-			// rmdir only: a folder that gained a file meanwhile stays.
-			const clear = (dir: string): void => {
-				for (const entry of readdirSync(dir, { withFileTypes: true })) if (entry.isDirectory()) clear(join(dir, entry.name));
-				try {
-					rmdirSync(dir);
-				} catch {
-					// Not empty after all.
-				}
-			};
-			for (const path of paths) if (lstatSync(join(folder, path), { throwIfNoEntry: false })?.isDirectory()) clear(join(folder, path));
+			for (const path of paths) removeEmptyTreePhysical(join(physical(folder), path));
 		},
 	};
 	return new History(store, place, session, async () => {
@@ -316,7 +311,7 @@ export function localHistory(storeRoot: string, folder: string, session: string)
 		}
 		mkdirSync(store, { recursive: true, mode: 0o700 });
 		await new Promise<void>((resolve, reject) => {
-			const child = spawn(program, ["init", "--quiet", "--bare", store], { env: { ...clean, GIT_TERMINAL_PROMPT: "0" } });
+			const child = spawn(program, ["init", "--quiet", "--bare", store], { env: clean });
 			child.on("error", reject);
 			child.on("close", (code) => (code === 0 ? resolve() : reject(new Error("git init failed"))));
 		});
@@ -332,8 +327,8 @@ function quote(word: string): string {
 }
 
 /** Wrap a lab history removal in its current fence when that fence holds. */
-export async function fencedHistoryRemoval(script: string, fencedScript?: (script: string) => Promise<string | undefined>): Promise<string> {
-	return (await fencedScript?.(script)) ?? script;
+export async function fencedHistoryRemoval(script: string, fencedScript?: (script: string) => Promise<string | undefined>): Promise<string | undefined> {
+	return fencedScript?.(script);
 }
 
 /**
@@ -376,7 +371,8 @@ export function sandboxHistory(exec: (command: string) => Promise<{ exitCode: nu
 			const root = quote(folder);
 			for (let i = 0; i < paths.length; i += 200) {
 				const script = `cd ${root} && for f in ${paths.slice(i, i + 200).map(quote).join(" ")}; do [ -d "$f" ] && [ ! -L "$f" ] && continue; d=$(cd -P -- "$(dirname -- "$f")" 2>/dev/null && pwd -P) || continue; case "$d" in ${root}|${root}/*) rm -f -- "$f";; esac; done`;
-				await run(await fencedHistoryRemoval(script, fencedScript));
+				const fenced = await fencedHistoryRemoval(script, fencedScript);
+				if (fenced) await run(fenced);
 			}
 		},
 		async occupied(paths) {
@@ -389,7 +385,9 @@ export function sandboxHistory(exec: (command: string) => Promise<{ exitCode: nu
 		},
 		async clearEmpty(paths) {
 			for (let i = 0; i < paths.length; i += 200) {
-				await run(`cd ${quote(folder)} && for f in ${paths.slice(i, i + 200).map(quote).join(" ")}; do if [ -d "$f" ] && [ ! -L "$f" ]; then find "./$f" -depth -type d -empty -delete 2>/dev/null; fi; done; true`);
+				const script = `cd ${quote(folder)} && for f in ${paths.slice(i, i + 200).map(quote).join(" ")}; do if [ -d "$f" ] && [ ! -L "$f" ]; then find "./$f" -depth -type d -empty -delete 2>/dev/null; fi; done; true`;
+				const fenced = await fencedHistoryRemoval(script, fencedScript);
+				if (fenced) await run(fenced);
 			}
 		},
 	};

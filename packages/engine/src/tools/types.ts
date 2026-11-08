@@ -4,6 +4,7 @@ import type { AppSummary, CanvasSummary, Part, StepView, SurfaceAnswer } from "@
 import type { McpView } from "../apps/host.ts";
 import type { SessionLog } from "../session/log.ts";
 import type { Workspace } from "./workspace.ts";
+import type { CommitTarget } from "./workspace.ts";
 
 /** How a tool is gated. */
 export type ToolKind =
@@ -49,6 +50,8 @@ export interface ToolContext {
 	readOnly?: boolean;
 	/** Literal argv for an exact allowCommands match. The workspace starts it without a shell. */
 	argv?: string[];
+	/** Exact repository and branch covered by this git_commit decision. */
+	commit?: CommitTarget;
 	/** Where shared tools (pixi and its caches) are kept on this computer. */
 	tools?: string;
 	/** The vetted package sources of the session's lab, when it names them (its descriptor's `packages`). */

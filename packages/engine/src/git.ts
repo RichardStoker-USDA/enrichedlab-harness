@@ -3,13 +3,13 @@
 // person's index, branch and history alone. See docs/bundles.md.
 
 import { execFileSync } from "node:child_process";
-import { randomBytes } from "node:crypto";
-import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { createHash, randomBytes } from "node:crypto";
+import { closeSync, constants, existsSync, linkSync, mkdtempSync, readFileSync, rmSync, statSync, writeSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
-import { mkdirPhysical, unlinkPhysical } from "./tools/anchored.ts";
-import { contained, FULL_CONTAINMENT, GIT_SETTINGS_PATTERNS, physical, sandboxer, shellSafe, trustedGit } from "./tools/workspace.ts";
-import { SECRET_NAME, withoutSecrets } from "./util.ts";
+import { inflateSync } from "node:zlib";
+import { mkdirPhysical, openPhysical, unlinkPhysical } from "./tools/anchored.ts";
+import { contained, engineEnvironment, FULL_CONTAINMENT, GIT_SETTINGS_PATTERNS, physical, projectGitPattern, safeTemp, sandboxer, trustedGit, type CommitTarget } from "./tools/workspace.ts";
+import { SECRET_NAME } from "./util.ts";
 
 /**
  * git on the project's own repository. Its settings and attributes are project content (an agent can write them),
@@ -24,7 +24,7 @@ function git(cwd: string, args: string[], env?: Record<string, string>, scratch:
 	const full = ["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgSign=false", ...args];
 	const facility = sandboxer();
 	if (!facility || !FULL_CONTAINMENT.has(facility)) throw new Error("This computer has no sandbox for the engine's git work (Seatbelt on macOS, bubblewrap on Linux), so it didn't run.");
-	const options = { cwd, env: { ...withoutSecrets(shellSafe({ ...process.env, ...env })), ...env, GIT_TERMINAL_PROMPT: "0" }, encoding: "utf8" as const };
+	const options = { cwd, env: engineEnvironment({ ...env, GIT_TERMINAL_PROMPT: "0" }), encoding: "utf8" as const };
 	const here = physical(cwd);
 	// Where the repository's folders are, asked each time under containment that writes nothing. The answers are
 	// project content (a .git file, core.worktree), so they widen what git may write only in layouts git makes itself:
@@ -47,6 +47,26 @@ function git(cwd: string, args: string[], env?: Record<string, string>, scratch:
 	const launch = contained(program, full, { writable, network: "none", exact: true, protect, protectPatterns: GIT_SETTINGS_PATTERNS });
 	try {
 		return execFileSync(launch.file, launch.args, { ...options, stdio: ["ignore", "pipe", "pipe", ...(launch.pass ?? [])] }).trim();
+	} finally {
+		launch.release?.();
+	}
+}
+
+/** Run trusted git with only the named write grants. No repository discovery can widen them. */
+function exactGit(cwd: string, args: string[], writable: string[], env: Record<string, string> = {}, readable: string[] = [], protect: string[] = [], protectPatterns: string[] = []): string {
+	const program = trustedGit();
+	if (!program) throw new Error("No git from the system's or Homebrew's own folders was found, so the engine's git work didn't run.");
+	const facility = sandboxer();
+	if (!facility || !FULL_CONTAINMENT.has(facility)) throw new Error("This computer has no sandbox for the engine's git work (Seatbelt on macOS, bubblewrap on Linux), so it didn't run.");
+	const full = ["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgSign=false", "-c", "gc.auto=0", ...args];
+	const launch = contained(program, full, { writable: writable.map(physical), readable: readable.map(physical), network: "none", exact: true, protect, protectPatterns });
+	try {
+		return execFileSync(launch.file, launch.args, {
+			cwd,
+			env: engineEnvironment({ ...env, GIT_TERMINAL_PROMPT: "0" }),
+			encoding: "utf8",
+			stdio: ["ignore", "pipe", "pipe", ...(launch.pass ?? [])],
+		}).trim();
 	} finally {
 		launch.release?.();
 	}
@@ -92,7 +112,7 @@ export function removeWorktree(root: string, path: string, branch?: string, drop
  * Returns the commit id.
  */
 export function snapshot(cwd: string, sessionId: string, message: string): string {
-	const scratch = mkdtempSync(join(tmpdir(), "enrichedlab-index-"));
+	const scratch = mkdtempSync(join(safeTemp(), "git-index-"));
 	try {
 		const env = { GIT_INDEX_FILE: join(scratch, "index") };
 		git(cwd, ["add", "-A", "."], env);
@@ -122,7 +142,7 @@ export function restoreSnapshot(cwd: string, commit: string): string[] {
 	const now = snapshot(cwd, "restore-scratch", "before restore");
 	const changed = git(cwd, ["diff", "--name-only", commit, now]).split("\n").filter(Boolean);
 	if (changed.length) {
-		const scratch = mkdtempSync(join(tmpdir(), "enrichedlab-index-"));
+		const scratch = mkdtempSync(join(safeTemp(), "git-index-"));
 		try {
 			const env = { GIT_INDEX_FILE: join(scratch, "index") };
 			git(cwd, ["read-tree", commit], env);
@@ -143,22 +163,81 @@ export function restoreSnapshot(cwd: string, commit: string): string[] {
 /** The person's git identity, so work made elsewhere is committed as theirs. */
 export function identity(cwd: string): { name: string; email: string } {
 	const read = (key: string) => {
-		try {
-			return git(cwd, ["config", key]);
+		for (const scope of ["--global", "--system"]) try {
+			const value = git(cwd, ["config", scope, key]);
+			if (value) return value;
 		} catch {
-			return "";
+			// Try the next person-controlled scope.
 		}
+		return "";
 	};
 	return { name: read("user.name") || "EnrichedLab", email: read("user.email") || "enrichedlab@localhost" };
 }
 
-/** Stage the session worktree and commit it on its current branch as the person. */
-export function commit(cwd: string, message: string): string {
-	const who = identity(cwd);
-	const as = { GIT_AUTHOR_NAME: who.name, GIT_AUTHOR_EMAIL: who.email, GIT_COMMITTER_NAME: who.name, GIT_COMMITTER_EMAIL: who.email };
-	git(cwd, ["add", "-A"]);
-	// No signing (the sandbox hides the signing keys) and no hooks: the commit is the session's work as it stands.
-	return git(cwd, ["commit", "--no-gpg-sign", "--no-verify", "-q", "-m", message], as);
+/** Validate and install one loose object made in the isolated staging repository. */
+function installObject(target: CommitTarget, stage: string, id: string): void {
+	const source = join(stage, "objects", id.slice(0, 2), id.slice(2));
+	const destination = join(target.commonDir, "objects", id.slice(0, 2), id.slice(2));
+	if (existsSync(destination)) return;
+	const compressed = readFileSync(source);
+	const actual = createHash(target.objectFormat).update(inflateSync(compressed)).digest("hex");
+	if (actual !== id) throw new Error(`The staged git object ${id} changed before it could be installed.`);
+	mkdirPhysical(dirname(destination));
+	const temporary = join(dirname(destination), `.enrichedlab-${randomBytes(8).toString("hex")}`);
+	let fd: number | undefined;
+	try {
+		fd = openPhysical(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o444);
+		let offset = 0;
+		while (offset < compressed.length) offset += writeSync(fd, compressed, offset);
+		closeSync(fd);
+		fd = undefined;
+		try {
+			// link(2) publishes without replacing an object another process installed after the existence check.
+			linkSync(temporary, destination);
+		} catch (error) {
+			if (!existsSync(destination)) throw error;
+		}
+	} finally {
+		if (fd !== undefined) closeSync(fd);
+		rmSync(temporary, { force: true });
+	}
+}
+
+/** Git against the recorded repository, for commands that cannot execute project code. */
+function metadataGit(target: CommitTarget, args: string[], env: Record<string, string> = {}): string {
+	const protect = [join(target.commonDir, "config"), join(target.commonDir, "hooks"), join(target.commonDir, "info"), join(target.adminDir, "config.worktree")];
+	return exactGit(target.worktree, ["--git-dir", target.adminDir, "--work-tree", target.worktree, ...args], [target.commonDir], env, [], protect, GIT_SETTINGS_PATTERNS);
+}
+
+/** Stage in an isolated repository, then update only the branch named by the permission decision. */
+export function commit(target: CommitTarget, message: string, verify: () => boolean): string {
+	if (!verify()) throw new Error("The repository or branch changed after git_commit was allowed, so nothing was committed.");
+	const scratch = mkdtempSync(join(safeTemp(), "git-commit-"));
+	const stage = join(scratch, "repo.git");
+	try {
+		exactGit(scratch, ["init", "--quiet", "--bare", `--object-format=${target.objectFormat}`, stage], [scratch]);
+		const alternate = join(target.commonDir, "objects");
+		const prefix = ["--git-dir", stage, "--work-tree", target.worktree];
+		const staged = (args: string[], env: Record<string, string> = {}) => exactGit(target.worktree, [...prefix, ...args], [scratch], { GIT_ALTERNATE_OBJECT_DIRECTORIES: alternate, ...env }, [target.worktree, target.commonDir], [], [projectGitPattern(target.worktree)]);
+		staged(["read-tree", target.head]);
+		// The staging repository has no project config, hooks or filter definitions. Project files decide what is
+		// committed, but cannot start a helper while the real repository metadata is writable.
+		staged(["add", "-A", "--", "."]);
+		const tree = staged(["write-tree"]);
+		if (tree === staged(["rev-parse", `${target.head}^{tree}`])) throw new Error("There are no changes to commit.");
+		const who = identity(target.repo);
+		const as = { GIT_AUTHOR_NAME: who.name, GIT_AUTHOR_EMAIL: who.email, GIT_COMMITTER_NAME: who.name, GIT_COMMITTER_EMAIL: who.email };
+		const made = staged(["commit-tree", tree, "-p", target.head, "-m", message], as);
+		const objects = staged(["rev-list", "--objects", made, `^${target.head}`]).split("\n").map((line) => line.split(" ", 1)[0]!).filter((id) => new RegExp(`^[0-9a-f]{${target.objectFormat === "sha256" ? 64 : 40}}$`).test(id));
+		for (const id of objects) installObject(target, stage, id);
+		if (!verify()) throw new Error("The repository or branch changed while git_commit staged the files, so its branch was not updated.");
+		metadataGit(target, ["update-ref", "-m", `git_commit: ${message.split("\n", 1)[0]}`, `refs/heads/${target.branch}`, made, target.head]);
+		// Match ordinary git commit: the worktree's own index now describes the committed tree.
+		metadataGit(target, ["read-tree", made], { GIT_INDEX_FILE: join(target.adminDir, "index") });
+		return made;
+	} finally {
+		rmSync(scratch, { recursive: true, force: true });
+	}
 }
 
 /** Git pathspecs for the names SECRET_NAME matches, so history is searched by name without walking every tree. */
@@ -193,7 +272,7 @@ export interface Pack {
 export function packForSend(repo: string, bundle: string): Pack {
 	const id = randomBytes(4).toString("hex");
 	const ref = `refs/enrichedlab/send/${id}`;
-	const scratch = mkdtempSync(join(tmpdir(), "enrichedlab-index-"));
+	const scratch = mkdtempSync(join(safeTemp(), "git-index-"));
 	try {
 		const env = { GIT_INDEX_FILE: join(scratch, "index") };
 		let head: string | undefined;
@@ -255,7 +334,7 @@ export function fetchBundle(repo: string, bundle: string, source: string, branch
 /** The commits `from..tip` made again on `onto`, with the files `onto` has and `from` lacks put back. Returns the new tip. */
 function rebuild(repo: string, from: string, onto: string, tip: string): string {
 	const restore = git(repo, ["diff", "--name-only", "--diff-filter=A", "-z", from, onto]).split("\0").filter(Boolean);
-	const scratch = mkdtempSync(join(tmpdir(), "enrichedlab-rebuild-"));
+	const scratch = mkdtempSync(join(safeTemp(), "git-rebuild-"));
 	const env = { GIT_INDEX_FILE: join(scratch, "index") };
 	const made = new Map([[from, onto]]);
 	let last = onto;

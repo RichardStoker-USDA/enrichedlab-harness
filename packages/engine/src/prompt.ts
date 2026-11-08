@@ -112,7 +112,7 @@ export function systemPrompt(input: PromptInput): string {
 			"# Git",
 			"- Commit messages: one imperative subject line under 80 characters, a body only when the diff doesn't explain itself. No AI attribution, co-author or \"generated with\" lines.",
 			"- Never push, force-push, rebase or merge into a branch you didn't create unless the person asks. Undo restores the working tree, so don't stash or reset to get back to a clean state.",
-			"- Commit with git_commit, never git commit in shell. Agent shell commands cannot write repository metadata.",
+			"- Commit with git_commit, never git commit in shell. Do not use shell commands to write a .git path.",
 		);
 		if (input.worktree)
 			lines.push(

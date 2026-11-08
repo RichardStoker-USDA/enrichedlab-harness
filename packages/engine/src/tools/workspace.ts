@@ -3,12 +3,12 @@
 
 import { spawn } from "node:child_process";
 import type { Dirent } from "node:fs";
-import { accessSync, closeSync, constants, existsSync, fstatSync, ftruncateSync, lstatSync, readdirSync, readFileSync, readlinkSync, realpathSync, statSync, writeSync } from "node:fs";
+import { accessSync, closeSync, constants, existsSync, fstatSync, ftruncateSync, lstatSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, writeSync } from "node:fs";
 import { readdir, readFile, stat } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { withoutSecrets } from "../util.ts";
-import { holdFolder, mkdirPhysical, openPhysical } from "./anchored.ts";
+import { holdFolder, holdGitEntries, mkdirPhysical, openPhysical } from "./anchored.ts";
 
 export interface Entry {
 	name: string;
@@ -34,6 +34,21 @@ export interface ExecOptions {
 	argv?: string[];
 }
 
+/** The repository and branch a git_commit permission decision covers. */
+export interface CommitTarget {
+	repo: string;
+	worktree: string;
+	adminDir: string;
+	commonDir: string;
+	branch: string;
+	head: string;
+	objectFormat: "sha1" | "sha256";
+	/** True only when this is the worktree and branch stored in the session header. */
+	recorded: boolean;
+	/** Device and inode identities for every path that selects the repository. */
+	identity: Record<string, string>;
+}
+
 export interface Workspace {
 	kind: "local" | "sandbox";
 	/** Shown to the model and the person. */
@@ -55,6 +70,10 @@ export interface Workspace {
 	exec(command: string, options: ExecOptions): Promise<ExecResult>;
 	/** The worktree EnrichedLab made for this session (known from the session's own record, never from the path). */
 	readonly worktree?: { path: string; gitDir: string };
+	/** Resolve the repository and current branch that a git_commit question names. */
+	commitTarget?(): CommitTarget | undefined;
+	/** Check that a previously decided commit target is still exactly the same repository and branch. */
+	verifyCommitTarget?(target: CommitTarget): boolean;
 	/** Set when commands run contained: by the OS ("seatbelt", "bwrap") or in a site's sandbox ("site"). */
 	readonly sandboxed?: string;
 	/** The names a glob pattern matches here, relative as the shell gives them; undefined when it can't say. */
@@ -112,7 +131,7 @@ function real(path: string, depth = 0): string {
 	}
 }
 
-/** How local commands are contained. "workspace": writes only inside the project and temp folders, no network. */
+/** How local commands are contained. "workspace" applies the platform write boundary and blocks the network. */
 export type SandboxMode = "off" | "workspace";
 
 let bwrapWorks: boolean | undefined;
@@ -132,24 +151,35 @@ export function shellSafe(env: Record<string, string | undefined>): Record<strin
 	return Object.fromEntries(Object.entries(env).filter((entry): entry is [string, string] => entry[1] !== undefined && !drop.test(entry[0]) && !entry[1].startsWith("() {")));
 }
 
-/** The temp folder commands may write: the system's, unless it is / or holds the home folder (then /tmp). */
+let privateTemp: string | undefined;
+
+/** A private engine-created temp folder. Project content and TMPDIR never choose the containment grant. */
 export function safeTemp(): string {
-	const fallback = process.platform === "darwin" ? "/private/tmp" : "/tmp";
-	let temp: string;
-	try {
-		temp = realpathSync(tmpdir());
-	} catch {
-		return fallback;
-	}
-	const home = (() => {
-		try {
-			return realpathSync(homedir());
-		} catch {
-			return homedir();
-		}
-	})();
-	const holds = (outer: string, inner: string) => inner === outer || inner.startsWith(outer.endsWith(sep) ? outer : `${outer}${sep}`);
-	return temp === sep || holds(temp, home) || temp.split(sep).filter(Boolean).length < 2 ? fallback : temp;
+	if (privateTemp && existsSync(privateTemp)) return privateTemp;
+	const base = process.platform === "darwin" ? "/private/tmp" : process.platform === "linux" ? "/tmp" : join(homedir(), "AppData", "Local", "Temp");
+	privateTemp = mkdtempSync(join(base, "enrichedlab-"));
+	process.once("exit", () => {
+		if (privateTemp) rmSync(privateTemp, { recursive: true, force: true });
+	});
+	return privateTemp;
+}
+
+const ENGINE_PATH = process.platform === "win32" ? "C:\\Windows\\System32" : "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin";
+
+/** Minimal environment for engine-owned programs. The only caller Git settings retained disable config files. */
+export function engineEnvironment(extra: Record<string, string> = {}): Record<string, string> {
+	return {
+		PATH: ENGINE_PATH,
+		HOME: homedir(),
+		LANG: "C",
+		LC_ALL: "C",
+		TMPDIR: safeTemp(),
+		TMP: safeTemp(),
+		TEMP: safeTemp(),
+		...(process.env.GIT_CONFIG_GLOBAL === "/dev/null" ? { GIT_CONFIG_GLOBAL: "/dev/null" } : {}),
+		...(process.env.GIT_CONFIG_SYSTEM === "/dev/null" ? { GIT_CONFIG_SYSTEM: "/dev/null" } : {}),
+		...extra,
+	};
 }
 
 /** Where a trusted git may really live: the system's and Homebrew's own folders (a link from them must stay there). */
@@ -249,27 +279,30 @@ export const GIT_SETTINGS_PATTERNS = ["/\\.git/(modules/.+/)?(config|hooks|info)
 const GIT_SCAN_MAX = 50_000;
 const GIT_SCAN_DEPTH = 64;
 
-/** Existing .git entries below a project, without following links during the scan. Linux protects this launch-time set. */
-export function projectGitPaths(root: string): string[] {
+/** Existing .git entries below a project, without following links. Any incomplete scan refuses its caller. */
+export function projectGitPaths(root: string, maxEntries = GIT_SCAN_MAX, maxDepth = GIT_SCAN_DEPTH): string[] {
 	const found: string[] = [];
 	const pending: { path: string; depth: number }[] = [{ path: real(root), depth: 0 }];
 	let seen = 0;
-	while (pending.length && seen < GIT_SCAN_MAX) {
+	while (pending.length) {
 		const next = pending.pop()!;
 		let entries: Dirent<string>[];
 		try {
 			entries = readdirSync(next.path, { withFileTypes: true, encoding: "utf8" });
-		} catch {
-			continue;
+		} catch (error) {
+			throw new Error(`Couldn't check ${next.path} for repository metadata, so the command didn't run: ${(error as Error).message}`);
 		}
 		for (const entry of entries) {
-			if (++seen > GIT_SCAN_MAX) break;
+			if (++seen > maxEntries) throw new Error(`The project has more than ${maxEntries} entries, so repository metadata protection couldn't be completed and the command didn't run.`);
 			const path = join(next.path, entry.name);
 			if (entry.name.toLowerCase() === ".git") {
 				if (entry.isDirectory() || entry.isFile() || entry.isSymbolicLink()) found.push(path);
 				continue;
 			}
-			if (entry.isDirectory() && next.depth < GIT_SCAN_DEPTH) pending.push({ path, depth: next.depth + 1 });
+			if (entry.isDirectory()) {
+				if (next.depth >= maxDepth) throw new Error(`The project is deeper than ${maxDepth} folders, so repository metadata protection couldn't be completed and the command didn't run.`);
+				pending.push({ path, depth: next.depth + 1 });
+			}
 		}
 	}
 	return found;
@@ -317,7 +350,7 @@ function seatbeltProfile(writable: string[], network: NetworkAccess, readable: s
  * once it has exited. `protect`: paths inside the writable ones that stay read only (a
  * repository's settings and hooks).
  */
-export function contained(file: string, args: string[], options: { writable: string[]; network: NetworkAccess; readable?: string[]; server?: boolean; temp?: boolean; exact?: boolean; protect?: string[]; protectPatterns?: string[] }): { file: string; args: string[]; facility?: Facility; pass?: number[]; release?: () => void } {
+export function contained(file: string, args: string[], options: { writable: string[]; network: NetworkAccess; readable?: string[]; server?: boolean; temp?: boolean; exact?: boolean; protect?: string[]; protectPatterns?: string[]; waitForChildren?: boolean }): { file: string; args: string[]; facility?: Facility; pass?: number[]; release?: () => void; syncFd?: number } {
 	// Each path resolved once: the check and the grant are the same answer.
 	const resolved = options.writable.map(real);
 	if (options.exact) resolved.forEach((p, i) => {
@@ -335,7 +368,7 @@ export function contained(file: string, args: string[], options: { writable: str
 		const writable = [...options.writable, ...(options.temp === false ? [] : [safeTemp()])].map((p) => resolve(p));
 		return { file: self[0]!, args: [...self.slice(1), "__contain", JSON.stringify(writable), "--", file, ...args], facility };
 	}
-	const writable = [...resolved, ...(options.temp === false ? [] : [safeTemp(), "/private/tmp", "/tmp"])].filter((p, i, all) => existsSync(p) && all.indexOf(p) === i);
+	const writable = [...resolved, ...(options.temp === false ? [] : [safeTemp()])].filter((p, i, all) => existsSync(p) && all.indexOf(p) === i);
 	const readable = [...resolved, ...(options.readable ?? []).map(real)].filter((p) => existsSync(p));
 	const protect = [...new Set((options.protect ?? []).map(real))];
 	if (facility === "seatbelt") return { file: "/usr/bin/sandbox-exec", args: ["-p", seatbeltProfile(writable, options.network, readable, protect, options.protectPatterns), file, ...args], facility };
@@ -366,10 +399,13 @@ export function contained(file: string, args: string[], options: { writable: str
 	const net = options.network === "none" ? [] : ["--share-net"];
 	// Without temp folders (a replay), the private /tmp and /run that hide the host's sockets can't be written either.
 	const sealed = options.temp === false ? ["--remount-ro", "/tmp", "--remount-ro", "/run"] : [];
+	// The monitor can exit before redirected background children. PID 1 keeps this pipe until the sandbox is empty.
+	const syncFd = options.waitForChildren ? 3 + held.length : undefined;
 	return {
 		file: trustedBwrap() ?? "/usr/bin/bwrap",
-		args: ["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--tmpfs", "/run", ...sealed, ...hidden, ...binds, "--unshare-all", ...net, "--die-with-parent", "--new-session", "--", file, ...args],
+		args: ["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--tmpfs", "/run", ...sealed, ...hidden, ...binds, "--unshare-all", ...net, "--die-with-parent", "--new-session", ...(syncFd === undefined ? [] : ["--sync-fd", String(syncFd)]), "--", file, ...args],
 		facility,
+		...(syncFd === undefined ? {} : { syncFd }),
 		...(held.length ? { pass: [...held], release: () => held.splice(0).forEach((fd) => closeSync(fd)) } : {}),
 	};
 }
@@ -387,7 +423,7 @@ export class LocalWorkspace implements Workspace {
 	 * The session's own worktree and repository git folder, used only to decide whether engine git may commit without
 	 * asking. Agent commands receive no repository metadata write grant.
 	 */
-	readonly worktree?: { path: string; gitDir: string };
+	private readonly worktreeRecord?: { path: string; repo: string; branch?: string };
 
 	/** `worktree`: the one EnrichedLab made for this session, from the session's record (engine.ts). */
 	constructor(
@@ -397,40 +433,119 @@ export class LocalWorkspace implements Workspace {
 	) {
 		this.label = `this computer, in ${root}`;
 		if (sandbox === "workspace") this.sandboxed = sandboxer();
-		if (worktree) {
-			try {
-				const gitDir = real(join(worktree.repo, ".git"));
-				const path = real(worktree.path);
-				const here = real(root);
-				// Where git keeps this worktree's own state, from its .git file: it must be a folder under .git/worktrees.
-				const dotGit = join(path, ".git");
-				const pointer = lstatSync(dotGit, { throwIfNoEntry: false })?.isFile() ? /^gitdir: (.+)$/m.exec(readFileSync(dotGit, "utf8"))?.[1]?.trim() : undefined;
-				const admin = pointer ? real(resolve(path, pointer)) : "";
-				const branch = worktree.branch ?? "";
-				// The admin folder must point back to this worktree, not another one.
-				const back = admin ? readFileSync(join(admin, "gitdir"), "utf8").trim() : "";
-				if (statSync(gitDir, { throwIfNoEntry: false })?.isDirectory() && path.startsWith(`${gitDir}${sep}`) && (here === path || here.startsWith(`${path}${sep}`)) && dirname(admin) === join(gitDir, "worktrees") && real(back) === real(dotGit) && /^enrichedlab\/[a-z0-9-]+$/.test(branch)) {
-					this.worktree = { path, gitDir };
-				}
-			} catch {
-				// A session record that no longer names its own valid worktree gets no worktree privilege.
-			}
+		if (worktree) this.worktreeRecord = worktree;
+	}
+
+	/** Rechecked on every permission decision. A cached session record alone grants nothing. */
+	get worktree(): { path: string; gitDir: string } | undefined {
+		const target = this.recordedCommitTarget();
+		return target ? { path: target.worktree, gitDir: target.commonDir } : undefined;
+	}
+
+	commitTarget(): CommitTarget | undefined {
+		return this.worktreeRecord ? this.recordedCommitTarget() : this.discoveredCommitTarget();
+	}
+
+	verifyCommitTarget(target: CommitTarget): boolean {
+		const current = this.commitTarget();
+		return current !== undefined && JSON.stringify(current) === JSON.stringify(target);
+	}
+
+	private recordedCommitTarget(): CommitTarget | undefined {
+		const record = this.worktreeRecord;
+		if (!record || !/^enrichedlab\/[a-z0-9-]+$/.test(record.branch ?? "")) return undefined;
+		try {
+			const repo = real(record.repo);
+			const commonDir = join(repo, ".git");
+			const worktree = real(record.path);
+			const here = real(this.root);
+			if (real(commonDir) !== commonDir || !statSync(commonDir).isDirectory() || !worktree.startsWith(`${commonDir}${sep}`) || (here !== worktree && !here.startsWith(`${worktree}${sep}`))) return undefined;
+			const dotGit = join(worktree, ".git");
+			const pointer = lstatSync(dotGit).isFile() ? /^gitdir: (.+)$/m.exec(readFileSync(dotGit, "utf8"))?.[1]?.trim() : undefined;
+			if (!pointer) return undefined;
+			const adminDir = resolve(worktree, pointer);
+			if (real(adminDir) !== adminDir || dirname(adminDir) !== join(commonDir, "worktrees") || !statSync(adminDir).isDirectory()) return undefined;
+			const back = readFileSync(join(adminDir, "gitdir"), "utf8").trim();
+			const commondir = readFileSync(join(adminDir, "commondir"), "utf8").trim();
+			const headRef = readFileSync(join(adminDir, "HEAD"), "utf8").trim();
+			if (real(back) !== real(dotGit) || real(resolve(adminDir, commondir)) !== commonDir || headRef !== `ref: refs/heads/${record.branch}`) return undefined;
+			const queried = this.queryCommitTarget(worktree, adminDir, true);
+			if (!queried || queried.worktree !== worktree || queried.commonDir !== commonDir || queried.branch !== record.branch) return undefined;
+			queried.repo = repo;
+			const s = statSync(repo, { bigint: true });
+			queried.identity.repo = `${s.dev}:${s.ino}`;
+			return queried;
+		} catch {
+			return undefined;
 		}
 	}
 
+	private discoveredCommitTarget(): CommitTarget | undefined {
+		return this.queryCommitTarget(this.root, undefined, false);
+	}
+
+	private queryCommitTarget(cwd: string, admin: string | undefined, recorded: boolean): CommitTarget | undefined {
+		const git = trustedGit();
+		if (!git) return undefined;
+		const prefix = [git, "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgSign=false", ...(admin ? ["--git-dir", admin] : [])];
+		const run = (args: string[]) => {
+			const result = Bun.spawnSync([...prefix, ...args], { cwd, env: engineEnvironment({ GIT_TERMINAL_PROMPT: "0" }), stdout: "pipe", stderr: "ignore", timeout: 5_000 });
+			return result.exitCode === 0 ? result.stdout.toString().trim() : undefined;
+		};
+		const worktree = run(["rev-parse", "--path-format=absolute", "--show-toplevel"]);
+		const adminDir = run(["rev-parse", "--path-format=absolute", "--absolute-git-dir"]);
+		const common = run(["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+		const ref = run(["symbolic-ref", "-q", "HEAD"]);
+		const head = run(["rev-parse", "--verify", "HEAD"]);
+		const format = run(["rev-parse", "--show-object-format"]);
+		if (!worktree || !adminDir || !common || !ref?.startsWith("refs/heads/") || !head || (format !== "sha1" && format !== "sha256")) return undefined;
+		const target: CommitTarget = {
+			repo: real(worktree),
+			worktree: real(worktree),
+			adminDir: real(adminDir),
+			commonDir: real(isAbsolute(common) ? common : resolve(cwd, common)),
+			branch: ref.slice("refs/heads/".length),
+			head,
+			objectFormat: format,
+			recorded,
+			identity: {},
+		};
+		try {
+			const dotGit = join(target.worktree, ".git");
+			for (const [name, path] of Object.entries({ repo: target.repo, worktree: target.worktree, admin: target.adminDir, common: target.commonDir, dotGit })) {
+				const s = statSync(path, { bigint: true });
+				target.identity[name] = `${s.dev}:${s.ino}`;
+			}
+		} catch {
+			return undefined;
+		}
+		return target;
+	}
+
 	/**
-	 * Agent commands may write the project but no path below its root with a .git component. Engine git has a separate
-	 * containment path and is the only way an agent commits.
+	 * Agent commands write the project with existing .git entries protected. macOS also denies new .git paths;
+	 * Linux moves new entries aside at command completion. Engine git has a separate containment path.
 	 */
 	private writable(): { writable: string[]; protect: string[]; protectPatterns: string[] } {
 		return { writable: [this.root], protect: projectGitPaths(this.root), protectPatterns: [projectGitPattern(this.root)] };
 	}
 
 	/** The program and arguments that run `command`, contained when the workspace is sandboxed. */
-	private launch(command: string, contain: boolean, readOnly = false, argv?: string[]): ReturnType<typeof contained> {
+	private launch(command: string, contain: boolean, readOnly = false, argv?: string[]): ReturnType<typeof contained> & { quarantine?: ReturnType<typeof holdGitEntries>["quarantine"] } {
 		const plain = argv ? { file: argv[0]!, args: argv.slice(1) } : { file: this.shell.file, args: this.shell.args(command) };
 		if (!contain || !this.sandboxed) return plain;
 		if (readOnly) return contained(plain.file, plain.args, { writable: [], network: "none" });
+		if (this.sandboxed === "bubblewrap") {
+			const root = real(this.root);
+			const entries = holdGitEntries(root, GIT_SCAN_MAX, GIT_SCAN_DEPTH);
+			try {
+				const launch = contained(plain.file, plain.args, { writable: [root], protect: entries.paths, network: "none", exact: true, waitForChildren: true });
+				return { ...launch, quarantine: entries.quarantine, release: () => { launch.release?.(); entries.release(); } };
+			} catch (error) {
+				entries.release();
+				throw error;
+			}
+		}
 		return contained(plain.file, plain.args, { ...this.writable(), network: "none" });
 	}
 
@@ -593,8 +708,20 @@ export class LocalWorkspace implements Workspace {
 		if (options.readOnly && (!this.sandboxed || !FULL_CONTAINMENT.has(this.sandboxed) || options.unsandboxed)) return Promise.resolve({ exitCode: 125, output: "A read-only subagent runs commands only where the OS can keep them from writing (macOS Seatbelt, Linux bubblewrap), so this didn't run.", timedOut: false });
 		// A contained command runs without asking, so it never sees the engine's keys and tokens: `env` would show them.
 		const base = shellSafe(options.env ?? process.env);
-		const env = this.sandboxed && !options.unsandboxed ? withoutSecrets(base) : base;
-		const childEnv: Record<string, string> = { ...(this.sandboxed && !options.unsandboxed ? activated(this.root, env) : env), LAB_AGENT: "1", PAGER: "cat", GIT_PAGER: "cat", TERM: "dumb", NO_COLOR: "1" };
+		const isContained = Boolean(this.sandboxed && !options.unsandboxed);
+		const env = isContained ? withoutSecrets(base) : base;
+		// Exact allowCommands argv uses only the person's launch environment. Project activation may select programs
+		// and loader settings from project content, so it is for contained shell commands only.
+		const selected = isContained && !options.argv ? activated(this.root, env) : env;
+		const childEnv: Record<string, string> = {
+			...selected,
+			...(isContained ? { TMPDIR: safeTemp(), TMP: safeTemp(), TEMP: safeTemp() } : {}),
+			LAB_AGENT: "1",
+			PAGER: "cat",
+			GIT_PAGER: "cat",
+			TERM: "dumb",
+			NO_COLOR: "1",
+		};
 		let argv = options.argv;
 		if (argv) {
 			if (process.platform === "win32") return Promise.resolve({ exitCode: 126, output: "allowCommands is off on Windows, so this command didn't run.\n", timedOut: false });
@@ -606,15 +733,21 @@ export class LocalWorkspace implements Workspace {
 		}
 		const launch = this.launch(command, !options.unsandboxed, options.readOnly, argv);
 		return new Promise((done) => {
-			const child = spawn(launch.file, launch.args, {
-				cwd: this.root,
-				// Inside the project's own package environment when it has one (tools/environment.ts), for contained
-				// commands only: its programs are the project's, so they never run uncontained in place of the system's.
-				env: childEnv,
-				stdio: ["ignore", "pipe", "pipe", ...(launch.pass ?? [])],
-				windowsHide: true,
-				detached: process.platform !== "win32",
-			});
+			let child: ReturnType<typeof spawn>;
+			try {
+				child = spawn(launch.file, launch.args, {
+					cwd: this.root,
+					// Inside the project's own package environment when it has one (tools/environment.ts), for contained
+					// commands only: its programs are the project's, so they never run uncontained in place of the system's.
+					env: childEnv,
+					stdio: ["ignore", "pipe", "pipe", ...(launch.pass ?? []), ...(launch.syncFd === undefined ? [] : ["pipe" as const])],
+					windowsHide: true,
+					detached: process.platform !== "win32",
+				});
+			} catch (error) {
+				launch.release?.();
+				throw error;
+			}
 			// Keep the start and the end of long output; the middle is what a person scrolls past anyway.
 			const half = MAX_EXEC_OUTPUT / 2;
 			let head = "";
@@ -637,6 +770,20 @@ export class LocalWorkspace implements Workspace {
 			};
 			child.stdout!.on("data", take);
 			child.stderr!.on("data", take);
+			let cleanupFailed = false;
+			const quarantine = () => {
+				const result = launch.quarantine?.();
+				if (!result) return;
+				for (const { from, to } of result.moved) take(Buffer.from(`\nEnrichedLab moved ${JSON.stringify(from)} to ${JSON.stringify(to)} because it was created during a contained command. New .git entries cannot remain active; nothing was deleted.\n`));
+				if (result.error) {
+					cleanupFailed = true;
+					take(Buffer.from(`\nEnrichedLab could not finish checking new .git entries: ${result.error}\n`));
+				}
+			};
+			// Foreground completion and, separately, the end of every background child. The sync pipe is part of
+			// child.stdio, so close waits for it even when a background job redirects all its own output.
+			if (launch.quarantine) child.on("exit", quarantine);
+			if (launch.syncFd !== undefined) (child.stdio[launch.syncFd] as NodeJS.ReadableStream).resume();
 			const kill = () => {
 				if (closed || !child.pid) return;
 				try {
@@ -671,12 +818,13 @@ export class LocalWorkspace implements Workspace {
 				failure = `\n${error.message}`;
 			});
 			child.on("close", (code) => {
+				quarantine();
 				launch.release?.();
 				closed = true;
 				clearTimeout(timer);
 				options.signal.removeEventListener("abort", onAbort);
 				const output = omitted ? `${head}\n[… ${omitted} characters of output omitted …]\n${tail}` : head + tail;
-				done({ exitCode: code, output: output + failure, timedOut });
+				done({ exitCode: cleanupFailed ? 125 : code, output: output + failure, timedOut });
 			});
 		});
 	}

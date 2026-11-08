@@ -714,32 +714,76 @@ describe("own-branch commits", () => {
 	test("the worktree prompt directs commits through the built-in tool", () => {
 		const prompt = systemPrompt({ cwd: scratch("prompt-worktree"), shell: "bash", workspaceLabel: "test", globalInstructions: [], sites: [], worktree: { branch: "enrichedlab/test", repo: "/repo" } });
 		expect(prompt).toContain("Commit with git_commit, never git commit in shell");
+		expect(prompt).toContain("Do not use shell commands to write a .git path");
 		expect(prompt).toContain("Use git_commit when a piece of work is done and tested");
 	});
 
 	test("a worktree record accepts only its own admin back-reference", async () => {
+		const { execFileSync } = await import("node:child_process");
 		const repo = scratch("worktree-record");
 		const gitDir = join(repo, ".git");
 		const path = join(gitDir, "enrichedlab-worktrees", "s1");
 		const ownAdmin = join(gitDir, "worktrees", "s1");
 		const otherAdmin = join(gitDir, "worktrees", "person");
-		mkdirSync(path, { recursive: true });
-		mkdirSync(ownAdmin, { recursive: true });
+		execFileSync("git", ["init", "-q", "-b", "main"], { cwd: repo });
+		execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "--allow-empty", "-qm", "start"], { cwd: repo });
+		execFileSync("git", ["worktree", "add", "-qb", "enrichedlab/test-s1", path], { cwd: repo });
 		mkdirSync(otherAdmin, { recursive: true });
-		writeFileSync(join(path, ".git"), `gitdir: ${ownAdmin}\n`);
-		writeFileSync(join(ownAdmin, "gitdir"), `${join(path, ".git")}\n`);
 		writeFileSync(join(otherAdmin, "gitdir"), `${join(repo, "person", ".git")}\n`);
 		const record = { path, repo, branch: "enrichedlab/test-s1" };
 		const valid = new LocalWorkspace(path, "off", record);
 		expect(valid.worktree).toEqual({ path: realpathSync(path), gitDir: realpathSync(gitDir) });
-		expect(decide(gitCommitTool, { message: "Test" }, valid, { permissions: { mode: "ask", allowCommands: [] } } as unknown as LabConfig, new Set())).toEqual({ action: "run" });
+		const allowed = decide(gitCommitTool, { message: "Test" }, valid, { permissions: { mode: "ask", allowCommands: [] } } as unknown as LabConfig, new Set());
+		expect(allowed.action).toBe("run");
+		if (allowed.action === "run") expect(allowed.commit).toMatchObject({ repo: realpathSync(repo), branch: record.branch, recorded: true });
+		const target = valid.commitTarget()!;
+		writeFileSync(join(ownAdmin, "HEAD"), "ref: refs/heads/main\n");
+		expect(valid.verifyCommitTarget(target)).toBe(false);
+		expect(valid.worktree).toBeUndefined();
+		writeFileSync(join(ownAdmin, "HEAD"), `ref: refs/heads/${record.branch}\n`);
+		expect(valid.verifyCommitTarget(target)).toBe(true);
+		const sub = join(path, "sub");
+		mkdirSync(sub);
+		writeFileSync(join(sub, ".git"), `gitdir: ${gitDir}\n`);
+		const nested = new LocalWorkspace(sub, "off", record);
+		expect(nested.commitTarget()).toMatchObject({ repo: realpathSync(repo), branch: record.branch, adminDir: realpathSync(ownAdmin) });
 		await expect(valid.write(".git", `gitdir: ${otherAdmin}\n`)).rejects.toThrow(".git path");
 		writeFileSync(join(path, ".git"), `gitdir: ${otherAdmin}\n`);
 		const redirected = new LocalWorkspace(path, "off", record);
 		expect(redirected.worktree).toBeUndefined();
 		expect(decide(gitCommitTool, { message: "Test" }, redirected, { permissions: { mode: "ask", allowCommands: [] } } as unknown as LabConfig, new Set()).action).toBe("ask");
-		expect(decide(gitCommitTool, { message: "Test" }, redirected, { permissions: { mode: "ask", allowCommands: [] } } as unknown as LabConfig, new Set(["write:git_commit"])).action).toBe("run");
+		expect(decide(gitCommitTool, { message: "Test" }, redirected, { permissions: { mode: "ask", allowCommands: [] } } as unknown as LabConfig, new Set(["write:git_commit"])).action).toBe("ask");
 		expect(decide(gitCommitTool, { message: "Test" }, redirected, { permissions: { mode: "full", allowCommands: [] } } as unknown as LabConfig, new Set()).action).toBe("run");
+	});
+
+	test("a non-worktree commit question binds the current repository and branch", async () => {
+		const { execFileSync } = await import("node:child_process");
+		const repo = scratch("commit-question");
+		execFileSync("git", ["init", "-q", "-b", "main"], { cwd: repo });
+		execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "--allow-empty", "-qm", "start"], { cwd: repo });
+		const other = scratch("commit-question-other");
+		execFileSync("git", ["init", "-q", "-b", "wrong"], { cwd: other });
+		execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "--allow-empty", "-qm", "other"], { cwd: other });
+		const previousGitDir = process.env.GIT_DIR;
+		let ws: LocalWorkspace;
+		let verdict: ReturnType<typeof decide>;
+		try {
+			process.env.GIT_DIR = join(other, ".git");
+			ws = new LocalWorkspace(repo);
+			verdict = decide(gitCommitTool, { message: "Test" }, ws, { permissions: { mode: "ask", allowCommands: [] } } as unknown as LabConfig, new Set());
+		} finally {
+			if (previousGitDir === undefined) delete process.env.GIT_DIR;
+			else process.env.GIT_DIR = previousGitDir;
+		}
+		expect(verdict.action).toBe("ask");
+		if (verdict.action !== "ask") return;
+		expect(verdict.commit).toMatchObject({ repo: realpathSync(repo), branch: "main", recorded: false });
+		execFileSync("git", ["switch", "-qc", "other"], { cwd: repo });
+		expect(ws.verifyCommitTarget(verdict.commit!)).toBe(false);
+		const remembered = new Set(verdict.keys);
+		const changed = decide(gitCommitTool, { message: "Test" }, ws, { permissions: { mode: "ask", allowCommands: [] } } as unknown as LabConfig, remembered);
+		expect(changed.action).toBe("ask");
+		if (changed.action === "ask") expect(changed.commit?.branch).toBe("other");
 	});
 
 	test.skipIf(process.platform !== "darwin")("agent commands cannot write git metadata; the engine commit tool owns commits", async () => {
@@ -749,46 +793,52 @@ describe("own-branch commits", () => {
 		const config = { permissions: { mode: "ask", allowCommands: [] } } as unknown as LabConfig;
 		const shell = { name: "shell", kind: "exec" } as unknown as Tool;
 		// Outside the temp folders, which contained commands may always write.
-		const repo = realpathSync(mkdtempSync(join(homedir(), ".el-own-")));
-		const git = (...a: string[]) => execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", ...a], { cwd: repo, encoding: "utf8" });
-		git("init", "-q", "-b", "main");
-		writeFileSync(join(repo, "a.txt"), "one\n");
-		git("add", ".");
-		git("commit", "-q", "-m", "start");
-		const made = createWorktree(repo, "s1", "test");
-		const own = new LocalWorkspace(made.path, "workspace", { ...made, repo });
-		expect(own.worktree?.gitDir).toBe(join(repo, ".git"));
-		const run = (ws: LocalWorkspace, command: string) => decide(shell, { command }, ws, config, new Set()).action;
-		expect(run(own, "git push origin HEAD")).toBe("ask");
-		expect(decide(gitCommitTool, { message: "Fix the parser" }, own, config, new Set())).toEqual({ action: "run" });
-		// A folder that only looks like one (no record that the engine made it) isn't the session's worktree.
-		const lookalike = join(repo, ".git", "enrichedlab-worktrees", "w9");
-		mkdirSync(lookalike, { recursive: true });
-		expect(new LocalWorkspace(lookalike).worktree).toBeUndefined();
-		expect(run(new LocalWorkspace(lookalike), "git commit -m x")).toBe("ask");
-		expect(decide(gitCommitTool, { message: "Fix" }, new LocalWorkspace(lookalike), config, new Set()).action).toBe("ask");
-		// Shell git cannot change the worktree pointer or index. The engine tool stages and commits with engine git.
-		writeFileSync(join(made.path, "b.txt"), "two\n");
-		const opts = { timeoutMs: 30_000, signal: new AbortController().signal };
-		const pointer = readFileSync(join(made.path, ".git"), "utf8");
-		expect((await own.exec("printf 'gitdir: /tmp/other\\n' > .git", opts)).exitCode).not.toBe(0);
-		expect(readFileSync(join(made.path, ".git"), "utf8")).toBe(pointer);
-		const committed = await gitCommitTool.run({ message: "Add b" }, { workspace: own } as never);
-		expect(committed.ok).toBe(true);
-		expect(execFileSync("git", ["-C", made.path, "log", "--format=%s", "-1"], { encoding: "utf8" }).trim()).toBe("Add b");
-		const before = readFileSync(join(repo, ".git", "config"), "utf8");
-		expect((await own.exec("git config core.hooksPath /tmp/elsewhere", opts)).exitCode).not.toBe(0);
-		expect((await own.exec(`printf x > ${join(repo, ".git", "hooks", "pre-commit")}`, opts)).exitCode).not.toBe(0);
-		expect(readFileSync(join(repo, ".git", "config"), "utf8")).toBe(before);
-		expect(existsSync(join(repo, ".git", "hooks", "pre-commit"))).toBe(false);
-		// The person's own branch and index aren't the session's to change. A later mixed-case .git is read only too.
-		const main = git("rev-parse", "HEAD").trim();
-		expect((await own.exec("git update-ref refs/heads/main HEAD", opts)).exitCode).not.toBe(0);
-		expect(git("rev-parse", "HEAD").trim()).toBe(main);
-		expect((await own.exec("mkdir -p nested/.GiT && printf x > nested/.GiT/config", opts)).exitCode).not.toBe(0);
-		// File edits never go into a .git folder.
-		await expect(own.write(".git", "gitdir: /tmp/elsewhere\n")).rejects.toThrow(".git path");
-		rmSync(repo, { recursive: true, force: true });
+		const repo = realpathSync(mkdtempSync(join(homedir(), ".enrichedlab-commit-test-")));
+		try {
+			const git = (...a: string[]) => execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", ...a], { cwd: repo, encoding: "utf8" });
+			git("init", "-q", "-b", "main");
+			writeFileSync(join(repo, "a.txt"), "one\n");
+			git("add", ".");
+			git("commit", "-q", "-m", "start");
+			const made = createWorktree(repo, "s1", "test");
+			const own = new LocalWorkspace(made.path, "workspace", { ...made, repo });
+			expect(own.worktree?.gitDir).toBe(join(repo, ".git"));
+			const run = (ws: LocalWorkspace, command: string) => decide(shell, { command }, ws, config, new Set()).action;
+			expect(run(own, "git push origin HEAD")).toBe("ask");
+			expect(decide(gitCommitTool, { message: "Fix the parser" }, own, config, new Set()).action).toBe("run");
+			// A folder that only looks like one (no record that the engine made it) isn't the session's worktree.
+			const lookalike = join(repo, ".git", "enrichedlab-worktrees", "w9");
+			mkdirSync(lookalike, { recursive: true });
+			expect(new LocalWorkspace(lookalike).worktree).toBeUndefined();
+			expect(run(new LocalWorkspace(lookalike), "git commit -m x")).toBe("ask");
+			expect(decide(gitCommitTool, { message: "Fix" }, new LocalWorkspace(lookalike), config, new Set()).action).toBe("ask");
+			// Shell git cannot change the worktree pointer or index. The engine tool stages and commits with engine git.
+			writeFileSync(join(made.path, "b.txt"), "two\n");
+			git("config", "filter.evil.clean", "sh -c 'exit 99'");
+			writeFileSync(join(made.path, ".gitattributes"), "b.txt filter=evil\n");
+			const opts = { timeoutMs: 30_000, signal: new AbortController().signal };
+			const pointer = readFileSync(join(made.path, ".git"), "utf8");
+			expect((await own.exec("printf 'gitdir: /tmp/other\\n' > .git", opts)).exitCode).not.toBe(0);
+			expect(readFileSync(join(made.path, ".git"), "utf8")).toBe(pointer);
+			const target = own.commitTarget()!;
+			const committed = await gitCommitTool.run({ message: "Add b" }, { workspace: own, commit: target } as never);
+			expect(committed.ok).toBe(true);
+			expect(execFileSync("git", ["-C", made.path, "log", "--format=%s", "-1"], { encoding: "utf8" }).trim()).toBe("Add b");
+			const before = readFileSync(join(repo, ".git", "config"), "utf8");
+			expect((await own.exec("git config core.hooksPath /tmp/elsewhere", opts)).exitCode).not.toBe(0);
+			expect((await own.exec(`printf x > ${join(repo, ".git", "hooks", "pre-commit")}`, opts)).exitCode).not.toBe(0);
+			expect(readFileSync(join(repo, ".git", "config"), "utf8")).toBe(before);
+			expect(existsSync(join(repo, ".git", "hooks", "pre-commit"))).toBe(false);
+			// The person's own branch and index aren't the session's to change. A later mixed-case .git is read only too.
+			const main = git("rev-parse", "HEAD").trim();
+			expect((await own.exec("git update-ref refs/heads/main HEAD", opts)).exitCode).not.toBe(0);
+			expect(git("rev-parse", "HEAD").trim()).toBe(main);
+			expect((await own.exec("mkdir -p nested/.GiT && printf x > nested/.GiT/config", opts)).exitCode).not.toBe(0);
+			// File edits never go into a .git folder.
+			await expect(own.write(".git", "gitdir: /tmp/elsewhere\n")).rejects.toThrow(".git path");
+		} finally {
+			rmSync(repo, { recursive: true, force: true });
+		}
 	});
 });
 
@@ -798,37 +848,40 @@ describe("repository handoff", () => {
 		const { packForSend, fetchBundle } = await import("../packages/engine/src/git.ts");
 		const git = (cwd: string, ...a: string[]) => execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", ...a], { cwd, encoding: "utf8" }).trim();
 		// The person's global ignore rules (often .env already) mustn't decide this test.
-		const saved = { global: process.env.GIT_CONFIG_GLOBAL, xdg: process.env.XDG_CONFIG_HOME };
+		const saved = { global: process.env.GIT_CONFIG_GLOBAL, system: process.env.GIT_CONFIG_SYSTEM };
 		process.env.GIT_CONFIG_GLOBAL = "/dev/null";
-		process.env.XDG_CONFIG_HOME = scratch("xdg");
-		const repo = scratch("send");
-		git(repo, "init", "-q", "-b", "main");
-		writeFileSync(join(repo, "a.txt"), "one\n");
-		git(repo, "add", ".");
-		git(repo, "commit", "-q", "-m", "start");
-		writeFileSync(join(repo, "a.txt"), "two\n");
-		writeFileSync(join(repo, ".env"), "TOKEN=x\n");
-		const bundle = join(scratch("bundle"), "r.bundle");
-		const sent = packForSend(repo, bundle);
-		expect(sent.skipped).toEqual([".env"]);
-		const far = scratch("far");
-		git(far, "init", "-q");
-		git(far, "fetch", "-q", bundle, `${sent.ref}:refs/heads/work`);
-		git(far, "checkout", "-q", "work");
-		// git may check files out with CRLF on Windows.
-		expect(readFileSync(join(far, "a.txt"), "utf8").replace(/\r\n/g, "\n")).toBe("two\n");
-		expect(existsSync(join(far, ".env"))).toBe(false);
-		writeFileSync(join(far, "b.txt"), "made far away\n");
-		git(far, "add", ".");
-		git(far, "commit", "-q", "-m", "Add b");
-		const back = join(far, "..", `${sent.id}.bundle`);
-		git(far, "bundle", "create", "-q", back, `${sent.commit}..work`);
-		expect(fetchBundle(repo, back, "refs/heads/work", "enrichedlab/far", sent.commit).map((l) => l.split(" ").slice(1).join(" "))).toEqual(["Add b"]);
-		expect(git(repo, "branch", "--show-current")).toBe("main");
-		expect(readFileSync(join(repo, "a.txt"), "utf8")).toBe("two\n");
-		for (const [key, value] of [["GIT_CONFIG_GLOBAL", saved.global], ["XDG_CONFIG_HOME", saved.xdg]] as const) {
-			if (value === undefined) delete process.env[key];
-			else process.env[key] = value;
+		process.env.GIT_CONFIG_SYSTEM = "/dev/null";
+		try {
+			const repo = scratch("send");
+			git(repo, "init", "-q", "-b", "main");
+			writeFileSync(join(repo, "a.txt"), "one\n");
+			git(repo, "add", ".");
+			git(repo, "commit", "-q", "-m", "start");
+			writeFileSync(join(repo, "a.txt"), "two\n");
+			writeFileSync(join(repo, ".env"), "TOKEN=x\n");
+			const bundle = join(scratch("bundle"), "r.bundle");
+			const sent = packForSend(repo, bundle);
+			expect(sent.skipped).toEqual([".env"]);
+			const far = scratch("far");
+			git(far, "init", "-q");
+			git(far, "fetch", "-q", bundle, `${sent.ref}:refs/heads/work`);
+			git(far, "checkout", "-q", "work");
+			// git may check files out with CRLF on Windows.
+			expect(readFileSync(join(far, "a.txt"), "utf8").replace(/\r\n/g, "\n")).toBe("two\n");
+			expect(existsSync(join(far, ".env"))).toBe(false);
+			writeFileSync(join(far, "b.txt"), "made far away\n");
+			git(far, "add", ".");
+			git(far, "commit", "-q", "-m", "Add b");
+			const back = join(scratch("returned-bundle"), `${sent.id}.bundle`);
+			git(far, "bundle", "create", "-q", back, `${sent.commit}..work`);
+			expect(fetchBundle(repo, back, "refs/heads/work", "enrichedlab/far", sent.commit).map((l) => l.split(" ").slice(1).join(" "))).toEqual(["Add b"]);
+			expect(git(repo, "branch", "--show-current")).toBe("main");
+			expect(readFileSync(join(repo, "a.txt"), "utf8")).toBe("two\n");
+		} finally {
+			for (const [key, value] of [["GIT_CONFIG_GLOBAL", saved.global], ["GIT_CONFIG_SYSTEM", saved.system]] as const) {
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
 		}
 	}, 30_000);
 });

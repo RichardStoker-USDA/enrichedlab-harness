@@ -3,16 +3,16 @@
 
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { chmodSync, closeSync, constants, existsSync, linkSync, mkdirSync, readdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { chmodSync, closeSync, constants, existsSync, linkSync, lstatSync, mkdirSync, readdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { LabConfig } from "../packages/engine/src/config.ts";
 import { allowKeys, decide, HIDDEN_REASON, PUSH_REASON } from "../packages/engine/src/permissions.ts";
 import { restoreSnapshot, snapshot } from "../packages/engine/src/git.ts";
-import { mkdirPhysical, openPhysical, unlinkPhysical } from "../packages/engine/src/tools/anchored.ts";
+import { holdGitEntries, mkdirPhysical, openPhysical, removeEmptyTreePhysical, unlinkPhysical } from "../packages/engine/src/tools/anchored.ts";
 import { allowedCommand, isReadOnlyCommand } from "../packages/engine/src/tools/shell.ts";
 import type { Tool } from "../packages/engine/src/tools/types.ts";
-import { LocalWorkspace, projectGitPaths, projectGitPattern, trustedGit } from "../packages/engine/src/tools/workspace.ts";
+import { engineEnvironment, LocalWorkspace, projectGitPaths, projectGitPattern, safeTemp, sandboxer, trustedGit } from "../packages/engine/src/tools/workspace.ts";
 import { everyCommand, plainCommands } from "../packages/engine/src/tools/shell_syntax.ts";
 import { FENCE_PY } from "../packages/engine/src/sites/sandbox_fence.ts";
 import { bashPattern, type SandboxApi, SandboxWorkspace } from "../packages/engine/src/sites/sandbox_workspace.ts";
@@ -126,13 +126,15 @@ describe("lab sandbox file fence", () => {
 			writeFileSync(script, FENCE_PY);
 			const probe = spawnSync("python3", ["-I", script, "probe", "n0nce"], { cwd: project, encoding: "utf8" });
 			expect(probe.stdout).toStartWith("el-fence ok n0nce ");
-			const run = (command: string) => spawnSync("python3", ["-I", script, "run", project, command], { cwd: project, encoding: "utf8" });
+			const run = (command: string, mode = "write") => spawnSync("python3", ["-I", script, "run", project, command, mode], { cwd: project, encoding: "utf8" });
 			expect(run('echo hi > inside.txt && echo t > "$TMPDIR/t" && echo x > /dev/null').status).toBe(0);
 			for (const command of ["echo bad > alias/marker.txt", "unlink ../other/marker.txt", "python3 -c 'import os; os.truncate(\"../other/marker.txt\", 0)'", "mkdir ../other/d", "echo x > /tmp/el-fence-shared-codetest", "ln -s x ../other/l"]) {
 				expect([command, run(command).status]).not.toEqual([command, 0]);
 			}
 			expect(readFileSync(join(other, "marker.txt"), "utf8")).toBe("keep");
 			expect(existsSync("/tmp/el-fence-shared-codetest")).toBe(false);
+			const flags = "python3 -c 'import array,fcntl,os; f=open(\"inside.txt\",\"rb\"); a=array.array(\"I\",[0]); fcntl.ioctl(f,0x80086601,a,True); a[0]^=0x40; fcntl.ioctl(f,0x40086602,a)'";
+			expect(run(flags, "read").status).not.toBe(0);
 			// The folder named must be the one the command starts in.
 			expect(spawnSync("python3", ["-I", script, "run", other, "true"], { cwd: project, encoding: "utf8" }).status).toBe(125);
 		} finally {
@@ -248,6 +250,25 @@ describe("round 4: what a line can hide", () => {
 		}
 	});
 
+	test.skipIf(process.platform === "win32")("empty-directory cleanup stays anchored and never follows a replacement link", () => {
+		const base = realpathSync(mkdtempSync(join(tmpdir(), "el-empty-tree-")));
+		try {
+			const project = join(base, "project");
+			const outside = join(base, "outside");
+			mkdirSync(join(project, "empty", "nested"), { recursive: true });
+			mkdirSync(outside);
+			writeFileSync(join(outside, "keep"), "keep\n");
+			expect(removeEmptyTreePhysical(join(project, "empty"))).toBe(true);
+			mkdirSync(join(project, "empty"));
+			rmSync(join(project, "empty"), { recursive: true });
+			symlinkSync(outside, join(project, "empty"));
+			expect(removeEmptyTreePhysical(join(project, "empty"))).toBe(false);
+			expect(readFileSync(join(outside, "keep"), "utf8")).toBe("keep\n");
+		} finally {
+			rmSync(base, { recursive: true, force: true });
+		}
+	});
+
 	test("a fence word that is a glob is expanded in the sandbox as the command's shell will", () => {
 		expect(bashPattern("data/*.csv")).toBe("\\d\\a\\t\\a/*\\.\\c\\s\\v");
 		expect(bashPattern("a b/[!x]?")).toBe("\\a\\ \\b/[!x]?");
@@ -307,9 +328,11 @@ describe("round 5: one boundary", () => {
 	});
 
 	test.skipIf(process.platform !== "darwin")("the engine's own git runs a project's filter drivers contained", () => {
-		const repo = realpathSync(mkdtempSync(join(tmpdir(), "el-gitfilter-")));
-		// Outside the project and outside the temp folders contained commands may write.
-		const outside = realpathSync(mkdtempSync(join(homedir(), ".el-gitfilter-out-")));
+		const base = realpathSync(mkdtempSync(join(tmpdir(), "el-gitfilter-")));
+		const repo = join(base, "repo");
+		const outside = join(base, "outside");
+		mkdirSync(repo);
+		mkdirSync(outside);
 		try {
 			const git = trustedGit()!;
 			spawnSync(git, ["init", "-q"], { cwd: repo });
@@ -324,13 +347,12 @@ describe("round 5: one boundary", () => {
 			}
 			expect(existsSync(join(outside, "pwned"))).toBe(false);
 		} finally {
-			rmSync(repo, { recursive: true, force: true });
-			rmSync(outside, { recursive: true, force: true });
+			rmSync(base, { recursive: true, force: true });
 		}
 	});
 
 	test.skipIf(process.platform !== "darwin")("a .git file or core.worktree pointing elsewhere gives the engine's git nothing more to write", () => {
-		const base = realpathSync(mkdtempSync(join(homedir(), ".el-gitlayout-")));
+		const base = realpathSync(mkdtempSync(join(tmpdir(), "el-gitlayout-")));
 		try {
 			const git = trustedGit()!;
 			// A .git file sending git to a repository outside the project.
@@ -391,7 +413,7 @@ describe("round 5: one boundary", () => {
 		for (const m of source.matchAll(/git\([a-zA-Z.]+, \["fetch"[^\n]*/g)) expect(m[0]).toContain('GIT_ALLOW_PROTOCOL: "file"');
 		for (const c of calls.filter((x) => x.sub === "log")) expect(c.rest).not.toMatch(/"-p"|"--patch"|"--stat"|textconv/);
 		// Every process git.ts starts goes through its contained helper.
-		expect((source.match(/execFileSync\(/g) ?? []).length).toBe(2);
+		expect((source.match(/execFileSync\(/g) ?? []).length).toBe(3);
 		// Only under full containment: no direct run of git anywhere in the file.
 		expect(source).toContain("FULL_CONTAINMENT.has(facility)");
 		expect(source.match(/from "node:child_process"/g)?.length).toBe(1);
@@ -423,8 +445,14 @@ describe("round 6: containment is the boundary", () => {
 		expect(allowKeys(shell, { command: "git status" }).keys[0]).not.toBe("shell!push");
 	});
 
+	test.skipIf(process.platform !== "win32")("Windows Git names and backslash paths cannot hide a push", () => {
+		for (const command of ["Git push origin main", String.raw`'C:\Program Files\Git\bin\Git.exe' push origin main`]) {
+			expect(allowKeys(shell, { command }).keys[0]).toBe("shell!push");
+		}
+	});
+
 	test.skipIf(process.platform !== "darwin")("a read-only subagent's commands run where nothing in the project can change, or not at all", async () => {
-		const root = realpathSync(mkdtempSync(join(homedir(), ".el-readonly-")));
+		const root = realpathSync(mkdtempSync(join(tmpdir(), "el-readonly-")));
 		try {
 			writeFileSync(join(root, "a.txt"), "data\n");
 			const opts = { timeoutMs: 30_000, signal: new AbortController().signal, readOnly: true };
@@ -501,6 +529,12 @@ describe("round 6: containment is the boundary", () => {
 				const program = join(bin, "literal-argv");
 				writeFileSync(program, "#!/bin/sh\nprintf '<%s>' \"$1\"\n");
 				chmodSync(program, 0o755);
+				writeFileSync(join(project, "pixi.toml"), "[workspace]\nchannels = []\n");
+				const projectBin = join(project, ".pixi", "envs", "default", "bin");
+				mkdirSync(join(project, ".pixi", "envs", "default", "conda-meta"), { recursive: true });
+				mkdirSync(projectBin, { recursive: true });
+				writeFileSync(join(projectBin, "literal-argv"), "#!/bin/sh\nexit 99\n");
+				chmodSync(join(projectBin, "literal-argv"), 0o755);
 				const command = "literal-argv 'a b; $HOME'";
 				const argv = allowedCommand(command, [command]);
 				expect(argv).toEqual(["literal-argv", "a b; $HOME"]);
@@ -520,14 +554,135 @@ describe("round 6: containment is the boundary", () => {
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}
-		for (const command of ["/usr/lib/git-core/git-svn dcommit", "/usr/lib/git-core/git-p4 submit", "p4 submit"]) {
+		for (const command of ["/usr/lib/git-core/git-svn dcommit", "/usr/lib/git-core/git-svn d[c]ommit", "/usr/lib/git-core/git-p4 submit", "p4 submit", "p4 s[u]bmit"]) {
 			expect([command, allowKeys(shell, { command }).keys[0]]).toEqual([command, "shell!push"]);
 		}
-		for (const command of ["timeout 5 env GIT_SSH_COMMAND=./x git fetch", "nice env GIT_CONFIG_COUNT=1 git status", "export GIT_SSH_COMMAND", "declare -x GIT_CONFIG_COUNT", "readonly GIT_ASKPASS", "builtin export GIT_CONFIG_COUNT", "builtin declare -x GIT_SSH_COMMAND", "git -c gc.recentObjectsHook=./x gc", "git -c tar.x.command=./y archive HEAD", "git -c difftool.t.cmd=./y difftool"]) {
+		for (const command of ["timeout 5 env GIT_SSH_COMMAND=./x git fetch", "nice env GIT_CONFIG_COUNT=1 git status", "export GIT_SSH_COMMAND", "declare -x GIT_CONFIG_COUNT", "readonly GIT_ASKPASS", "builtin export GIT_CONFIG_COUNT", "builtin declare -x GIT_SSH_COMMAND", "git -c gc.recentObjectsHook=./x gc", "git -c core.fsm[o]nitor=./x status", "git -c tar.x.command=./y archive HEAD", "git -c difftool.t.cmd=./y difftool"]) {
 			expect([command, allowKeys(shell, { command }).keys[0]]).toEqual([command, "shell!hidden"]);
 		}
 		expect(FENCE_PY.match(/425, 426, 427/g)).toHaveLength(2);
+		expect(FENCE_PY).toContain('"x86_64": (0xC000003E, [16,');
+		expect(FENCE_PY).toContain("14, 15, 16, 29, 52");
 	});
+
+	test("temp grants and Linux metadata scans fail closed instead of following caller state", () => {
+		const attack = realpathSync(mkdtempSync(join(tmpdir(), "el-attacker-temp-")));
+		const before = process.env.TMPDIR;
+		process.env.TMPDIR = attack;
+		try {
+			expect(safeTemp()).not.toBe(attack);
+		} finally {
+			if (before === undefined) delete process.env.TMPDIR;
+			else process.env.TMPDIR = before;
+			rmSync(attack, { recursive: true, force: true });
+		}
+		const root = realpathSync(mkdtempSync(join(tmpdir(), "el-scan-limit-")));
+		try {
+			writeFileSync(join(root, "a"), "a");
+			writeFileSync(join(root, "b"), "b");
+			writeFileSync(join(root, "c"), "c");
+			expect(() => projectGitPaths(root, 2)).toThrow("couldn't be completed");
+			mkdirSync(join(root, "deep", "deeper"), { recursive: true });
+			expect(() => projectGitPaths(root, 100, 0)).toThrow("deeper than");
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("engine Git accepts only /dev/null caller config overrides", () => {
+		const names = ["GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_DIR", "LD_PRELOAD"];
+		const saved = names.map((name) => process.env[name]);
+		try {
+			for (const name of names) process.env[name] = "/project/controlled";
+			for (const name of names) expect(engineEnvironment()[name]).toBeUndefined();
+			for (const name of names.slice(0, 2)) process.env[name] = "/dev/null";
+			expect(engineEnvironment()).toMatchObject({ GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" });
+		} finally {
+			names.forEach((name, i) => {
+				if (saved[i] === undefined) delete process.env[name];
+				else process.env[name] = saved[i];
+			});
+		}
+	});
+
+	test.skipIf(process.platform !== "linux")("Linux .git quarantine uses held folders and preserves files, directories and links", () => {
+		const base = realpathSync(mkdtempSync(join(tmpdir(), "el-git-quarantine-")));
+		const root = join(base, "project");
+		const outside = join(base, "outside");
+		mkdirSync(join(root, "existing", ".git"), { recursive: true });
+		mkdirSync(outside);
+		writeFileSync(join(outside, ".git"), "outside\n");
+		const held = holdGitEntries(root);
+		try {
+			writeFileSync(join(root, ".git"), "gitdir: elsewhere\n");
+			mkdirSync(join(root, "nested", ".GiT"), { recursive: true });
+			writeFileSync(join(root, "nested", ".GiT", "config"), "keep\n");
+			mkdirSync(join(root, "linked"));
+			symlinkSync(outside, join(root, "linked", ".git"));
+			// Replacing the project name cannot redirect cleanup to another directory.
+			const movedRoot = join(base, "held-project");
+			renameSync(root, movedRoot);
+			symlinkSync(outside, root);
+			const result = held.quarantine();
+			expect(result.error).toBeUndefined();
+			expect(result.moved.map((m) => m.from).sort()).toEqual([".git", "linked/.git", "nested/.GiT"]);
+			for (const { from, to } of result.moved) {
+				expect(existsSync(join(movedRoot, from))).toBe(false);
+				expect(to).toMatch(/\.git\.enrichedlab-blocked-[a-f0-9]{12}$/);
+				if (from === ".git") expect(readFileSync(join(movedRoot, to), "utf8")).toBe("gitdir: elsewhere\n");
+				else if (from === "nested/.GiT") expect(readFileSync(join(movedRoot, to, "config"), "utf8")).toBe("keep\n");
+				else expect(lstatSync(join(movedRoot, to)).isSymbolicLink()).toBe(true);
+			}
+			expect(readFileSync(join(outside, ".git"), "utf8")).toBe("outside\n");
+			expect(existsSync(join(movedRoot, "existing", ".git"))).toBe(true);
+			expect(held.quarantine()).toEqual({ moved: [] });
+			renameSync(join(movedRoot, "existing", ".git"), join(movedRoot, "existing", "original-metadata"));
+			writeFileSync(join(movedRoot, "existing", ".git"), "replacement\n");
+			const replacement = held.quarantine();
+			expect(replacement.error).toBeUndefined();
+			expect(replacement.moved.map((m) => m.from)).toEqual(["existing/.git"]);
+			expect(readFileSync(join(movedRoot, replacement.moved[0]!.to), "utf8")).toBe("replacement\n");
+			expect(() => holdGitEntries(movedRoot, 1)).toThrow("couldn't be completed");
+			expect(() => holdGitEntries(movedRoot, 100, 0)).toThrow("deeper than");
+		} finally {
+			held.release();
+			rmSync(base, { recursive: true, force: true });
+		}
+	});
+
+	test.skipIf(process.platform !== "linux" || sandboxer() !== "bubblewrap")("Linux commands write results, protect existing .git, and quarantine new metadata after foreground and background work", async () => {
+		const root = realpathSync(mkdtempSync(join(tmpdir(), "el-linux-metadata-")));
+		try {
+			mkdirSync(join(root, ".git"));
+			writeFileSync(join(root, ".git", "config"), "existing\n");
+			mkdirSync(join(root, "pointer"));
+			writeFileSync(join(root, "pointer", ".git"), "gitdir: elsewhere\n");
+			const ws = new LocalWorkspace(root, "workspace");
+			const output: string[] = [];
+			const options = { timeoutMs: 5_000, signal: AbortSignal.timeout(5_000), onOutput: (text: string) => output.push(text) };
+			expect((await ws.exec("printf x > ordinary", options)).exitCode).toBe(0);
+			expect(readFileSync(join(root, "ordinary"), "utf8")).toBe("x");
+			expect((await ws.exec("printf bad > .git/config", options)).exitCode).not.toBe(0);
+			expect((await ws.exec("printf bad > pointer/.git", options)).exitCode).not.toBe(0);
+			expect(readFileSync(join(root, ".git", "config"), "utf8")).toBe("existing\n");
+			expect(readFileSync(join(root, "pointer", ".git"), "utf8")).toBe("gitdir: elsewhere\n");
+			const foreground = await ws.exec("mkdir -p made/.git && printf keep > made/.git/config", options);
+			expect(foreground.exitCode).toBe(0);
+			// Keep the launching shell alive for its job. The existing --die-with-parent rule kills orphaned jobs.
+			const background = await ws.exec("(sleep 0.2; mkdir -p later; printf pointer > later/.git) >/dev/null 2>&1 & wait", options);
+			expect(background.exitCode).toBe(0);
+			for (const folder of ["made", "later"]) {
+				expect(existsSync(join(root, folder, ".git"))).toBe(false);
+				const blocked = readdirSync(join(root, folder)).find((name) => name.startsWith(".git.enrichedlab-blocked-"));
+				expect(blocked).toBeDefined();
+				expect(readFileSync(folder === "made" ? join(root, folder, blocked!, "config") : join(root, folder, blocked!), "utf8")).toBe(folder === "made" ? "keep" : "pointer");
+				expect((folder === "made" ? foreground : background).output).toContain(`EnrichedLab moved "${folder}/.git"`);
+			}
+			expect(output.join("")).toContain('EnrichedLab moved "later/.git"');
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	}, 15_000);
 
 	test("round 8: file writes reject .git before and after following links, without blocking an ancestor .git", async () => {
 		const base = realpathSync(mkdtempSync(join(tmpdir(), "el-git-paths-")));

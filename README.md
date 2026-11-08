@@ -51,10 +51,13 @@ Updates are signed and install themselves the same way: the app offers them, `el
   fill PDF forms.
 - **Where work runs.** Each session works on this computer or in a lab sandbox, and can move between them, taking
   its git repository along. A lab that keeps its data inside pins its sessions there.
-- **Contained by default.** On macOS and Linux the agent's commands can write only to the project and temp folders,
-  can't read your credential folders, and have no network unless you allow it; anything that would run outside that
+- **Contained by default.** On macOS and Linux the agent's commands can write to the project and private temp folders.
+  On Linux, existing `.git` entries stay read only and new ones are moved aside when the command and its background
+  children end. Commands can't read your credential folders and have no network unless you allow
+  it; anything that would run outside that
   asks first, unless its exact command is in `allowCommands` or you chose Allow Everything. An `allowCommands` entry
-  is one literal POSIX argv run without a shell; it is off on Windows. On Windows commands can write only to the
+  is one literal POSIX argv run without a shell, selected from the person's launch `PATH` rather than the project's
+  package environment; it is off on Windows. On Windows commands can write only to the
   project and temp folders, can read your credential folders, and ask before they run
   ([docs/security.md](docs/security.md)).
 

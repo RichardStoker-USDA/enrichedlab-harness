@@ -1107,7 +1107,7 @@ export class SessionRuntime {
 		if (before.length) this.append({ t: "checkpoint", id: newId("e"), at: now(), callId: call.id, files: before });
 		// Decided again just before it runs: a path that now leads elsewhere (a link changed meanwhile) isn't followed.
 		const latest = verdict.action === "run" ? decide(tool, args, this.workspace, this.deps.config(), this.allowed, this.discovering, this.permissionMode, !this.historyOff) : verdict;
-		if (verdict.action === "run" && (latest.action !== "run" || JSON.stringify(latest.argv) !== JSON.stringify(verdict.argv))) {
+		if (verdict.action === "run" && (latest.action !== "run" || JSON.stringify(latest.argv) !== JSON.stringify(verdict.argv) || JSON.stringify(latest.commit) !== JSON.stringify(verdict.commit))) {
 			return { ok: false, content: "Refused: where this call acts changed while it waited (a link may have moved). Send it again.", decision: "refused", tool, args };
 		}
 		try {
@@ -1121,6 +1121,7 @@ export class SessionRuntime {
 				fence: verdict.action === "run" && verdict.fence === true,
 				readOnly: this.agentMode === "read" || (verdict.action === "run" && verdict.readOnly === true),
 				argv: verdict.action === "run" ? verdict.argv : undefined,
+				commit: verdict.commit,
 				outside: Boolean(tool.ask?.(args, { workspace: this.workspace })),
 				tools: this.deps.toolsDir,
 				packages: this.deps.packageSources?.(this.site),
