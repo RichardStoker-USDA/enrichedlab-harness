@@ -665,7 +665,7 @@ export class Engine {
 
 	uiPrefs(): UiPrefs {
 		const { theme = "auto", showReasoning = true } = readJson<Partial<UiPrefs>>(this.paths.ui, {});
-		return { theme, showReasoning, permissions: modeOf(this.config.permissions.mode) };
+		return { theme, showReasoning, permissions: modeOf(this.config.permissions.mode), reasoningSummaries: this.config.reasoningSummaries !== false, ...(this.config.summaryModel ? { summaryModel: this.config.summaryModel } : {}) };
 	}
 
 	/** ChatGPT plan models are offered while an account is signed in; config.json records only that. */
@@ -805,6 +805,8 @@ export class Engine {
 					if (!result.ok || p.retry !== true) return result;
 					return { ...result, session: this.retryFrom(runtime, before).summary() };
 				}
+				case "session.stepFiles":
+					return this.session(need("sessionId")).stepFiles(need("id"));
 				case "session.compact":
 					return this.session(need("sessionId")).compactNow();
 				case "session.rename": {
@@ -1170,6 +1172,18 @@ export class Engine {
 						saveConfig(this.paths, { permissions: { ...DEFAULT_CONFIG.permissions, ...saved.permissions, mode: p.permissions } });
 						this.reloadConfig();
 						next.permissions = p.permissions;
+					}
+					// The summary model by ref, or "" for automatic (a fast model in the same place).
+					if (typeof p.summaryModel === "string" || typeof p.reasoningSummaries === "boolean") {
+						const raw = readJson<Record<string, unknown>>(this.paths.config, {});
+						if (typeof p.summaryModel === "string") {
+							if (p.summaryModel) raw.summaryModel = p.summaryModel.slice(0, 300);
+							else delete raw.summaryModel;
+						}
+						if (typeof p.reasoningSummaries === "boolean") raw.reasoningSummaries = p.reasoningSummaries;
+						writeJson(this.paths.config, raw);
+						this.reloadConfig();
+						Object.assign(next, this.uiPrefs());
 					}
 					this.emit("ui.updated", next);
 					return next;

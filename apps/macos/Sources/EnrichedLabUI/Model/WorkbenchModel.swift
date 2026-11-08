@@ -5,6 +5,8 @@ import Observation
 /// What a workbench tab shows.
 public enum Pane: Hashable, Codable, Sendable {
 	case files
+	/// Every step the session took, with its input, output, files and reason.
+	case timeline
 	case terminal(id: String)
 	/// An agent-made document (HTML, Markdown, SVG, image) the engine serves.
 	case view(canvas: String)
@@ -22,7 +24,7 @@ public enum Pane: Hashable, Codable, Sendable {
 	/// Panes that are one per session: opening again brings the open one forward.
 	var single: Bool {
 		switch self {
-		case .files, .browser, .screen, .desktop: true
+		case .files, .timeline, .browser, .screen, .desktop: true
 		default: false
 		}
 	}
@@ -30,6 +32,7 @@ public enum Pane: Hashable, Codable, Sendable {
 	var symbol: String {
 		switch self {
 		case .files: "folder"
+		case .timeline: "list.bullet.rectangle"
 		case .terminal: "terminal"
 		case .view: "doc.richtext"
 		case .table: "tablecells"
@@ -98,7 +101,7 @@ public final class WorkbenchModel {
 	/// A sandbox browser is one per session whatever its lab; a desktop is one per lab.
 	private func sameKind(_ a: Pane, _ b: Pane) -> Bool {
 		switch (a, b) {
-		case (.files, .files), (.browser, .browser), (.screen, .screen): true
+		case (.files, .files), (.timeline, .timeline), (.browser, .browser), (.screen, .screen): true
 		case let (.desktop(x), .desktop(y)): x == y
 		default: false
 		}

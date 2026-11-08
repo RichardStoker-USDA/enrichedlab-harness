@@ -147,6 +147,8 @@ describe("approvals", () => {
 		await turn(session, "shell: rm notes.txt");
 		expect(existsSync(join(root, "notes.txt"))).toBe(false);
 		const step = session.events.findLast((e) => e.t === "tool" && e.name === "shell")!;
+		// The timeline asks which files each step changed.
+		expect(await session.stepFiles(step.id)).toMatchObject({ files: ["notes.txt"], with: 1, history: true });
 		const back = await session.rewind(step.id);
 		expect(back).toMatchObject({ ok: true, files: ["notes.txt"] });
 		expect(readFileSync(join(root, "notes.txt"), "utf8")).toBe("x\n");

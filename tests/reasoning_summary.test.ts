@@ -9,7 +9,7 @@ import { DEFAULT_CONFIG, type LabConfig } from "../packages/engine/src/config.ts
 import type { ModelRegistry } from "../packages/engine/src/models/registry.ts";
 import type { ModelProfile } from "../packages/engine/src/models/types.ts";
 import { SessionLog } from "../packages/engine/src/session/log.ts";
-import { type RuntimeDeps, SessionRuntime } from "../packages/engine/src/session/runtime.ts";
+import { pickHelper, type RuntimeDeps, SessionRuntime } from "../packages/engine/src/session/runtime.ts";
 import { LocalWorkspace } from "../packages/engine/src/tools/workspace.ts";
 import type { ModelWhere } from "../packages/protocol/src/index.ts";
 
@@ -118,5 +118,20 @@ describe("reasoning summaries", () => {
 		for (let i = 0; i < 100 && (runtime.isRunning || !runtime.events.some((e) => e.t === "assistant")); i++) await Bun.sleep(10);
 		await Bun.sleep(50);
 		expect(lab.asked).not.toContain("summary");
+	});
+
+	test("not chosen, summaries go to a fast model in the same place, never elsewhere, and on this computer to the session's own", () => {
+		const lab: ModelWhere = { kind: "lab", name: "Field Lab" };
+		const big = profile("lab/qwen3-235b", "https://lab.example.org/v1", lab);
+		const small = profile("lab/qwen3-4b", "https://lab.example.org/v1", lab);
+		const elsewhere = profile("cloud/gpt-mini", "https://api.example.com/v1", { kind: "cloud", name: "Example" });
+		const embed = profile("lab/embed-small", "https://lab.example.org/v1", lab);
+		const all = [big, elsewhere, embed, small];
+		expect(pickHelper(big, undefined, all, () => true).ref).toBe("lab/qwen3-4b");
+		expect(pickHelper(big, undefined, all, (m) => m !== small).ref).toBe("lab/qwen3-235b");
+		// A chosen model in another place isn't used: the session's own writes them.
+		expect(pickHelper(big, elsewhere, [], () => true).ref).toBe("lab/qwen3-235b");
+		const here: ModelWhere = { kind: "device", name: "this computer" };
+		expect(pickHelper(profile("local/qwen3-30b", "http://127.0.0.1:1234/v1", here), undefined, [profile("local/qwen3-4b", "http://127.0.0.1:1234/v1", here)], () => true).ref).toBe("local/qwen3-30b");
 	});
 });

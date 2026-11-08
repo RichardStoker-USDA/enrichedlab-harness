@@ -593,6 +593,11 @@ export interface Requests {
 	"session.compact": { params: { sessionId: string }; result: { ok: boolean; detail: string } };
 	/** Put the folder back as it was before a step (an event id in the log); with `retry`, a new session continues from there. */
 	"session.rewind": { params: { sessionId: string; before: string; retry?: boolean }; result: { ok: boolean; detail: string; files: string[]; session?: SessionSummary } };
+	/**
+	 * The files a step (a tool event) changed, from step history. `with` counts the calls that ran together with it
+	 * (their changes can't be told apart); `history` is false when the session kept none for that step here.
+	 */
+	"session.stepFiles": { params: { sessionId: string; id: string }; result: { files: string[]; with: number; history: boolean; commit?: string } };
 	"session.undo": { params: { sessionId: string }; result: { ok: boolean; files: string[]; detail: string } };
 	"session.rename": { params: { sessionId: string; title: string }; result: { ok: true } };
 	/** Move where the session's files and commands act. A git repository comes along when `carry` is set. */
@@ -750,6 +755,10 @@ export interface UiPrefs {
 	showReasoning: boolean;
 	/** How much new sessions ask (a session can set its own); kept in config.json as permissions.mode. */
 	permissions: PermissionMode;
+	/** The model that writes reasoning summaries (config summaryModel); absent picks a fast one in the same place. */
+	summaryModel?: string;
+	/** Whether steps' reasoning gets a short summary (config reasoningSummaries). */
+	reasoningSummaries: boolean;
 }
 
 // ── The browser in a lab's sandbox ───────────────────────────────────────────────────────────────────────────────

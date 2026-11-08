@@ -123,6 +123,31 @@ struct BlockTests {
 		#expect(summarize(steps) == "Read 1 file, ran 1 command, 1 failed")
 	}
 
+	@Test("the timeline: steps by request, the reason once per message, the input laid out, who allowed it")
+	func steps() throws {
+		let events = try decode("""
+		[{"t":"tool","id":"r0","at":"2026-11-07T00:00:01Z","callId":"c0","name":"read","ok":true,"content":""},
+		 {"t":"user","id":"u","at":"2026-11-07T00:00:00Z","text":"Plot it"},
+		 {"t":"assistant","id":"a","at":"2026-11-07T00:00:12Z","model":"lab/m","text":"","reasoning":"plan","toolCalls":[{"id":"c1","name":"read","args":"{\\"path\\":\\"a.csv\\"}"},{"id":"c2","name":"shell","args":"{\\"command\\":\\"rm x\\",\\"a\\":1}"}],"stop":"tool_use"},
+		 {"t":"tool","id":"r1","at":"2026-11-07T00:00:13Z","callId":"c1","name":"read","ok":true,"content":"x"},
+		 {"t":"tool","id":"r2","at":"2026-11-07T00:00:15Z","callId":"c2","name":"shell","ok":false,"content":"","decision":"allowed_session"},
+		 {"t":"reasoning_summary","id":"s","at":"2026-11-07T00:00:16Z","of":"a","text":"Planned it.","model":"lab/mini"}]
+		""")
+		let turns = timeline(events)
+		#expect(turns.map(\.request) == ["", "Plot it"])
+		let steps = turns[1].steps
+		#expect(steps.map(\.id) == ["r1", "r2"])
+		#expect(steps.map(\.leads) == [true, false])
+		#expect(steps[0].why == "Planned it.")
+		#expect(steps[0].target == "a.csv")
+		#expect(steps[1].input == "{\n  \"a\" : 1,\n  \"command\" : \"rm x\"\n}")
+		#expect(steps[1].seconds == 3)
+		#expect(steps[1].asked && steps[1].permission == "allowed for this session")
+		#expect(TimelineFilter.problems.keeps(steps[1]) && !TimelineFilter.problems.keeps(steps[0]))
+		#expect(TimelineFilter.changes.keeps(steps[1]) && !TimelineFilter.changes.keeps(steps[0]))
+		#expect(timelineSummary(Array(turns.suffix(1))) == "2 steps for 1 request · 15 s · m · 1 failed")
+	}
+
 	@Test("calls still running join the activity, with the question they wait on")
 	func running() throws {
 		let events = try decode("""

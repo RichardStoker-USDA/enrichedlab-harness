@@ -7,7 +7,8 @@ import SwiftUI
 /// numbers so the script can capture this app's windows (and only them). Debug builds only.
 ///
 /// EL_SCENE_SESSION  a session id to open
-/// EL_SCENE_PANE     files, terminal, browser, desktop, or first (the newest view)
+/// EL_SCENE_PANE     files, timeline, terminal, browser, desktop, or first (the newest view)
+/// EL_SCENE_STEP     last: the timeline opens its newest step
 /// EL_SCENE_SETTINGS general, models, labs or updates: open Settings on that tab
 /// EL_SCENE_SIZE     the window's content size, such as 1360x880
 /// EL_SCENE_RESIZE   a content size applied after the pane opens (narrowing a window with the workbench open)
@@ -47,6 +48,7 @@ enum Automation {
 		if let pane = env["EL_SCENE_PANE"], let session = app.session {
 			switch pane {
 			case "files": session.workbench.show(.files, title: "Files")
+			case "timeline": session.workbench.show(.timeline, title: "Timeline")
 			case "terminal": session.workbench.newTerminal()
 			case "browser": session.workbench.show(.browser, title: "Browser")
 			case "desktop": if let site = session.place.site { session.workbench.show(.desktop(site: site.name), title: "\(session.place.title) desktop") }

@@ -195,6 +195,11 @@ public final class SessionModel {
 		do { status = try await app.connection.setModel(id, model: model, effort: effort) } catch { app.said(error) }
 	}
 
+	/// The files a step changed, kept by step history (nil when the engine couldn't say).
+	public func stepFiles(_ step: String) async -> EngineConnection.StepFiles? {
+		try? await app.connection.stepFiles(id, step: step)
+	}
+
 	/// Ask, then put the folder back as it was before a step; with `retry`, open a new session that continues from there.
 	public func confirmRewind(before: String, retry: Bool) {
 		app.confirmation = Confirmation(

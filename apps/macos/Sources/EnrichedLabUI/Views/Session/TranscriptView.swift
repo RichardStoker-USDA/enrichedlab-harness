@@ -190,11 +190,6 @@ struct ThinkingView: View {
 	}
 }
 
-func durationText(_ seconds: Double) -> String {
-	let s = Int(seconds.rounded())
-	return s < 60 ? "\(max(1, s)) s" : "\(s / 60) min \(s % 60) s"
-}
-
 /// The agent's answer: Markdown typeset for reading, with code blocks you can copy.
 struct AnswerView: View {
 	var text: String

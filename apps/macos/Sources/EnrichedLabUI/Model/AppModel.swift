@@ -426,6 +426,13 @@ public final class AppModel {
 		}
 	}
 
+	/// Who writes reasoning summaries ("" for automatic), and whether they're written.
+	public func setSummaries(model: String? = nil, on: Bool? = nil) async {
+		do { ui = try await connection.setUiPrefs(summaryModel: model, reasoningSummaries: on) } catch {
+			said(error, prefix: "Couldn't save that setting")
+		}
+	}
+
 	/// The question asked once when a folder is added: may EnrichedLab change files there, or only read them.
 	public var folderQuestion: FolderQuestion?
 

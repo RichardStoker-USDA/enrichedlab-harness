@@ -67,6 +67,9 @@ public struct EnrichedLabCommands: Commands {
 			Button("Files") { session?.workbench.show(.files, title: "Files") }
 				.keyboardShortcut("f", modifiers: [.command, .option])
 				.disabled(session == nil)
+			Button("Timeline") { session?.workbench.show(.timeline, title: "Timeline") }
+				.keyboardShortcut("t", modifiers: [.command, .option])
+				.disabled(session == nil)
 			Button("Browser") { session?.workbench.show(.browser, title: "Browser") }
 				.disabled(session == nil)
 			Divider()

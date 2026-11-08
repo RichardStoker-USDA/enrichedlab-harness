@@ -51,6 +51,27 @@ const DELTA_FLUSH_MS = 24;
 const PARALLEL_KINDS = new Set(["read", "net", "site-read"]);
 /** Tool kinds that may change the folder: a snapshot follows each step that used one. */
 const CHANGES = new Set(["write", "exec", "sandbox"]);
+/** Model names that say small and fast: mini, flash, haiku, nano, a few billion parameters (4b, 7b). */
+const QUICK = /(^|[-_.:/\s])(mini|small|flash|lite|haiku|nano|fast|instant|tiny|turbo|[1-9](\.\d)?b)([-_.:/\s]|$)/i;
+/** Models that don't chat. */
+const NOT_CHAT = /embed|rerank|whisper|tts|transcribe|moderation|image|guard/i;
+
+/**
+ * The model that writes summaries for a session on `model`: the one chosen (`configured`), or else a fast one among
+ * `all` (a lab's or a provider's small model), only in the same place, so a summary never goes anywhere the
+ * session's model doesn't. On this computer the session's own model writes them: no second model loads beside it.
+ */
+export function pickHelper(model: ModelProfile, configured: ModelProfile | undefined, all: ModelProfile[], allows: (m: ModelProfile) => boolean): ModelProfile {
+	const b = whereOf(model);
+	const usable = (helper: ModelProfile | undefined): helper is ModelProfile => {
+		if (!helper || helper.ref === model.ref || !allows(helper)) return false;
+		const a = whereOf(helper);
+		return a.kind === b.kind && a.name === b.name && (b.kind === "device" || b.kind === "network" || helper.provider === model.provider);
+	};
+	if (configured) return usable(configured) ? configured : model;
+	if (b.kind === "device") return model;
+	return all.find((helper) => QUICK.test(`${helper.id} ${helper.label}`) && !NOT_CHAT.test(`${helper.id} ${helper.label}`) && usable(helper)) ?? model;
+}
 
 export interface RuntimeDeps {
 	config(): LabConfig;
@@ -433,12 +454,27 @@ export class SessionRuntime {
 	 * `model` itself. Summaries carry the conversation, so they never go anywhere the session's model doesn't.
 	 */
 	private helperModel(model: ModelProfile): ModelProfile {
-		const helper = this.deps.registry.resolve(this.deps.config().summaryModel);
-		if (!helper || helper.ref === model.ref || !this.deps.allows(helper, this.site)) return model;
-		const a = whereOf(helper);
-		const b = whereOf(model);
-		const same = a.kind === b.kind && a.name === b.name && (b.kind === "device" || b.kind === "network" || helper.provider === model.provider);
-		return same ? helper : model;
+		const configured = this.deps.config().summaryModel;
+		return pickHelper(model, configured ? this.deps.registry.resolve(configured) : undefined, configured ? [] : this.deps.registry.all(), (m) => this.deps.allows(m, this.site));
+	}
+
+	/**
+	 * The files a step changed, from step history: between the point before it and the one its group of calls left.
+	 * Calls that ran together share that point, so their changes come together (`with`).
+	 */
+	async stepFiles(id: string): Promise<{ files: string[]; with: number; history: boolean; commit?: string }> {
+		const at = this.events.findIndex((e) => e.id === id);
+		const step = this.events[at];
+		if (!step || step.t !== "tool") return { files: [], with: 0, history: false };
+		const after = this.events.slice(at).find((e): e is Ev<"checkpoint"> => e.t === "checkpoint" && !!e.history && (e.calls?.includes(step.callId) ?? false));
+		const before = this.events.slice(0, at).findLast((e): e is Ev<"checkpoint"> => e.t === "checkpoint" && !!e.history);
+		// No point after it: it changed nothing history saw. A move since: its history is where it was then.
+		if (!before?.history) return { files: [], with: 1, history: false };
+		if (!after?.history) return { files: [], with: 1, history: true };
+		if (this.events.slice(this.events.indexOf(before)).some((e) => e.t === "place")) return { files: [], with: after.calls?.length ?? 1, history: false };
+		const history = this.stepHistory();
+		const files = history ? await history.changes(before.history, after.history).catch(() => []) : [];
+		return { files, with: after.calls?.length ?? 1, history: !!history, commit: after.history };
 	}
 
 	/** Queue a step's reasoning for a reading summary (docs/research.md); the full text stays on the step. */

@@ -85,7 +85,7 @@ class Lab {
 	models = $state<ModelInfo[]>([]);
 	/** The model a new session gets when none is chosen. */
 	defaultModel = $state<string | undefined>();
-	ui = $state<UiPrefs>({ theme: "auto", showReasoning: true, permissions: "auto" });
+	ui = $state<UiPrefs>({ theme: "auto", showReasoning: true, permissions: "auto", reasoningSummaries: true });
 	current = $state<string | undefined>();
 	summary = $state<SessionSummary | undefined>();
 	events = $state<SessionEvent[]>([]);

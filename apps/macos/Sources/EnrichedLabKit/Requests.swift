@@ -223,9 +223,25 @@ extension EngineConnection {
 		try await call("ui.get", Empty())
 	}
 
-	public func setUiPrefs(theme: String? = nil, showReasoning: Bool? = nil, permissions: PermissionMode? = nil) async throws -> UiPrefs {
-		struct P: Encodable, Sendable { var theme: String?; var showReasoning: Bool?; var permissions: String? }
-		return try await call("ui.set", P(theme: theme, showReasoning: showReasoning, permissions: permissions?.rawValue))
+	/// `summaryModel` "" returns summaries to the automatic choice.
+	public func setUiPrefs(theme: String? = nil, showReasoning: Bool? = nil, permissions: PermissionMode? = nil, summaryModel: String? = nil, reasoningSummaries: Bool? = nil) async throws -> UiPrefs {
+		struct P: Encodable, Sendable { var theme: String?; var showReasoning: Bool?; var permissions: String?; var summaryModel: String?; var reasoningSummaries: Bool? }
+		return try await call("ui.set", P(theme: theme, showReasoning: showReasoning, permissions: permissions?.rawValue, summaryModel: summaryModel, reasoningSummaries: reasoningSummaries))
+	}
+
+	/// The files a step changed, from step history.
+	public struct StepFiles: Decodable, Sendable, Hashable {
+		public var files: [String]
+		/// Calls that ran together with it; their changes come together.
+		public var with: Int
+		/// False when the session kept no history for that step here.
+		public var history: Bool
+		public var commit: String?
+	}
+
+	public func stepFiles(_ id: String, step: String) async throws -> StepFiles {
+		struct P: Encodable, Sendable { var sessionId: String; var id: String }
+		return try await call("session.stepFiles", P(sessionId: id, id: step))
 	}
 
 	public struct RewindResult: Decodable, Sendable {

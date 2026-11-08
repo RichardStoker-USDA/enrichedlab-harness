@@ -112,8 +112,8 @@ public func parseDate(_ text: String) -> Date? {
 	(try? Date(text, strategy: Date.ISO8601FormatStyle(includingFractionalSeconds: true))) ?? (try? Date(text, strategy: Date.ISO8601FormatStyle()))
 }
 
-private let reads: Set<String> = ["read", "ls", "glob", "grep", "recall"]
-private let edits: Set<String> = ["edit", "write"]
+let reads: Set<String> = ["read", "ls", "glob", "grep", "recall"]
+let edits: Set<String> = ["edit", "write"]
 
 /// One line for a finished activity: "Read 4 files, ran 2 commands, edited geom.py".
 public func summarize(_ steps: [StepItem]) -> String {
@@ -142,6 +142,12 @@ public func summarize(_ steps: [StepItem]) -> String {
 	let text = parts.joined(separator: ", ")
 	guard let first = text.first else { return "\(steps.count) step\(steps.count == 1 ? "" : "s")" }
 	return first.uppercased() + text.dropFirst()
+}
+
+/// "4 s", "2 min 5 s".
+public func durationText(_ seconds: Double) -> String {
+	let s = Int(seconds.rounded())
+	return s < 60 ? "\(max(1, s)) s" : "\(s / 60) min \(s % 60) s"
 }
 
 /// The useful part of tool arguments still streaming: a path or command if one has appeared.

@@ -65,10 +65,22 @@ because it is data, not decoration.
   millions of rows virtualized), Plot (WebGPU), App (a running Shiny, Streamlit or dev server), Browser (a real
   browser in the desktop app, or a lab sandbox's browser shown live and marked with that lab's color), Terminal (the
   person's shell on this computer; a command console in a lab sandbox), Files (the place's folder, opening data as
-  tables).
+  tables), Timeline (every step, below).
 - Drag a tab to an edge to split; drag a gutter to resize; the layout is remembered per session.
 - When a view arrives, it opens as a tab in the most recent pane group; the workbench opens if it was closed.
 - On a phone the workbench is a full-height sheet with its tabs across the top.
+
+## Timeline
+
+Art direction: a lab notebook's ledger. Each request heads its steps in the person's own words, pinned while its
+steps scroll. A one-point rail runs down the left with a mark at each step: blue (gold in dark) for a step that
+changed or ran something, rule-gray for a read, warning for one the person was asked about, red for a failure. Time
+sits left of the rail in tabular digits. The reason a step was taken (its message's reasoning summary) sits above it
+in the margin voice, once per message, not repeated for calls made together. A step opens in place to its input
+(the arguments, keys sorted and indented), its output, the files it changed (from step history, `session.stepFiles`),
+and its provenance line: model, time, who allowed it, step id and history commit. "Full reasoning" and "Go Back to
+Before This Step" are there too. Filters: All, Changes, Asked, Failed. Nothing animates but the opening, which
+respects Reduce Motion. Window ▸ Timeline (⌥⌘T) opens it; it's one per session.
 
 ## Identity
 

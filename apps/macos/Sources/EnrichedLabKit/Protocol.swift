@@ -500,11 +500,17 @@ public struct UiPrefs: Codable, Sendable, Hashable {
 	public var showReasoning: Bool
 	/// How much new sessions ask: ask, auto or full.
 	public var permissions: String?
+	/// The model that writes reasoning summaries; nil picks a fast one in the same place.
+	public var summaryModel: String?
+	/// Whether each step's reasoning gets a short summary (on unless turned off).
+	public var reasoningSummaries: Bool?
 
-	public init(theme: String = "auto", showReasoning: Bool = true, permissions: String? = nil) {
+	public init(theme: String = "auto", showReasoning: Bool = true, permissions: String? = nil, summaryModel: String? = nil, reasoningSummaries: Bool? = nil) {
 		self.theme = theme
 		self.showReasoning = showReasoning
 		self.permissions = permissions
+		self.summaryModel = summaryModel
+		self.reasoningSummaries = reasoningSummaries
 	}
 
 	public var permissionMode: PermissionMode { permissions.flatMap(PermissionMode.init(rawValue:)) ?? .auto }

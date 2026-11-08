@@ -103,6 +103,12 @@ Anthropic API the system prompt carries a cache breakpoint and the conversation 
 thinking blocks before a point stop being replayed, which the API allows for a leading run. A site can name a
 separate summary model; otherwise the session's model writes it. Nobody has to run a command.
 
+Reasoning summaries (one line per step, for the run sheet and the timeline) come from `summaryModel` when it's set
+(Settings ▸ Models ▸ Reasoning summaries), and otherwise from a fast model where the session's model runs: a lab's or
+a provider's small one (a name with mini, flash, haiku, nano, a few billion parameters and the like). On this
+computer the session's own model writes them, after the turn, so a second model isn't loaded beside it. A summary
+never goes anywhere the session's model doesn't (`pickHelper` in `session/runtime.ts`).
+
 **Models.** A model reference is `<provider>/<model>`. Providers come from three places: model servers on this
 computer, services the person added with a key
 (`provider.add`: OpenAI, Anthropic, Gemini, OpenRouter or any OpenAI-compatible address, the key in the OS

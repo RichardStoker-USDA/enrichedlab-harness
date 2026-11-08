@@ -125,6 +125,21 @@ private struct ModelSettings: View {
 					}
 				}
 			}
+			Section {
+				Toggle("Summarize each step's reasoning", isOn: Binding(get: { app.ui.reasoningSummaries ?? true }, set: { on in Task { await app.setSummaries(on: on) } }))
+				Picker("Written by", selection: Binding(get: { app.ui.summaryModel ?? "" }, set: { ref in Task { await app.setSummaries(model: ref) } })) {
+					Text("Automatic").tag("")
+					ForEach(modelGroups(app.allowed(site: nil))) { group in
+						Section(group.label) { ForEach(group.models) { Text($0.label).tag($0.ref) } }
+					}
+				}
+				.disabled(app.ui.reasoningSummaries == false)
+			} header: {
+				Text("Reasoning summaries")
+			} footer: {
+				Text("A short line for each step in the run sheet and timeline; the full reasoning stays one click away. Automatic uses a fast model where the session's model runs, or the session's own model on this Mac. A summary never goes anywhere the session's model doesn't.")
+					.foregroundStyle(.secondary)
+			}
 			Section("ChatGPT plan") {
 				if let accounts = providers?.accounts, !accounts.isEmpty {
 					ForEach(accounts) { account in

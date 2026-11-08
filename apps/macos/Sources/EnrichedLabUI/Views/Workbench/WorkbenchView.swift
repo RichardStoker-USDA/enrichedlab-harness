@@ -110,6 +110,7 @@ private struct OpenMenu: View {
 	var body: some View {
 		Menu {
 			Button("Files") { session.workbench.show(.files, title: "Files") }
+			Button("Timeline") { session.workbench.show(.timeline, title: "Timeline") }
 			Button("New Terminal") { session.workbench.newTerminal() }
 			Button("Browser") { session.workbench.show(.browser, title: "Browser") }
 			if let site = session.place.site, site.desktop != nil {
@@ -160,6 +161,8 @@ private struct PaneView: View {
 		switch tab.pane {
 		case .files:
 			FilesPane(session: session)
+		case .timeline:
+			TimelinePane(session: session)
 		case let .terminal(id):
 			TerminalPane(paneId: id, session: session)
 		case let .view(canvas):

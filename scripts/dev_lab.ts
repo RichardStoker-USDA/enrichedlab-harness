@@ -374,6 +374,8 @@ async function main(): Promise<void> {
 /** One state of the native window: a session, a pane, Settings, a size (Automation.swift reads these). */
 interface MacScene {
 	name: string;
+	/** Open the newest step in the timeline. */
+	openStep?: boolean;
 	session?: "lab" | "local";
 	pane?: "files" | "terminal" | "browser" | "desktop" | "first";
 	settings?: "general" | "models" | "labs" | "updates";
@@ -419,6 +421,7 @@ const MAC_SCENES: MacScene[] = [
 	{ name: "mac_live_done", prompt: "Write the big page", until: "done", after: 800 },
 	{ name: "mac_live_long", prompt: "Run a long analysis of the field data", until: "done", after: 800 },
 	{ name: "mac_live_scrolled", prompt: "Run a long analysis of the field data", until: "done", scrollUp: true, after: 800 },
+	{ name: "mac_timeline", prompt: "Run a long analysis of the field data", until: "done", pane: "timeline", openStep: true, after: 2000 },
 	{ name: "mac_settings_general", settings: "general" },
 	{ name: "mac_settings_models", settings: "models", after: 2500 },
 	{ name: "mac_settings_labs", settings: "labs" },
@@ -451,6 +454,7 @@ async function macScenes(client: EngineClient, engineVersion: string, sessions: 
 					...(scene.drag ? { EL_SCENE_DRAG: scene.drag } : {}),
 					...(scene.send ? { EL_SCENE_SEND: scene.send } : {}),
 					...(scene.scrollUp ? { EL_SCENE_SCROLLUP: "1" } : {}),
+					...(scene.openStep ? { EL_SCENE_STEP: "last" } : {}),
 					...(scene.folder ? { EL_SCENE_FOLDER: project } : {}),
 					...(scene.prompt ? { EL_SCENE_PROMPT: scene.prompt, EL_SCENE_UNTIL: scene.until ?? "done" } : {}),
 					...(scene.settings ? { EL_SCENE_SETTINGS: scene.settings } : {}),
