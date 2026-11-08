@@ -3,7 +3,7 @@ import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "n
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
-export const VERSION = "0.2.31";
+export const VERSION = "0.2.32";
 
 /**
  * How the harness names itself to a lab. Gate files every request under the User-Agent's first word, so the lab's
@@ -13,6 +13,7 @@ export const CLIENT_AGENT = `EnrichedLab/${VERSION} (${process.platform}; ${proc
 
 /** What changed in this version, one line each, newest first. Surfaces show the first lines when a session opens. */
 export const NEWS = [
+	"0.2.32: commands are read the way the shell reads them, so encoded or disguised pushes still ask; in a lab's sandbox, commands run under a Linux file fence that keeps their writes in the project; run packages are read and replayed with stricter isolation; going back never writes through a moved link. 0.2.31's changes, which were never published, are included.",
 	"0.2.31: a Timeline of every step (Window ▸ Timeline, ⌥⌘T) with why it ran, its input and output, the files it changed and who allowed it; reasoning summaries from a fast model where the session's model runs; each project gets its own package environment, so Shiny and the rest install and update apart from the system; Export Run Package carries the step history, and el session verify and reproduce check and rerun it; This Mac's local sandbox explained; many safety fixes to approvals and going back.",
 	"0.2.30: no more crash when resizing the window with a plot or dashboard open; the agent asks only for what can't be undone (choose Ask, Auto or Allow All beside the model), asks once per folder, and “allow for this session” names what it covers and sticks; every step is kept, so you can go back to before any step or try again from there; the conversation follows new output; UC Davis light and dark colors.",
 	"0.2.29: el lab check reads a lab's published API description (OpenAPI 3.1) where the lab offers one.",

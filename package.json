@@ -1,6 +1,6 @@
 {
   "name": "enrichedlab",
-  "version": "0.2.31",
+  "version": "0.2.32",
   "private": true,
   "type": "module",
   "description": "EnrichedLab: an agent harness with a terminal, a desktop window and a browser view over one engine",
