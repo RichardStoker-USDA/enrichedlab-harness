@@ -3,7 +3,7 @@
 // another project, the install is contained, and pixi.toml with pixi.lock records exactly what is there, so step
 // history can take a change back and a lab can build the same environment.
 
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { pixi, pixiPresent } from "../apps/environments.ts";
@@ -94,6 +94,8 @@ export const environmentTool: Tool<{ action: Action; packages?: string[]; pypi?:
 		if (args.action === "list" && !pixiPresent(tools)) return { ok: true, content: `pixi isn't on this computer yet, so this is what pixi.toml asks for (nothing is built):\n${readFileSync(join(root, "pixi.toml"), "utf8")}` };
 		const program = await pixi(tools, (line) => ctx.output(`${line}\n`));
 		const caches = join(tools, "pixi-cache");
+		// Made first: containment can only let the install write a folder that exists.
+		mkdirSync(caches, { recursive: true });
 		const env: Record<string, string> = { PIXI_NO_PATH_UPDATE: "1", PIXI_CACHE_DIR: caches, PIXI_HOME: caches };
 		for (const key of ["PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "SYSTEMROOT", "SSL_CERT_FILE", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY"]) if (process.env[key]) env[key] = process.env[key]!;
 		const file = join(root, "pixi.toml");

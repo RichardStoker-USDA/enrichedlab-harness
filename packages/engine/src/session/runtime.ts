@@ -494,14 +494,21 @@ export class SessionRuntime {
 	 */
 	private async pumpSummaries(): Promise<void> {
 		if (this.summarizing || !this.toSummarize.length) return;
-		const model = this.model();
-		if (!model) return;
-		const helper = this.helperModel(model);
-		if (this.running && whereOf(helper).kind === "device") return;
 		this.summarizing = true;
 		try {
 			while (this.toSummarize.length) {
-				const step = this.toSummarize.shift()!;
+				// Each step's reasoning goes only where the model that wrote it runs: its helper is chosen for that step,
+				// just before the request, never carried over from an earlier one.
+				const step = this.toSummarize[0]!;
+				const writer = this.deps.registry.resolve(step.model);
+				if (!writer || !this.deps.allows(writer, this.site)) {
+					this.toSummarize.shift();
+					continue;
+				}
+				const helper = this.helperModel(writer);
+				// A model on this computer serves one request at a time: wait for the turn to end.
+				if (this.running && whereOf(helper).kind === "device") return;
+				this.toSummarize.shift();
 				const text = await this.summarizeReasoning(helper, step.reasoning ?? "").catch(() => "");
 				if (text) this.append({ t: "reasoning_summary", id: newId("e"), at: now(), of: step.id, text, model: helper.ref });
 			}

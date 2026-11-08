@@ -682,8 +682,9 @@ async function main(): Promise<void> {
 				for (const path of r.same) out(`  same     ${path}`);
 				for (const d of r.differ) out(`  DIFFERS  ${d.path}${d.expected ? "" : " (the step removed it)"}${d.got ? "" : " (the rerun removed it)"}`);
 				for (const path of r.extra) out(`  EXTRA    ${path} (changed by the rerun, not by the step)`);
-				out(r.differ.length || r.extra.length ? "Not reproduced: the files differ." : `Reproduced: ${r.same.length} file${r.same.length === 1 ? "" : "s"} came out the same.`);
-				if (r.differ.length || r.extra.length) process.exitCode = 1;
+				const failed = r.exitCode !== 0;
+				out(failed ? `Not reproduced: the command ended with ${r.exitCode ?? "no exit code"}.\n${r.output}` : r.differ.length || r.extra.length ? "Not reproduced: the files differ." : `Reproduced: ${r.same.length} file${r.same.length === 1 ? "" : "s"} came out the same.`);
+				if (failed || r.differ.length || r.extra.length) process.exitCode = 1;
 				return;
 			}
 			if (verb === "push") {

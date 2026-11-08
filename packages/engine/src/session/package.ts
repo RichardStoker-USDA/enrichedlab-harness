@@ -111,13 +111,21 @@ function named(name: string, args: Record<string, unknown>, cwd: string): string
  * helpers or fsmonitor), no hooks, every object checked as it arrives.
  */
 const UNTRUSTED_GIT = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "transfer.fsckObjects=true", "-c", "fetch.fsckObjects=true", "-c", "core.symlinks=false", "-c", "core.autocrlf=false", "-c", "protocol.allow=never", "-c", "protocol.file.allow=always"];
-const UNTRUSTED_ENV = { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_TERMINAL_PROMPT: "0", GIT_ASKPASS: "", SSH_ASKPASS: "" };
+/** Only what git needs: no GIT_DIR, object or alternate directories, templates or injected config from the caller. */
+const UNTRUSTED_ENV: Record<string, string> = {
+	...Object.fromEntries(["PATH", "HOME", "LANG", "LC_ALL", "TMPDIR"].flatMap((k) => (process.env[k] ? [[k, process.env[k]!]] : []))),
+	GIT_CONFIG_NOSYSTEM: "1",
+	GIT_CONFIG_GLOBAL: "/dev/null",
+	GIT_TERMINAL_PROMPT: "0",
+	GIT_NO_REPLACE_OBJECTS: "1",
+	GIT_TEMPLATE_DIR: "",
+};
 
 /** Open a history bundle into a new, empty bare repository, every ref in it (a plain clone takes branches and tags only). */
 function openBundle(bundle: string, repo: string): { ok: boolean; error: string } {
-	const init = spawnSync("git", [...UNTRUSTED_GIT, "init", "--quiet", "--bare", repo], { encoding: "utf8", env: UNTRUSTED_ENV });
+	const init = spawnSync("git", [...UNTRUSTED_GIT, "init", "--quiet", "--bare", "--template=", repo], { encoding: "utf8", env: UNTRUSTED_ENV });
 	if (init.status !== 0) return { ok: false, error: (init.stderr || "git init failed").trim() };
-	const fetched = spawnSync("git", [...UNTRUSTED_GIT, "--git-dir", repo, "fetch", "--quiet", "--no-tags", "--no-recurse-submodules", bundle, "refs/*:refs/*"], { encoding: "utf8", env: UNTRUSTED_ENV });
+	const fetched = spawnSync("git", [...UNTRUSTED_GIT, "--git-dir", repo, "fetch", "--quiet", "--no-tags", "--no-recurse-submodules", bundle, "refs/sessions/*:refs/sessions/*"], { encoding: "utf8", env: UNTRUSTED_ENV });
 	return { ok: fetched.status === 0, error: (fetched.stderr || "").trim() };
 }
 
@@ -343,11 +351,16 @@ export function verifyPackage(folder: string): CheckRow[] {
 			if (opened.ok) {
 				const ids = new Set<string>();
 				for (const e of graph) if (typeof e.identifier === "string" && e.identifier.startsWith("git-blob:")) ids.add(e.identifier.slice(9));
-				for (const e of graph) for (const key of [`${TERMS}historyBefore`, `${TERMS}historyAfter`]) if (typeof e[key] === "string") ids.add(e[key] as string);
+				for (const e of graph) for (const key of [`${TERMS}historyBefore`, `${TERMS}historyAfter`]) if (e[key] !== undefined) ids.add(String(e[key]));
 				const listed = [...ids];
-				const found = listed.length ? spawnSync("git", [...UNTRUSTED_GIT, "--git-dir", repo, "cat-file", "--batch-check"], { input: `${listed.filter((id) => /^[0-9a-f]{40,64}$/.test(id)).join("\n")}\n`, encoding: "utf8", env: UNTRUSTED_ENV }).stdout : "";
-				const missing = found.split("\n").filter((line) => line.endsWith(" missing")).length;
-				rows.push({ check: "content ids", ok: missing === 0, detail: missing ? `${missing} of ${listed.length} aren't in the history` : `all ${listed.length} are in the history` });
+				const malformed = listed.filter((id) => !/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(id));
+				const asked = listed.filter((id) => !malformed.includes(id));
+				const r = asked.length ? spawnSync("git", [...UNTRUSTED_GIT, "--git-dir", repo, "cat-file", "--batch-check"], { input: `${asked.join("\n")}\n`, encoding: "utf8", env: UNTRUSTED_ENV }) : { status: 0, stdout: "" };
+				// Every id asked must come back present, one line each, from a git that finished cleanly.
+				const answers = r.stdout.split("\n").filter(Boolean);
+				const present = answers.filter((line) => !line.endsWith(" missing")).length;
+				const ok = r.status === 0 && !malformed.length && answers.length === asked.length && present === asked.length;
+				rows.push({ check: "content ids", ok, detail: ok ? `all ${listed.length} are in the history` : `${malformed.length ? `${malformed.length} malformed; ` : ""}${asked.length - present} of ${asked.length} not found in the history` });
 			}
 		} finally {
 			rmSync(scratch, { recursive: true, force: true });
@@ -400,6 +413,7 @@ export async function reproduceStep(folder: string, step: string, options: { pre
 		};
 		const opened = openBundle(bundle, repo);
 		if (!opened.ok) throw new Error(`The step history bundle doesn't open: ${opened.error}`);
+		mkdirSync(join(repo, "info"), { recursive: true });
 		writeFileSync(join(repo, "info", "attributes"), "* -text -eol -filter -ident -working-tree-encoding\n");
 		const index = { GIT_INDEX_FILE: join(scratch, "index") };
 		run(["read-tree", before], index);

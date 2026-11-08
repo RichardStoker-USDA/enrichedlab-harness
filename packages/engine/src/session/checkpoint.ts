@@ -55,8 +55,8 @@ export class Checkpoints {
 		const kept = new Map<string, FileBefore>();
 		for (const files of [...changes].reverse()) {
 			for (const file of files) {
-				// A link on the way now leads somewhere else: that isn't the file that was kept.
-				if (file.real && physical(file.path) !== file.real) continue;
+				// Only where the path still leads to the file that was kept; a record from before that was noted is left.
+				if (!file.real || physical(file.path) !== file.real) continue;
 				// Acts where the path leads: through a link to a file that didn't exist, the file made there goes, not the link.
 				const at = file.real ?? file.path;
 				if (!kept.has(at)) {
