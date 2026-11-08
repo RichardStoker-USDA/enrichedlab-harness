@@ -2,7 +2,7 @@
 // turn's file changes can be undone. Shell commands aren't covered; they can change anything.
 
 import { createHash } from "node:crypto";
-import { closeSync, constants, existsSync, mkdirSync, openSync, readFileSync, rmSync, statSync, writeFileSync, writeSync } from "node:fs";
+import { closeSync, constants, existsSync, fstatSync, ftruncateSync, lstatSync, mkdirSync, openSync, readFileSync, rmSync, statSync, writeFileSync, writeSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { physical } from "../tools/workspace.ts";
 
@@ -67,14 +67,27 @@ export class Checkpoints {
 				}
 				if (file.existed && file.blob) {
 					mkdirSync(dirname(at), { recursive: true });
-					// Never through a link at the end: the path was checked to lead here.
-					const fd = openSync(at, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW, 0o666);
+					// Opened without truncating or following a link at the end, then checked: the folder above must still be
+					// the one judged (a link swapped in meanwhile is caught) before any byte changes.
+					const existedNow = lstatSync(at, { throwIfNoEntry: false }) !== undefined;
+					const fd = openSync(at, constants.O_WRONLY | constants.O_CREAT | constants.O_NOFOLLOW, 0o666);
 					try {
-						writeSync(fd, readFileSync(join(this.dir, file.blob)));
+						const opened = fstatSync(fd);
+						const there = lstatSync(at, { throwIfNoEntry: false });
+						if (physical(file.path) !== at || !there || there.ino !== opened.ino || there.dev !== opened.dev) {
+							if (!existedNow && opened.size === 0) rmSync(at, { force: true });
+							continue;
+						}
+						ftruncateSync(fd, 0);
+						writeSync(fd, readFileSync(join(this.dir, file.blob)), 0, undefined, 0);
 					} finally {
 						closeSync(fd);
 					}
-				} else if (!file.existed) rmSync(at, { force: true });
+				} else if (!file.existed) {
+					// Removed only while the path still leads here, checked right before.
+					if (physical(file.path) !== at || lstatSync(at, { throwIfNoEntry: false })?.isDirectory()) continue;
+					rmSync(at, { force: true });
+				}
 				restored.add(file.path);
 			}
 		}
