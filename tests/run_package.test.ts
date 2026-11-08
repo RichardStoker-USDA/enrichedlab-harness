@@ -3,10 +3,10 @@
 
 import { afterAll, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { writePackage } from "../packages/engine/src/session/package.ts";
+import { verifyPackage, writePackage } from "../packages/engine/src/session/package.ts";
 import type { SessionEvent, SessionSummary } from "../packages/protocol/src/index.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "el-package-"));
@@ -54,5 +54,19 @@ describe("a run package", () => {
 		expect(existsSync(join(out, "files"))).toBe(false);
 		const crate = JSON.parse(readFileSync(join(out, "ro-crate-metadata.json"), "utf8")) as { "@graph": { "@id": string; description?: string }[] };
 		expect(crate["@graph"].find((e) => e["@id"] === "./")?.description).toContain("worked in the field sandbox");
+	});
+
+	test("verify reads only plain files inside the package: no .., absolute paths or links", () => {
+		const out = join(dir, "pkg-hostile");
+		writePackage(out, { summary: summary(), events, log: [], attachments: {}, version: "test" });
+		writeFileSync(join(dir, "secret.txt"), "not in the package\n");
+		symlinkSync(join(dir, "secret.txt"), join(out, "linked.txt"));
+		const meta = join(out, "ro-crate-metadata.json");
+		const crate = JSON.parse(readFileSync(meta, "utf8")) as { "@graph": Record<string, unknown>[] };
+		const hash = createHash("sha256").update("not in the package\n").digest("hex");
+		for (const id of ["../secret.txt", join(dir, "secret.txt"), "linked.txt"]) crate["@graph"].push({ "@id": id, "@type": "File", sha256: hash });
+		writeFileSync(meta, JSON.stringify(crate));
+		const rows = verifyPackage(out);
+		for (const id of ["../secret.txt", join(dir, "secret.txt"), "linked.txt"]) expect(rows.find((r) => r.check === id)).toMatchObject({ ok: false, detail: "missing, outside the package, or reached through a link" });
 	});
 });

@@ -9,7 +9,7 @@
 
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import type { SessionEvent, SessionSummary } from "@enrichedlab/protocol";
@@ -106,12 +106,34 @@ function named(name: string, args: Record<string, unknown>, cwd: string): string
 	return [...out];
 }
 
-/** Open a history bundle into a new bare repository, every ref in it (a plain clone takes branches and tags only). */
+/**
+ * git for a package someone else may have made: none of the person's or the system's config (no url rewrites,
+ * helpers or fsmonitor), no hooks, every object checked as it arrives.
+ */
+const UNTRUSTED_GIT = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "transfer.fsckObjects=true", "-c", "fetch.fsckObjects=true", "-c", "core.symlinks=false", "-c", "core.autocrlf=false", "-c", "protocol.allow=never", "-c", "protocol.file.allow=always"];
+const UNTRUSTED_ENV = { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_TERMINAL_PROMPT: "0", GIT_ASKPASS: "", SSH_ASKPASS: "" };
+
+/** Open a history bundle into a new, empty bare repository, every ref in it (a plain clone takes branches and tags only). */
 function openBundle(bundle: string, repo: string): { ok: boolean; error: string } {
-	const init = spawnSync("git", ["init", "--quiet", "--bare", repo], { encoding: "utf8" });
+	const init = spawnSync("git", [...UNTRUSTED_GIT, "init", "--quiet", "--bare", repo], { encoding: "utf8", env: UNTRUSTED_ENV });
 	if (init.status !== 0) return { ok: false, error: (init.stderr || "git init failed").trim() };
-	const fetched = spawnSync("git", ["--git-dir", repo, "fetch", "--quiet", bundle, "refs/*:refs/*"], { encoding: "utf8" });
+	const fetched = spawnSync("git", [...UNTRUSTED_GIT, "--git-dir", repo, "fetch", "--quiet", "--no-tags", "--no-recurse-submodules", bundle, "refs/*:refs/*"], { encoding: "utf8", env: UNTRUSTED_ENV });
 	return { ok: fetched.status === 0, error: (fetched.stderr || "").trim() };
+}
+
+/**
+ * A file the package names, inside the package folder: a relative path with no "..", no backslash and no link on the
+ * way. Undefined for anything else, which verify reports.
+ */
+function packaged(folder: string, id: string): string | undefined {
+	if (!id || isAbsolute(id) || id.includes("\\") || id.split("/").some((part) => part === ".." || part === "")) return undefined;
+	let at = folder;
+	for (const part of id.split("/")) {
+		at = join(at, part);
+		const info = lstatSync(at, { throwIfNoEntry: false });
+		if (!info || info.isSymbolicLink()) return undefined;
+	}
+	return statSync(at).isFile() ? at : undefined;
 }
 
 /** Write the package into `folder`; answers what it holds. */
@@ -300,18 +322,19 @@ export function verifyPackage(folder: string): CheckRow[] {
 	for (const e of graph) {
 		if (e["@type"] !== "File" || typeof e.sha256 !== "string" || e["@id"].startsWith("#")) continue;
 		checked++;
-		const full = join(folder, e["@id"]);
-		if (!existsSync(full)) {
+		const full = packaged(folder, e["@id"]);
+		if (!full) {
 			bad++;
-			rows.push({ check: e["@id"], ok: false, detail: "missing" });
+			rows.push({ check: e["@id"], ok: false, detail: "missing, outside the package, or reached through a link" });
 		} else if (sha256(readFileSync(full)) !== e.sha256) {
 			bad++;
 			rows.push({ check: e["@id"], ok: false, detail: "checksum differs" });
 		}
 	}
 	rows.push({ check: "files", ok: bad === 0, detail: bad ? `${bad} of ${checked} don't match` : `all ${checked} match their checksums` });
-	const bundle = join(folder, "history", "steps.bundle");
-	if (existsSync(bundle)) {
+	const bundle = packaged(folder, "history/steps.bundle");
+	if (existsSync(join(folder, "history", "steps.bundle")) && !bundle) rows.push({ check: "step history", ok: false, detail: "history/steps.bundle isn't a plain file in the package" });
+	else if (bundle) {
 		const scratch = mkdtempSync(join(tmpdir(), "el-verify-"));
 		try {
 			const repo = join(scratch, "steps.git");
@@ -322,7 +345,7 @@ export function verifyPackage(folder: string): CheckRow[] {
 				for (const e of graph) if (typeof e.identifier === "string" && e.identifier.startsWith("git-blob:")) ids.add(e.identifier.slice(9));
 				for (const e of graph) for (const key of [`${TERMS}historyBefore`, `${TERMS}historyAfter`]) if (typeof e[key] === "string") ids.add(e[key] as string);
 				const listed = [...ids];
-				const found = listed.length ? spawnSync("git", ["--git-dir", repo, "cat-file", "--batch-check"], { input: `${listed.join("\n")}\n`, encoding: "utf8" }).stdout : "";
+				const found = listed.length ? spawnSync("git", [...UNTRUSTED_GIT, "--git-dir", repo, "cat-file", "--batch-check"], { input: `${listed.filter((id) => /^[0-9a-f]{40,64}$/.test(id)).join("\n")}\n`, encoding: "utf8", env: UNTRUSTED_ENV }).stdout : "";
 				const missing = found.split("\n").filter((line) => line.endsWith(" missing")).length;
 				rows.push({ check: "content ids", ok: missing === 0, detail: missing ? `${missing} of ${listed.length} aren't in the history` : `all ${listed.length} are in the history` });
 			}
@@ -348,8 +371,10 @@ const SKIP = [".git", "node_modules", ".venv", "venv", ".pixi", "__pycache__", "
 
 /**
  * Rerun a command step from the package: its folder as it was just before the step, from the step history, in a
- * scratch folder, contained with no network (`prepare` runs first, e.g. to build the project's environment). Then
- * compare every file against what the step left. The scratch folder is removed afterwards.
+ * scratch folder. The command may come from someone else's package, so it runs contained like any agent command:
+ * writes only there and in temp folders, no network, credential folders hidden, no keys or tokens in its
+ * environment. Links in the history come out as plain files. `prepare` runs first (e.g. to build the project's
+ * environment). Then every file is compared with what the step left. The scratch folder is removed afterwards.
  */
 export async function reproduceStep(folder: string, step: string, options: { prepare?: (dir: string) => Promise<void>; timeoutMs?: number } = {}): Promise<Reproduced> {
 	const graph = (JSON.parse(readFileSync(join(folder, "ro-crate-metadata.json"), "utf8")) as { "@graph": Entity[] })["@graph"];
@@ -360,15 +385,16 @@ export async function reproduceStep(folder: string, step: string, options: { pre
 	const after = action[`${TERMS}historyAfter`];
 	if (typeof command !== "string") throw new Error("That step isn't a command, so there's nothing to rerun (a file edit carries its content in the log).");
 	if (typeof before !== "string") throw new Error("The package has no step history from before that step.");
-	const bundle = join(folder, "history", "steps.bundle");
-	if (!existsSync(bundle)) throw new Error("The package was made without its step history (history/steps.bundle).");
+	if (!/^[0-9a-f]{40,64}$/.test(before) || (typeof after === "string" && !/^[0-9a-f]{40,64}$/.test(after))) throw new Error("That step's history points aren't commit ids.");
+	const bundle = packaged(folder, "history/steps.bundle");
+	if (!bundle) throw new Error("The package has no step history (history/steps.bundle as a plain file).");
 	const scratch = mkdtempSync(join(tmpdir(), "el-reproduce-"));
 	try {
 		const repo = join(scratch, "steps.git");
 		const work = join(scratch, "work");
 		mkdirSync(work);
 		const run = (args: string[], env: Record<string, string> = {}) => {
-			const r = spawnSync("git", ["--git-dir", repo, "--work-tree", work, "-c", "core.autocrlf=false", ...args], { encoding: "utf8", cwd: work, env: { ...process.env, ...env } });
+			const r = spawnSync("git", [...UNTRUSTED_GIT, "--git-dir", repo, "--work-tree", work, ...args], { encoding: "utf8", cwd: work, env: { ...UNTRUSTED_ENV, ...env } });
 			if (r.status !== 0) throw new Error(`git ${args[0]}: ${(r.stderr || "").trim()}`);
 			return r.stdout;
 		};
