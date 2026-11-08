@@ -127,6 +127,8 @@ public struct RootView: View {
 			updateRoom()
 		}
 		.tint(Theme.accent)
+		.foregroundStyle(Theme.text)
+		.containerBackground(Theme.canvas, for: .window)
 		.preferredColorScheme(app.ui.theme == "light" ? .light : app.ui.theme == "dark" ? .dark : nil)
 		.sheet(item: $app.joining) { request in JoinLabView(request: request) }
 		.alert(

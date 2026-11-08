@@ -65,7 +65,7 @@ struct StepRow: View {
 						.truncationMode(.middle)
 						.foregroundStyle(.primary)
 					if unreviewed {
-						Text("Not reviewed by the lab").font(.caption2).foregroundStyle(.orange)
+						Text("Not reviewed by the lab").font(.caption2).foregroundStyle(Theme.warn)
 					}
 					Spacer(minLength: 8)
 					Text(result).font(.caption).foregroundStyle(.secondary).lineLimit(1).fixedSize()
@@ -141,12 +141,21 @@ struct StepRow: View {
 			if tool.decision == "denied" {
 				Image(systemName: "minus.circle").foregroundStyle(.secondary)
 			} else if tool.ok {
-				Image(systemName: "checkmark").foregroundStyle(.green)
+				Image(systemName: "checkmark").foregroundStyle(Theme.ok)
 			} else {
-				Image(systemName: "xmark").foregroundStyle(.red)
+				Image(systemName: "xmark").foregroundStyle(Theme.bad)
 			}
 		case let .running(_, _, _, waiting):
-			if waiting != nil { Image(systemName: "hand.raised.fill").foregroundStyle(Theme.accent) }
+			// Waiting on the person: the gold notch, edged in Aggie Blue in light so it holds on white (as the web window).
+			if waiting != nil {
+				RoundedRectangle(cornerRadius: 2)
+					.fill(Theme.gold)
+					.overlay(RoundedRectangle(cornerRadius: 2).strokeBorder(Theme.accent, lineWidth: 1.5))
+					.frame(width: 9, height: 9)
+					.rotationEffect(.degrees(45))
+					.frame(width: 12, height: 12)
+					.accessibilityLabel("Waiting for you")
+			}
 			else { ProgressView().controlSize(.mini).frame(width: 12, height: 12) }
 		}
 	}
@@ -199,27 +208,27 @@ private struct DetailView: View {
 					ForEach(Array(diffLines(diff).enumerated()), id: \.offset) { _, line in
 						Text(line.isEmpty ? " " : line)
 							.font(.system(size: 11.5, design: .monospaced))
-							.foregroundStyle(line.hasPrefix("+") ? Color.green : line.hasPrefix("-") ? Color.red : line.hasPrefix("@@") ? Color.secondary : Color.primary)
+							.foregroundStyle(line.hasPrefix("+") ? AnyShapeStyle(Theme.ok) : line.hasPrefix("-") ? AnyShapeStyle(Theme.bad) : line.hasPrefix("@@") ? AnyShapeStyle(.secondary) : AnyShapeStyle(.primary))
 							.frame(maxWidth: .infinity, alignment: .leading)
-							.background(line.hasPrefix("+") ? Color.green.opacity(0.08) : line.hasPrefix("-") ? Color.red.opacity(0.08) : .clear)
+							.background(line.hasPrefix("+") ? Theme.ok.opacity(0.1) : line.hasPrefix("-") ? Theme.bad.opacity(0.1) : .clear)
 					}
 				}
 				.padding(10)
 			}
-			.background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+			.background(Theme.surface, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
 			.textSelection(.enabled)
 		} else {
 			let output = tool.view?.detail ?? tool.content
 			ScrollView {
 				Text(output.count > 20_000 ? String(output.prefix(20_000)) + "\n…" : output)
 					.font(.system(size: 11.5, design: .monospaced))
-					.foregroundStyle(tool.ok ? .secondary : Color.red)
+					.foregroundStyle(tool.ok ? AnyShapeStyle(.secondary) : AnyShapeStyle(Theme.bad))
 					.textSelection(.enabled)
 					.frame(maxWidth: .infinity, alignment: .leading)
 					.padding(10)
 			}
 			.frame(maxHeight: 320)
-			.background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+			.background(Theme.surface, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
 		}
 	}
 
@@ -275,7 +284,7 @@ struct ApprovalCard: View {
 					.textSelection(.enabled)
 					.padding(8)
 					.frame(maxWidth: .infinity, alignment: .leading)
-					.background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+					.background(Theme.surface2, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
 			}
 			if let diff = request.view.diff, !diff.isEmpty {
 				ScrollView {
@@ -283,10 +292,10 @@ struct ApprovalCard: View {
 				}
 				.frame(maxHeight: 200)
 				.padding(8)
-				.background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+				.background(Theme.surface2, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
 			}
 			if request.view.unreviewed == true {
-				Text("This lab tool hasn't been reviewed by the lab yet.").font(.caption).foregroundStyle(.orange)
+				Text("This lab tool hasn't been reviewed by the lab yet.").font(.caption).foregroundStyle(Theme.warn)
 			}
 			// No Return or Escape shortcuts: a stray key in the composer must never answer a question.
 			ViewThatFits(in: .horizontal) {
@@ -311,7 +320,7 @@ struct ApprovalCard: View {
 			.disabled(answering)
 		}
 		.padding(12)
-		.background(.background.secondary, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+		.background(Theme.surface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
 		.overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(Theme.accent.opacity(0.5)))
 		.accessibilityElement(children: .contain)
 		.accessibilityLabel("Question: \(request.reason)")

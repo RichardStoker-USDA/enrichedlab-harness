@@ -169,6 +169,8 @@ struct PlotPane: View {
 	@State private var points: [PlotPoint] = []
 	@State private var error: String?
 	@State private var loaded = false
+	/// The color groups in the order they first appear, for the UC Davis series colors.
+	@State private var groups: [String] = []
 
 	struct PlotPoint: Identifiable, Sendable {
 		let id: Int
@@ -189,6 +191,8 @@ struct PlotPane: View {
 					.chartXAxisLabel(view.plot?.x ?? "x")
 					.chartYAxisLabel(view.plot?.y ?? "y")
 					.chartLegend(view.plot?.color == nil ? .hidden : .visible)
+					.chartForegroundStyleScale(domain: groups, range: groups.indices.map { Theme.series[$0 % Theme.series.count] })
+					.id(groups)
 				Text("\(points.count.formatted()) points").font(.caption).foregroundStyle(.secondary)
 			}
 		}
@@ -218,10 +222,14 @@ struct PlotPane: View {
 			guard let table = DataTable.parse(name: data.name, text: data.text ?? ""), let spec = view.plot else { error = "The data didn't read as a table."; return }
 			guard let xi = table.columns.firstIndex(of: spec.x), let yi = table.columns.firstIndex(of: spec.y) else { error = "The columns \(spec.x) and \(spec.y) aren't in the data."; return }
 			let ci = spec.color.flatMap { table.columns.firstIndex(of: $0) }
-			points = table.rows.compactMap { row in
+			let made = table.rows.compactMap { row -> PlotPoint? in
 				guard let x = Double(row.values[xi]), let y = Double(row.values[yi]) else { return nil }
 				return PlotPoint(id: row.id, x: x, y: y, group: ci.map { row.values[$0] } ?? "All")
 			}
+			// The color scale's domain holds every group before any point draws: Charts stops on a value outside it.
+			var seen = Set<String>()
+			groups = made.compactMap { seen.insert($0.group).inserted ? $0.group : nil }
+			points = made
 			if points.isEmpty { error = "\(spec.x) and \(spec.y) have no numbers to plot." }
 		} catch let failure {
 			error = (failure as? LocalizedError)?.errorDescription ?? failure.localizedDescription

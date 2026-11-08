@@ -198,7 +198,7 @@ private struct ModelSettings: View {
 				Text(preset.note).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
 				SecureField("Key", text: $key).textFieldStyle(.roundedBorder)
 				if let url = preset.keyUrl.flatMap(URL.init(string:)) { Link("Get a key from \(preset.label)", destination: url) }
-				if let error { Text(error).foregroundStyle(.red).font(.callout) }
+				if let error { Text(error).foregroundStyle(Theme.bad).font(.callout) }
 				HStack {
 					Spacer()
 					Button("Cancel") { adding = nil }.keyboardShortcut(.cancelAction)
@@ -251,7 +251,7 @@ private struct LabSettings: View {
 			ForEach(app.sites) { site in
 				Section {
 					LabeledContent("Status") {
-						Text(site.signedIn ? "Signed in as \(site.who ?? "you")" : site.error ?? "Signed out").foregroundStyle(site.signedIn ? AnyShapeStyle(.secondary) : AnyShapeStyle(Color.orange))
+						Text(site.signedIn ? "Signed in as \(site.who ?? "you")" : site.error ?? "Signed out").foregroundStyle(site.signedIn ? AnyShapeStyle(.secondary) : AnyShapeStyle(Theme.warn))
 					}
 					LabeledContent("Offers", value: "\(site.models) model\(site.models == 1 ? "" : "s"), \(site.tools) tools\(site.sandbox ? ", a sandbox" : "")\(site.desktop != nil ? ", a desktop" : "")")
 					if site.keepsDataInside == true { Text("Keeps its data inside: its sessions use its own models and stay in its sandbox.").font(.callout).foregroundStyle(.secondary) }
@@ -371,7 +371,7 @@ struct JoinLabView: View {
 				}
 				if advanced { Toggle("Keep this lab's work inside it", isOn: $request.isolated) }
 			}
-			if let error { Text(error).foregroundStyle(.red).font(.callout).fixedSize(horizontal: false, vertical: true) }
+			if let error { Text(error).foregroundStyle(Theme.bad).font(.callout).fixedSize(horizontal: false, vertical: true) }
 			HStack {
 				Spacer()
 				Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)

@@ -32,6 +32,8 @@ struct WorkbenchView: View {
 			}
 			.frame(maxWidth: .infinity, maxHeight: .infinity)
 		}
+		// One step off the canvas: a blue-white beside the white run sheet, black 90 beside the black one.
+		.background(Theme.surface)
 	}
 }
 
@@ -82,7 +84,7 @@ private struct TabButton: View {
 		}
 		.padding(.horizontal, 10)
 		.padding(.vertical, 5)
-		.background(selected ? AnyShapeStyle(.quaternary) : AnyShapeStyle(Color.clear), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+		.background(selected ? AnyShapeStyle(Theme.selected) : AnyShapeStyle(Color.clear), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
 		.contentShape(Rectangle())
 		.onTapGesture { session.workbench.selected = tab.id }
 		.onHover { hovering = $0 }

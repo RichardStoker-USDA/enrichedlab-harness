@@ -117,7 +117,7 @@ private struct PlaceRow: View {
 	}
 
 	private var statusStyle: some ShapeStyle {
-		if let site = place.site, site.error != nil, !site.signedIn { return AnyShapeStyle(Color.red) }
+		if let site = place.site, site.error != nil, !site.signedIn { return AnyShapeStyle(Theme.bad) }
 		return AnyShapeStyle(.secondary)
 	}
 

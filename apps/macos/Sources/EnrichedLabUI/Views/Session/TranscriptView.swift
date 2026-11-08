@@ -110,6 +110,7 @@ struct BlockView: View {
 			VStack(alignment: .leading, spacing: 6) {
 				Text(text)
 					.font(Theme.prompt)
+					.foregroundStyle(Theme.promptText)
 					.textSelection(.enabled)
 					.fixedSize(horizontal: false, vertical: true)
 				if images > 0 {
@@ -129,7 +130,7 @@ struct BlockView: View {
 		case let .notice(_, level, text):
 			Label(text, systemImage: level == "error" ? "exclamationmark.octagon" : level == "warn" ? "exclamationmark.triangle" : "info.circle")
 				.font(.callout)
-				.foregroundStyle(level == "error" ? AnyShapeStyle(Color.red) : level == "warn" ? AnyShapeStyle(Color.orange) : AnyShapeStyle(.secondary))
+				.foregroundStyle(level == "error" ? AnyShapeStyle(Theme.bad) : level == "warn" ? AnyShapeStyle(Theme.warn) : AnyShapeStyle(.secondary))
 				.textSelection(.enabled)
 		case let .rule(_, text):
 			HStack(spacing: 10) {
@@ -210,7 +211,7 @@ struct AnswerView: View {
 			if stop == "error" {
 				Label(error ?? "The model stopped with an error.", systemImage: "exclamationmark.octagon")
 					.font(.callout)
-					.foregroundStyle(.red)
+					.foregroundStyle(Theme.bad)
 					.textSelection(.enabled)
 			} else if stop == "cancelled" {
 				Text("Stopped.").font(.callout).foregroundStyle(.secondary)
@@ -229,9 +230,47 @@ struct MarkdownText: View {
 		StructuredText(markdown: text)
 			.font(Theme.prose)
 			.textual.codeBlockStyle(RunSheetCodeBlock())
+			// UC Davis colors for links, inline code, tables and quotes; the rest of GitHub's layout stays.
+			.textual.inlineStyle(InlineStyle().code(.monospaced, .fontScale(0.85), .backgroundColor(DynamicColor(Theme.surface2))).strong(.fontWeight(.semibold)).link(.foregroundColor(DynamicColor(Theme.accentText))))
+			.textual.tableStyle(RunSheetTable())
+			.textual.blockQuoteStyle(RunSheetQuote())
 			.textual.structuredTextStyle(.gitHub)
 			.textual.textSelection(.enabled)
 			.fixedSize(horizontal: false, vertical: true)
+	}
+}
+
+/// A table: hairline rules and every other row striped, in the theme's colors.
+struct RunSheetTable: StructuredText.TableStyle {
+	func makeBody(configuration: Configuration) -> some View {
+		configuration.label
+			.textual.tableCellSpacing(horizontal: 1, vertical: 1)
+			.textual.blockSpacing(.init(top: 0, bottom: 16))
+			.textual.tableBackground { layout in
+				Canvas { context, _ in
+					for row in layout.rowIndices.dropFirst() where row.isMultiple(of: 2) {
+						context.fill(Path(layout.rowBounds(row).integral), with: .color(Theme.surface))
+					}
+				}
+			}
+			.textual.tableOverlay { layout in
+				Canvas { context, _ in
+					for divider in layout.dividers() { context.fill(Path(divider), with: .color(Theme.rule)) }
+				}
+			}
+			.padding(1)
+			.border(Theme.rule, width: 1)
+	}
+}
+
+/// A quotation: a bar in the rule color and the text one step quieter.
+struct RunSheetQuote: StructuredText.BlockQuoteStyle {
+	func makeBody(configuration: Configuration) -> some View {
+		HStack(spacing: 12) {
+			RoundedRectangle(cornerRadius: 1.5).fill(Theme.rule).frame(width: 3)
+			configuration.label.foregroundStyle(.secondary)
+		}
+		.textual.blockSpacing(.init(top: 0, bottom: 16))
 	}
 }
 
@@ -274,9 +313,9 @@ private struct CodeBlockFrame: View {
 			}
 			.scrollIndicators(.automatic)
 		}
-		.background(Color(nsColor: .textBackgroundColor).opacity(0.6))
+		.background(Theme.code)
 		.clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-		.overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(.separator))
+		.overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(Theme.rule))
 		.textual.blockSpacing(.fontScaled(top: 0.8, bottom: 0.2))
 	}
 }

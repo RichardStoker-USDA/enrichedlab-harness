@@ -36,7 +36,7 @@ computer or the cluster that holds the data.
 | Axis | Committed to | Why |
 |---|---|---|
 | Composition | Three regions (rail, run sheet, workbench), tiling panes, no floating windows | Pro tools that people live in all day tile; free windows make people manage windows instead of work |
-| Color | White and Aggie Blue in light; black, UC Davis black tints and Aggie Gold in dark (BFI Index); place colors as markers only | UC Davis identity; the one extra hue per place earns its place by orienting |
+| Color | White and Aggie Blue in light; black, UC Davis black tints and Aggie Gold in dark (BFI Index); place colors as markers only. The macOS app uses the web window's roles (`Theme.swift`: canvas, surface, rule, text, accent text, the gold waiting notch, plot series in UC Davis colors) under Liquid Glass and system controls | UC Davis identity; the one extra hue per place earns its place by orienting |
 | Type | System UI (SF Pro, Segoe UI Variable); prose 15.5/1.6 at a 70-character measure; prompts 18/1.35 semibold; mono 12.5 for steps, code and data | Reading quality first; the run sheet is mostly reading |
 | Density | Comfortable in the run sheet, compact in the rail and panes (28 px rows, 12.5 px data) | Reading and scanning are different jobs |
 | Depth | Hairline rules between regions and panes; one soft shadow for things that float (menus, the command palette); translucent rail material in the desktop window | Flat regions read as one instrument; only transient things lift |
