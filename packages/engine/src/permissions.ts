@@ -212,6 +212,9 @@ const GIT_PUBLISHERS = PUBLISH.flatMap((p) => [`git-${p}`, `git-${p}.exe`]);
 /** git's bridges that publish with a subcommand: git-svn dcommit, git-p4 submit (run directly or as git svn). */
 const BRIDGES: Record<string, string> = { svn: "dcommit", p4: "submit" };
 
+/** PowerShell accepts these Unicode quote delimiters, and cmd removes caret escapes. This reader handles neither. */
+const WINDOWS_UNREADABLE = /[\u2018-\u201e]|\^[\s\S]/u;
+
 /** Settings that make git run a program (or rename a command): set on the command line, git could push unseen. */
 const GIT_RUNS = /^(alias\.|core\.(sshcommand|fsmonitor|pager|editor|askpass|hookspath|gitproxy|alternaterefscommand)|diff\.|difftool\.|filter\.|gc\.|merge\.|mergetool\.|gpg\.|credential\.|uploadpack\.|receivepack\.|sequence\.|interactive\.|remote\.|protocol\.|url\.|include|pager\.|log\.showsignature|submodule\.|tar\.|sendemail\.|lfs\.|web\.browser|browser\.|man\.|instaweb\.|ssh\.)/i;
 /** Programs that never run their arguments, so a shell's name among them is just a name. */
@@ -297,7 +300,8 @@ function flattenPowerShellArrays(line: string): string | undefined {
  * PowerShell can hand text to interpreters whose quoting rules this reader does not implement. On Windows those
  * handoffs always count as publishing, even when reached through another program, so Full mode still asks.
  */
-export function windowsInterpreterHandoff(command: string): boolean {
+function windowsPublishingHandoff(command: string): "push" | "hidden" | undefined {
+	if (WINDOWS_UNREADABLE.test(command)) return "push";
 	const executable = (word: string) => word.replace(/^.*[\\/]/, "").toLowerCase().replace(/\.exe$/, "");
 	const riskyAt = (words: readonly (string | undefined)[], i: number) => {
 		const word = words[i];
@@ -319,7 +323,7 @@ export function windowsInterpreterHandoff(command: string): boolean {
 		const flattened = flattenPowerShellArrays(command);
 		const startCommands = flattened === undefined ? undefined : everyPowerShellCommand(flattened)?.commands;
 		// A Start-Process expression outside the literal subset could hide either its executable or ArgumentList.
-		if (!startCommands) return true;
+		if (!startCommands) return "push";
 		const parameters = [
 			["argumentlist", true, ["args"]], ["confirm", false, ["cf"]], ["credential", true, ["runas"]],
 			["debug", false, ["db"]], ["environment", true, []], ["erroraction", true, ["ea"]], ["errorvariable", true, ["ev"]],
@@ -344,9 +348,9 @@ export function windowsInterpreterHandoff(command: string): boolean {
 			const positional: string[] = [];
 			for (let i = 1; i < words.length; i++) {
 				const word = words[i];
-				if (word === undefined) return true;
+				if (word === undefined) return "push";
 				const found = parameter(word);
-				if (found === "ambiguous") return true;
+				if (found === "ambiguous") return "push";
 				if (!found) {
 					positional.push(word);
 					continue;
@@ -354,34 +358,39 @@ export function windowsInterpreterHandoff(command: string): boolean {
 				const [name, takesValue] = found;
 				if (!takesValue) continue;
 				if (name === "argumentlist") {
-					if (argumentList) return true;
+					if (argumentList) return "push";
 					argumentList = [];
 					while (i + 1 < words.length) {
 						const next = words[i + 1];
-						if (next === undefined) return true;
+						if (next === undefined) return "push";
 						const nextParameter = parameter(next);
 						if (nextParameter && nextParameter !== "ambiguous") break;
 						argumentList.push(next);
 						i++;
 					}
-					if (!argumentList.length) return true;
+					if (!argumentList.length) return "push";
 					continue;
 				}
 				const value = words[++i];
-				if (value === undefined || parameter(value)) return true;
+				if (value === undefined || parameter(value)) return "push";
 				if (name === "filepath") {
-					if (file !== undefined) return true;
+					if (file !== undefined) return "push";
 					file = value;
 				}
 			}
 			file ??= positional.shift();
-			if (!file) return true;
+			if (!file) return "push";
 			if (argumentList === undefined) {
-				if (positional.length > 1) return true;
+				if (positional.length > 1) return "push";
 				argumentList = positional;
-			} else if (positional.length) return true;
+			} else if (positional.length) return "push";
 			const normalized = windowsArguments(argumentList.join(" "));
-			if (!normalized || riskyAt([file, ...normalized], 0)) return true;
+			if (!normalized || riskyAt([file, ...normalized], 0)) return "push";
+			// Classify the fixed child argv exactly as a direct PowerShell invocation. Quoting every word as a literal
+			// preserves its argv while keeping this synthetic line inside the constrained reader.
+			const child = [file, ...normalized].map((word) => `'${word.replaceAll("'", "''")}'`).join(" ");
+			const publishes = publishing(child, 1, true);
+			if (publishes) return publishes;
 		}
 	}
 	// PowerShell aliases and native wrappers that start a later argv. Normalize `.exe` before this check so the
@@ -391,14 +400,19 @@ export function windowsInterpreterHandoff(command: string): boolean {
 		if (riskyAt(words, 0)) return true;
 		const lead = words[0] === undefined ? undefined : executable(words[0]);
 		return lead !== undefined && runners.has(lead) && words.some((_word, i) => i > 0 && riskyAt(words, i));
-	});
+	}) ? "push" : undefined;
 	// When PowerShell syntax itself is outside the literal subset, retain enough token boundaries to fail closed on
 	// the same interpreter names and options. False positives ask; they never widen what may run.
-	return rough.some((_word, i) => riskyAt(rough, i));
+	return rough.some((_word, i) => riskyAt(rough, i)) ? "push" : undefined;
+}
+
+/** Windows handoffs and unreadable Windows syntax that must ask as a push. */
+export function windowsInterpreterHandoff(command: string): boolean {
+	return windowsPublishingHandoff(command) === "push";
 }
 
 /** A glob pattern as a regular expression for one name, as bash matches it. */
-function patternRegex(pattern: string): RegExp | undefined {
+function patternRegex(pattern: string, windows = process.platform === "win32"): RegExp | undefined {
 	// These replacements are used only against the fixed ASCII publishing names below. Unsupported POSIX,
 	// equivalence and collating classes stay unresolved and therefore fail closed.
 	const posix: Record<string, string> = {
@@ -429,7 +443,7 @@ function patternRegex(pattern: string): RegExp | undefined {
 		} else out += c.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&");
 	}
 	try {
-		return new RegExp(`^${out}$`, process.platform === "win32" ? "i" : "");
+		return new RegExp(`^${out}$`, windows ? "i" : "");
 	} catch {
 		return undefined;
 	}
@@ -444,20 +458,23 @@ function patternRegex(pattern: string): RegExp | undefined {
  * set in front, eval or a shell (started directly or through env, timeout, xargs and the like) handed code that
  * expands or arrives on its input, or a line that doesn't parse.
  */
-function publishing(command: string, depth = 0): "push" | "hidden" | undefined {
-	if (process.platform === "win32" && windowsInterpreterHandoff(command)) return "push";
-	const line = process.platform === "win32" ? everyPowerShellCommand(command) : everyCommand(command);
+function publishing(command: string, depth = 0, windows = process.platform === "win32"): "push" | "hidden" | undefined {
+	if (windows) {
+		const handoff = windowsPublishingHandoff(command);
+		if (handoff) return handoff;
+	}
+	const line = windows ? everyPowerShellCommand(command) : everyCommand(command);
 	if (!line || depth > 4) return /\bgit\b|\bpush\b|\bsend-pack\b/i.test(command) ? "push" : "hidden";
 	const name = (w: string) => {
-		const base = w.replace(process.platform === "win32" ? /^.*[\\/]/ : /^.*\//, "");
-		return process.platform === "win32" ? base.toLowerCase() : base;
+		const base = w.replace(windows ? /^.*[\\/]/ : /^.*\//, "");
+		return windows ? base.toLowerCase() : base;
 	};
 	const could = (text: string | undefined, pattern: string | undefined, names: string[]) => {
 		if (text === undefined) return false;
 		if (!pattern) return names.includes(name(text));
-		const slash = process.platform === "win32" ? Math.max(pattern.lastIndexOf("/"), pattern.lastIndexOf("\\")) : pattern.lastIndexOf("/");
+		const slash = windows ? Math.max(pattern.lastIndexOf("/"), pattern.lastIndexOf("\\")) : pattern.lastIndexOf("/");
 		const last = pattern.slice(slash + 1);
-		const re = patternRegex(last);
+		const re = patternRegex(last, windows);
 		return !re || names.some((n) => re.test(n));
 	};
 	const isPush = (w: string | undefined, p: string | undefined) => (p ? could(w, p, PUBLISH) : w !== undefined && (/(^|\s)push\b/.test(w) || PUBLISH.includes(name(w))));
@@ -527,7 +544,7 @@ function publishing(command: string, depth = 0): "push" | "hidden" | undefined {
 				if (w === undefined) continue;
 				const rest = argv.slice(i + 1);
 				if (name(w) === "eval") {
-					const inner = rest.includes(undefined) ? "hidden" : publishing(rest.join(" "), depth + 1);
+					const inner = rest.includes(undefined) ? "hidden" : publishing(rest.join(" "), depth + 1, windows);
 					if (inner === "push") return "push";
 					if (inner) hidden = true;
 					break;
@@ -535,7 +552,7 @@ function publishing(command: string, depth = 0): "push" | "hidden" | undefined {
 				if (SHELLS.has(name(w))) {
 					const flag = rest.findIndex((x) => x !== undefined && /^-[a-zA-Z]*c[a-zA-Z]*$/.test(x));
 					const script = flag >= 0 ? rest[flag + 1] : undefined;
-					const inner = flag >= 0 ? (script === undefined ? "hidden" : publishing(script, depth + 1)) : undefined;
+					const inner = flag >= 0 ? (script === undefined ? "hidden" : publishing(script, depth + 1, windows)) : undefined;
 					if (inner === "push") return "push";
 					// No -c and no script file: it runs whatever arrives on its input.
 					if (inner || (flag < 0 && !rest.some((x) => x === undefined || !x.startsWith("-")))) hidden = true;
@@ -548,7 +565,7 @@ function publishing(command: string, depth = 0): "push" | "hidden" | undefined {
 		// A word that is itself a command line (a pager, an editor, env -S, --compress-program) is read as one too.
 		for (const w of argv) {
 			if (w === undefined || !/\s/.test(w) || depth >= 3) continue;
-			const inner = publishing(w, depth + 1);
+			const inner = publishing(w, depth + 1, windows);
 			if (inner === "push") return "push";
 			if (inner === "hidden" && everyCommand(w)) hidden = true;
 		}

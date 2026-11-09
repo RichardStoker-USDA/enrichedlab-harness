@@ -114,10 +114,13 @@ The engine's own work stays inside the same line:
   one object. A scan error or its 50,000-entry or 64-level limit refuses the command. The engine also prepares one
   hidden sibling quarantine outside the project, named from the project's device and inode and on the same
   filesystem. Only when the sibling does not exist and its parent is not writable does the engine try one per-user
-  quarantine root under its home on the project's device. It makes the chosen directory with mode 0700, then opens
-  it without following any link and verifies from that descriptor that it is a directory owned by the person, still
-  mode 0700 and on the project's device. An existing sibling that fails any check refuses the command instead of
-  trying the fallback. The error names the failed check, or why both locations were unavailable.
+  quarantine root under its home. It makes the chosen directory with mode 0700, then opens it without following any
+  link and verifies from that descriptor that it is a directory owned by the person, still mode 0700 and on the
+  project's device. Equal device numbers are not enough for the fallback: the engine also makes an empty probe in
+  the project, uses anchored `renameat` calls to move it into the fallback and back, and removes it. Any failure,
+  including `EXDEV` between two bind mounts of one filesystem, refuses the command and names the failed step. An
+  existing sibling that fails any check refuses the command instead of trying the fallback. The error names the
+  failed check, or why both locations were unavailable.
   Contained commands cannot read the quarantine.
 
   Before starting the command, the engine records the project identity, quarantine path and the
@@ -136,8 +139,8 @@ The engine's own work stays inside the same line:
   failure refuses that command or write before it creates anything. Reads remain available so the person's data is
   not hidden. Recovery also finds a pending record by folder identity after the project is renamed or reached through
   another physical path. The pending pass uses the quarantine recorded in its journal, even if a new sibling becomes
-  available. An existing sibling or selected per-user quarantine must pass the same descriptor checks even when no
-  cleanup record is found; file writes refuse an unsafe quarantine without waiting for a command to check it.
+  available, and repeats the rename proof against that exact destination before recovery. With no cleanup record, an
+  ordinary file write verifies an existing sibling but does not create or check a hypothetical fallback.
 
   There is a remaining window while a command runs: new metadata exists at its project path and Git in that command,
   or a simultaneous process outside containment, can use it. An engine crash or failed bounded pass can leave that
@@ -176,9 +179,11 @@ Accepted residuals, each with its reason:
   `bash -c`, `wsl`, `powershell` or `pwsh` invocations count as a push and ask every time. Those interpreter handoffs
   also count behind `env`, `start`, `Start-Process`, its `saps` alias, `timeout` and `xargs`, including native `.exe`
   forms. `Start-Process` and its aliases normalize a literal `ArgumentList` supplied as one string or an array before
-  this check, including abbreviated parameter names; an unreadable form counts as a push. Other unsupported
-  PowerShell syntax asks as a push when its raw text contains a publishing word and as hidden otherwise. A script or
-  program that pushes on its own isn't. "Pushes ask"
+  this check, including abbreviated parameter names, then classify the normalized child argv exactly like a direct
+  invocation of that program. An unreadable form counts as a push. Any U+2018 through U+201E typographic quote used
+  by PowerShell, or any caret escape that cmd could remove, makes the Windows line unreadable and counts as a push.
+  Other unsupported PowerShell syntax asks as a push when its raw text contains a publishing word and as hidden
+  otherwise. A script or program that pushes on its own isn't. "Pushes ask"
   means pushes the line shows.
 - The lab fence by Landlock ABI. ABI 3 covers file contents, names, existence and truncation; refusing TCP needs ABI
   4, device ioctls ABI 5, and signals and abstract sockets to processes outside the fence ABI 6. Below those, a fenced
@@ -240,8 +245,9 @@ word is text only when nothing expands or substitutes in it: no variable, substi
 (`tools/shell_syntax.ts`). On Windows, the publishing gate reads a constrained set of literal PowerShell
 native-command words, where a backslash in `C:\Tools\Git\git.exe` stays a backslash. Variables and expression
 syntax outside that literal subset, splatting, script blocks, block comments, backtick escapes and the stop-parsing
-token fail closed and ask in every mode. The Windows interpreter handoffs and executor wrappers listed above count
-as pushes before this parsing. Bracket expressions are outside that Windows subset. A supported glob word (`*` or
+token fail closed and ask in every mode. Typographic quote delimiters and caret escapes also fail closed as pushes.
+The Windows interpreter handoffs and executor wrappers listed above count as pushes before this parsing. Bracket
+expressions are outside that Windows subset. A supported glob word (`*` or
 `?`, plus `[..]` on POSIX shells) is judged by the names it matches: on
 this computer they are listed at decision time and each must be inside the project, links
 followed; in a fenced lab sandbox each

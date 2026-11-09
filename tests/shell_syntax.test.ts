@@ -47,7 +47,11 @@ describe("shell syntax", () => {
 			"Start-Process -FilePath cmd.exe -ArgumentList @('/d','/c','g^it p^ush origin main')",
 			"start -Fi cmd.exe -Arg '/d /c g^it p^ush origin main'",
 			"saps -Path cmd.exe -Args '/d /c g^it p^ush origin main'",
+			`Start-Process -ArgumentList '"push" origin main' -FilePath git.exe`,
+			"Start-Process git -ArgumentList push,origin,main",
 			"saps cmd.exe -ArgumentList @('/d',$unreadable)",
+			"saps cmd.exe -ArgumentList ‘/c g^it p^ush origin main’",
+			"Write-Output safe^value",
 			`iex '& ("g"+"it") ("p"+"ush") origin main'`,
 			"Invoke-Expression 'git push origin main'",
 			"cmd.exe /d /c g^it p^ush origin main",
@@ -55,7 +59,8 @@ describe("shell syntax", () => {
 			"wsl git push origin main",
 			"pwsh -NoProfile -Command 'git push origin main'",
 		]) expect([command, windowsInterpreterHandoff(command)]).toEqual([command, true]);
-		for (const command of ["Write-Output safe", "Write-Output powershell", "git status", "git -e path", "cmd.exe /?", "sh script.sh", "saps cmd.exe -ArgumentList '/d /q'", "saps -Path cmd.exe -Args '/d /q'"]) expect([command, windowsInterpreterHandoff(command)]).toEqual([command, false]);
+		for (const quote of "‘’‚‛“”„") expect(windowsInterpreterHandoff(`Write-Output ${quote}safe${quote}`)).toBe(true);
+		for (const command of ["Write-Output safe", "Write-Output powershell", "git status", "git -e path", "cmd.exe /?", "sh script.sh", "saps cmd.exe -ArgumentList '/d /q'", "saps -Path cmd.exe -Args '/d /q'", "Start-Process git -ArgumentList status"]) expect([command, windowsInterpreterHandoff(command)]).toEqual([command, false]);
 	});
 
 	test("anything more than text has no plain reading", () => {
@@ -518,8 +523,29 @@ describe("round 6: containment is the boundary", () => {
 				"Start-Process -FilePath cmd.exe -ArgumentList @('/d','/c','g^it p^ush origin main')",
 				"start -Fi cmd.exe -Arg '/d /c g^it p^ush origin main'",
 				"saps -Path cmd.exe -Args '/d /c g^it p^ush origin main'",
+				`Start-Process -ArgumentList '"push" origin main' -FilePath git.exe`,
+				"Start-Process git -ArgumentList push,origin,main",
 				"saps cmd.exe -ArgumentList @('/d',$unreadable)",
 			]) {
+				expect([command, allowKeys(shell, { command }).keys[0]]).toEqual([command, "shell!push"]);
+				expect(decide(shell, { command }, workspace, full, new Set()).action).toBe("ask");
+			}
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test.skipIf(process.platform !== "win32")("typographic quotes and caret escapes ask as pushes on Windows", () => {
+		const root = realpathSync(mkdtempSync(join(tmpdir(), "el-windows-unreadable-")));
+		const workspace = new LocalWorkspace(root, "off");
+		const full = { permissions: { mode: "full", allowCommands: [] } } as unknown as LabConfig;
+		try {
+			const commands = [
+				...Array.from("‘’‚‛“”„", (quote) => `Write-Output ${quote}safe${quote}`),
+				"Write-Output safe^value",
+				"saps cmd.exe -ArgumentList ‘/c g^it p^ush origin main’",
+			];
+			for (const command of commands) {
 				expect([command, allowKeys(shell, { command }).keys[0]]).toEqual([command, "shell!push"]);
 				expect(decide(shell, { command }, workspace, full, new Set()).action).toBe("ask");
 			}
@@ -865,6 +891,51 @@ describe("round 6: containment is the boundary", () => {
 			if (quarantine) chmodSync(quarantine, 0o700);
 			chmodSync(parent, 0o700);
 			rmSync(base, { recursive: true, force: true });
+		}
+	});
+
+	test.skipIf(process.platform !== "linux" || sandboxer() !== "bubblewrap")("Linux refuses a fallback across equal-device bind mounts when rename returns EXDEV", () => {
+		const base = realpathSync(mkdtempSync(join(tmpdir(), "el-git-bind-fallback-")));
+		const projectSource = join(base, "project-source");
+		const stateSource = join(base, "state-source");
+		const project = join(base, "views", "project");
+		const state = join(base, "views", "state");
+		mkdirSync(projectSource);
+		mkdirSync(stateSource);
+		mkdirSync(project, { recursive: true });
+		mkdirSync(state);
+		try {
+			const bwrap = ["/usr/bin/bwrap", "/bin/bwrap", "/usr/local/bin/bwrap"].find(existsSync)!;
+			const module = join(import.meta.dir, "../packages/engine/src/tools/workspace.ts");
+			const script = `import { gitQuarantineFolder } from ${JSON.stringify(module)};\ntry { gitQuarantineFolder(${JSON.stringify(project)}, ${JSON.stringify(state)}); process.exit(2); } catch (error) { const message = String(error?.message ?? error); process.stdout.write(message); if (!message.includes("EXDEV")) process.exit(3); }`;
+			const ran = spawnSync(bwrap, [
+				"--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
+				"--bind", projectSource, project, "--bind", stateSource, state,
+				"--unshare-all", "--die-with-parent", "--new-session", "--", process.execPath, "-e", script,
+			], { encoding: "utf8" });
+			expect(ran.status, ran.stderr).toBe(0);
+			expect(ran.stdout).toContain("rename probe could not move into the fallback quarantine: EXDEV");
+			expect(readdirSync(projectSource)).toEqual([]);
+		} finally {
+			rmSync(base, { recursive: true, force: true });
+		}
+	});
+
+	test.skipIf(process.platform !== "linux")("ordinary writes work when the engine home is inside the project home", async () => {
+		const project = realpathSync(mkdtempSync(join(tmpdir(), "el-home-project-")));
+		const home = join(project, ".el");
+		const savedHome = process.env.EL_HOME;
+		try {
+			process.env.EL_HOME = home;
+			const workspace = new LocalWorkspace(project);
+			await workspace.write("ordinary.txt", "ok\n");
+			expect(readFileSync(join(project, "ordinary.txt"), "utf8")).toBe("ok\n");
+			expect(existsSync(join(home, "quarantine"))).toBe(false);
+			expect(existsSync(gitQuarantineMarker(project, home))).toBe(false);
+		} finally {
+			if (savedHome === undefined) delete process.env.EL_HOME;
+			else process.env.EL_HOME = savedHome;
+			rmSync(project, { recursive: true, force: true });
 		}
 	});
 

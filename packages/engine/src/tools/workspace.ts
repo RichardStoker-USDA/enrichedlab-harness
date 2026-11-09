@@ -10,7 +10,7 @@ import { homedir, tmpdir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { labHome } from "../paths.ts";
 import { expandHome, withoutSecrets } from "../util.ts";
-import { holdFolder, holdGitEntries, holdPrivateFolder, mkdirPhysical, openPhysical, type GitEntryBaseline } from "./anchored.ts";
+import { holdFolder, holdGitEntries, holdPrivateFolder, mkdirPhysical, openPhysical, proveGitQuarantineRename, type GitEntryBaseline } from "./anchored.ts";
 import { systemCommand, systemPowerShell } from "./windows_contain.ts";
 
 export interface Entry {
@@ -469,7 +469,7 @@ interface GitQuarantineRecord {
 	version: 1;
 	project: string;
 	baseline: GitEntryBaseline;
-	quarantine?: string;
+	quarantine: string;
 }
 
 const activeGitQuarantines = new Set<string>();
@@ -486,26 +486,25 @@ export function gitQuarantineFolder(root: string, home = labHome()): string {
 	return checkedGitQuarantineFolder(root, true, home)!;
 }
 
-/** File writes verify an existing quarantine even without a journal, without making one for ordinary edits. */
+function verifyGitQuarantineFolder(project: string, path: string, device: bigint, proveRename: boolean): string {
+	const held = holdPrivateFolder(path, device);
+	closeSync(held);
+	if (proveRename) proveGitQuarantineRename(project, path);
+	return path;
+}
+
+/** File writes verify an existing sibling even without a journal, without making a quarantine for ordinary edits. */
 function checkedGitQuarantineFolder(root: string, create: boolean, home = labHome()): string | undefined {
 	const project = real(root);
 	const projectStat = statSync(project, { bigint: true });
 	const id = createHash("sha256").update(`${projectStat.dev}:${projectStat.ino}`).digest("hex");
 	const sibling = dirname(project) === project ? undefined : join(dirname(project), `.enrichedlab-git-quarantine-${id}`);
 	const fallback = join(home, "quarantine", `git-${projectStat.dev}`);
-	const verify = (path: string): string => {
-		const held = holdPrivateFolder(path, projectStat.dev);
-		try {
-			return path;
-		} finally {
-			closeSync(held);
-		}
-	};
 	let siblingReason = "the sibling does not exist";
 	try {
 		if (!sibling) throw new Error("the project is a filesystem root");
 		// An existing entry is never a reason to fall back, including a dangling link or an unsafe directory.
-		if (lstatSync(sibling, { throwIfNoEntry: false })) return verify(sibling);
+		if (lstatSync(sibling, { throwIfNoEntry: false })) return verifyGitQuarantineFolder(project, sibling, projectStat.dev, false);
 		if (create) {
 			let made = false;
 			try {
@@ -513,27 +512,28 @@ function checkedGitQuarantineFolder(root: string, create: boolean, home = labHom
 				made = true;
 			} catch (error) {
 				const code = (error as NodeJS.ErrnoException).code;
-				if (code === "EEXIST") return verify(sibling);
+				if (code === "EEXIST") return verifyGitQuarantineFolder(project, sibling, projectStat.dev, false);
 				if (!["EACCES", "EPERM", "EROFS"].includes(code ?? "") || lstatSync(sibling, { throwIfNoEntry: false })) throw error;
 				siblingReason = (error as Error).message;
 			}
-			if (made) return verify(sibling);
+			if (made) return verifyGitQuarantineFolder(project, sibling, projectStat.dev, false);
 		}
 	} catch (error) {
 		throw new Error(`EnrichedLab could not verify its private .git quarantine, so no contained command ran. same-filesystem sibling: ${(error as Error).message}`);
 	}
+	// An ordinary file write with no cleanup journal has no fallback to use or verify.
+	if (!create) return undefined;
 	try {
 		if (pathAtOrBelow(fallback, project)) throw new Error("its path would be inside the project");
-		if (!create && !lstatSync(fallback, { throwIfNoEntry: false })) return undefined;
-		if (create) {
-			mkdirPhysical(dirname(fallback));
-			try {
-				mkdirSync(fallback, { mode: 0o700 });
-			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-			}
+		mkdirPhysical(dirname(fallback));
+		try {
+			mkdirSync(fallback, { mode: 0o700 });
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
 		}
-		return verify(fallback);
+		// Equal device numbers do not prove that rename works across two bind mounts. Exercise the exact direction
+		// cleanup will use, then move the empty probe back before accepting this fallback.
+		return verifyGitQuarantineFolder(project, fallback, projectStat.dev, true);
 	} catch (error) {
 		throw new Error(`EnrichedLab could not verify its private .git quarantine, so no contained command ran. same-filesystem sibling: ${siblingReason}; per-user fallback: ${(error as Error).message}`);
 	}
@@ -560,7 +560,7 @@ function readGitQuarantineRecord(file: string, project?: string): GitQuarantineR
 		&& typeof item[1] === "string"
 		&& /^\d+:\d+$/.test(item[1])
 	);
-	const validQuarantine = record.quarantine === undefined || (typeof record.quarantine === "string" && isAbsolute(record.quarantine) && typeof record.project === "string" && !pathAtOrBelow(record.quarantine, record.project));
+	const validQuarantine = typeof record.quarantine === "string" && isAbsolute(record.quarantine) && typeof record.project === "string" && !pathAtOrBelow(record.quarantine, record.project);
 	if (record.version !== 1 || typeof record.project !== "string" || !isAbsolute(record.project) || (project !== undefined && record.project !== project) || typeof record.baseline?.root !== "string" || !/^\d+:\d+$/.test(record.baseline.root) || !validEntries || !validQuarantine) {
 		throw new Error("the cleanup journal is invalid");
 	}
@@ -612,7 +612,6 @@ export interface GitRecovery {
 /** Verify quarantine and finish pending cleanup before a contained command or file write can start. */
 export function recoverGitQuarantine(root: string, home = labHome()): GitRecovery {
 	const project = real(root);
-	const checkedQuarantine = checkedGitQuarantineFolder(project, false, home);
 	let marker = gitQuarantineMarker(project, home);
 	let record: GitQuarantineRecord | undefined;
 	try {
@@ -621,10 +620,17 @@ export function recoverGitQuarantine(root: string, home = labHome()): GitRecover
 		throw new Error(`A prior contained command left .git cleanup pending for this project, but ${String((error as Error).message)}. No contained command ran.`);
 	}
 	if (activeGitQuarantines.has(marker)) throw new Error("another contained command in this project is still awaiting its final .git cleanup");
-	if (!record) return { moved: [] };
+	if (!record) {
+		checkedGitQuarantineFolder(project, false, home);
+		return { moved: [] };
+	}
 	let held: ReturnType<typeof holdGitEntries> | undefined;
 	try {
-		const quarantine = record.quarantine ?? checkedQuarantine ?? gitQuarantineFolder(project, home);
+		if (pathAtOrBelow(record.quarantine, project)) throw new Error("the recorded quarantine is now inside the project");
+		const projectStat = statSync(project, { bigint: true });
+		// A pending pass stays bound to the journaled destination and proves that destination again before touching
+		// attacker-written metadata. Mount topology may have changed since the command started.
+		const quarantine = verifyGitQuarantineFolder(project, record.quarantine, projectStat.dev, true);
 		held = holdGitEntries(project, GIT_SCAN_MAX, GIT_SCAN_DEPTH, record.baseline, quarantine);
 		const result = held.quarantine(true);
 		if (result.error) throw new Error(result.error);

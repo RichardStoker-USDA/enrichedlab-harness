@@ -8,6 +8,7 @@ import { CString, dlopen, FFIType, toArrayBuffer, type Pointer } from "bun:ffi";
 import { randomBytes } from "node:crypto";
 import { chmodSync, closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, rmdirSync, rmSync } from "node:fs";
 import { dirname, isAbsolute, join, sep } from "node:path";
+import { getSystemErrorName } from "node:util";
 
 const DARWIN_NOFOLLOW_ANY = 0x20000000;
 const DARWIN_AT_FDCWD = -2;
@@ -26,6 +27,7 @@ type Libc = {
 	readdir: (dir: Pointer) => Pointer | null;
 	closedir: (dir: Pointer) => number;
 	close: (fd: number) => number;
+	renameat: (fromDir: number, from: Buffer, toDir: number, to: Buffer) => number;
 	renameat2: (fromDir: number, from: Buffer, toDir: number, to: Buffer, flags: number) => number;
 	__errno_location: () => Pointer;
 };
@@ -45,6 +47,7 @@ function lib(): Libc {
 		closedir: { args: [FFIType.ptr], returns: FFIType.i32 },
 		close: { args: [FFIType.i32], returns: FFIType.i32 },
 		...(process.platform === "linux" ? {
+			renameat: { args: [FFIType.i32, FFIType.cstring, FFIType.i32, FFIType.cstring], returns: FFIType.i32 },
 			renameat2: { args: [FFIType.i32, FFIType.cstring, FFIType.i32, FFIType.cstring, FFIType.u32], returns: FFIType.i32 },
 			__errno_location: { args: [], returns: FFIType.ptr },
 		} : {}),
@@ -154,6 +157,75 @@ export function holdPrivateFolder(path: string, device?: bigint): number {
 		lib().close(held);
 		throw error;
 	}
+}
+
+/** Prove that a later anchored move from this project into a fallback quarantine can cross the same mount boundary. */
+export function proveGitQuarantineRename(project: string, quarantinePath: string): void {
+	if (process.platform !== "linux") throw new Error("Git quarantine rename probes are for Linux.");
+	const projectRoot = holdFolder(project);
+	const projectStat = fstatSync(projectRoot, { bigint: true });
+	const originalMode = Number(projectStat.mode & 0o7777n);
+	const changedMode = (originalMode & 0o700) !== 0o700;
+	let quarantineRoot: number;
+	try {
+		quarantineRoot = holdPrivateFolder(quarantinePath, projectStat.dev);
+	} catch (error) {
+		lib().close(projectRoot);
+		throw error;
+	}
+	const errno = new Int32Array(toArrayBuffer(lib().__errno_location(), 0, 4));
+	const reason = () => {
+		const code = errno[0];
+		try {
+			return `${getSystemErrorName(-code)} (errno ${code})`;
+		} catch {
+			return `errno ${code}`;
+		}
+	};
+	let probe = "";
+	let heldBy: number | undefined;
+	let failure: Error | undefined;
+	try {
+		// Recovery must still be possible when the contained command removed owner access from the project root.
+		if (changedMode) chmodSync(`/proc/self/fd/${projectRoot}`, originalMode | 0o700);
+		for (let attempt = 0; attempt < 8; attempt++) {
+			probe = `.enrichedlab-rename-probe-${randomBytes(12).toString("hex")}`;
+			errno[0] = 0;
+			if (lib().mkdirat(projectRoot, c(probe), 0o700) === 0) {
+				heldBy = projectRoot;
+				break;
+			}
+			if (errno[0] !== 17) throw new Error(`the rename probe could not be created in the project: ${reason()}`);
+		}
+		if (heldBy === undefined) throw new Error("the rename probe could not choose an unused name in the project");
+		errno[0] = 0;
+		if (lib().renameat(projectRoot, c(probe), quarantineRoot, c(probe)) !== 0) throw new Error(`the rename probe could not move into the fallback quarantine: ${reason()}`);
+		heldBy = quarantineRoot;
+		errno[0] = 0;
+		if (lib().renameat(quarantineRoot, c(probe), projectRoot, c(probe)) !== 0) throw new Error(`the rename probe could not move back into the project: ${reason()}`);
+		heldBy = projectRoot;
+	} catch (error) {
+		failure = error as Error;
+	} finally {
+		if (heldBy !== undefined) {
+			errno[0] = 0;
+			if (lib().unlinkat(heldBy, c(probe), AT_REMOVEDIR) !== 0) {
+				const cleanup = `the rename probe could not be removed: ${reason()}`;
+				failure = new Error(failure ? `${failure.message}; ${cleanup}` : cleanup);
+			}
+		}
+		if (changedMode) {
+			try {
+				chmodSync(`/proc/self/fd/${projectRoot}`, originalMode);
+			} catch (error) {
+				const restore = `the rename probe could not restore the project's mode: ${(error as Error).message}`;
+				failure = new Error(failure ? `${failure.message}; ${restore}` : restore);
+			}
+		}
+		lib().close(projectRoot);
+		lib().close(quarantineRoot);
+	}
+	if (failure) throw failure;
 }
 
 /**
