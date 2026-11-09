@@ -103,16 +103,17 @@ The engine's own work stays inside the same line:
   sibling app data stays hidden. The engine home is otherwise read only. The current app-data folder and an installed
   app's own `.pixi` folder are reopened only by their exact engine-owned grants after that mask. The engine makes an
   installed app's `.pixi` directory through a no-link path walk and records its device and inode. Each launch refuses
-  a link, a missing directory or a different identity. A project app's `.pixi` path is never an engine-home grant,
-  including when a project link points into the engine home. On Windows, where
+  a link, a missing directory or a different identity. Linux launchers inherit the held grant descriptors that
+  bubblewrap binds. A project app's `.pixi` path is never an engine-home grant, including when a project link points
+  into the engine home. Its ordinary write bind uses the directory identity recorded before installation. On Windows, where
   servers run as the person, the consent card says so before anything starts. A served backend needs a named network
   grant before it starts. Seatbelt limits that grant to loopback unless the manifest asks for network. Bubblewrap
   cannot provide loopback without sharing the host network, so the Linux card names that whole-network access.
 - Package installs and listings run contained with the pinned pixi, checked against its SHA-256 before each use. An
   installed app environment can write only its recorded app, environment and cache directory identities below the
   engine home. The ordinary project environment uses the same recorded-identity exception for its engine-owned
-  package cache without adding that cache to the project write grant. A listing never downloads pixi and gets no
-  network.
+  package cache without adding that cache to the project write grant. After package scripts finish, the engine checks
+  `.pixi` with `lstat` and refuses a link or a device or inode change. A listing never downloads pixi and gets no network.
 - File tools reject a `.git` component before and after following links on every platform. They also refuse every
   write to the active engine home and the trusted Git configuration paths listed above, before creating or opening
   the target and after resolving links. On macOS and Linux the final write uses the same anchored no-follow path
@@ -143,15 +144,16 @@ The engine's own work stays inside the same line:
   nested mount is refused instead of crossed, including a bind mount of the same filesystem. The pass temporarily
   adds owner access to a directory the command made inaccessible, then handles each new or replaced `.git` entry with
   a write-ahead journal. It appends the item identity, source and destination as an intent and fsyncs the journal
-  before the anchored rename. After the rename it verifies both names through the held descriptors, appends a done
-  record and fsyncs again before trying the next item. It then restores the directory's mode. It
+  before the anchored rename. After the rename it verifies both names through the held descriptors, fsyncs the source
+  and quarantine directories, appends a done record and fsyncs the journal again before trying the next item. It then restores the directory's mode. It
   reports the original path and exact quarantine path in command output. Nothing is deleted or overwritten, and
   cleanup never follows a link. A lifecycle pipe keeps final cleanup attached to background children even when they
   redirect output; the command result waits for them to end. The final pass scans again to confirm the baseline. It
   removes the cleanup record only after that scan succeeds and every intent has its done record.
 
-  Any foreground or final journal append, fsync, rename, verification or scan error returns exit 125 and leaves the
-  cleanup record in place. It does not move
+  Any foreground or final journal append, fsync, rename, verification or scan error returns exit 125. Before its final
+  scan, the final pass re-reads the journal and resumes every unfinished foreground intent. It removes the cleanup
+  record when that retry and verification succeed, and otherwise leaves the record in place. It does not move
   the project, leave its access bits changed or delete data to enforce the rule. Before any later contained command
   or local file-tool write in that project, the engine retries the anchored pass. An invalid record, a journal lookup
   or directory access error, or another failure refuses that command or write before it creates anything. Candidate
@@ -160,7 +162,8 @@ The engine's own work stays inside the same line:
   the project is renamed or reached through another physical path. The pending pass uses the quarantine recorded in
   its journal, even if a new sibling becomes available. For an intent without a done record, recovery checks the
   source and destination identities through the held descriptors. It completes a move still at its source, records a
-  move already at its destination as done, or refuses an absent, mismatched or ambiguous item.
+  move already at its destination as done, or refuses an absent, mismatched or ambiguous item. Its report is rebuilt
+  from every durable intent and matching done record, including a done record written just before an engine crash.
   With no cleanup record, an
   ordinary file write verifies an existing sibling but does not create or check a hypothetical fallback.
 
@@ -364,7 +367,8 @@ card. The saved grant key includes the effective network scope and backend, so a
 again. The build command uses `--network none` without that grant. A networkless container run uses `--pull=never`,
 so a missing image cannot trigger an unapproved pull. Building an app's pixi environment runs contained: pixi may
 write the app's recorded folder and environment identities and its recorded cache under `~/.el/tools`, never the
-person's shared package caches, and gets no keys.
+person's shared package caches, and gets no keys. After pixi exits, the engine refuses `.pixi` if it is a link or no
+longer has the device and inode recorded before package scripts ran.
 The card lists every package (conda, PyPI, other channels and indexes, and anything built from source), and a grant
 covers that exact `pixi.toml`: a change asks again. An app package is checked against its size limits before it is
 unpacked. Lab sandboxes are isolated by the lab.

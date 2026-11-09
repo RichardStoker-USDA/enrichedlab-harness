@@ -14,8 +14,9 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { basename, dirname, join } from "node:path";
-import { Client, type Transport } from "@modelcontextprotocol/client";
-import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
+import { PassThrough } from "node:stream";
+import { Client, type JSONRPCMessage, ReadBuffer, serializeMessage, type Transport } from "@modelcontextprotocol/client";
+import { StdioClientTransport, type StdioServerParameters } from "@modelcontextprotocol/client/stdio";
 import type { AppToolResult } from "@enrichedlab/protocol";
 import { contained, containedTempEnvironment, type NetworkAccess } from "../tools/workspace.ts";
 import { VERSION } from "../util.ts";
@@ -132,13 +133,155 @@ function baseEnv(manifest: AppManifest, ctx: BackendContext): Record<string, str
 	return containedTempEnvironment({ ...env, APP_NAME: manifest.name, APP_VERSION: manifest.version, APP_DATA_DIR: ctx.dataDir, ...(ctx.projectDir ? { PROJECT_DIR: ctx.projectDir } : {}) });
 }
 
-async function connectStdio(command: string, args: string[], env: Record<string, string>, cwd: string, ctx: BackendContext): Promise<McpBackend> {
-	const transport = new StdioClientTransport({ command, args, env, cwd, stderr: "pipe" });
+interface DescriptorLease {
+	readonly pass: number[];
+	retain(): void;
+	release(): void;
+}
+
+function descriptorLease(pass: number[], close: () => void): DescriptorLease {
+	let refs = 0;
+	let closed = false;
+	return {
+		pass,
+		retain: () => {
+			if (closed) throw new Error("The backend's held grant descriptors were already released.");
+			refs++;
+		},
+		release: () => {
+			if (refs > 0) refs--;
+			if (!refs && !closed) {
+				closed = true;
+				close();
+			}
+		},
+	};
+}
+
+interface HeldStdioParameters extends StdioServerParameters {
+	descriptors: DescriptorLease;
+}
+
+// Keep the SDK's stdio transport identity so its disposable version-negotiation sibling uses this constructor too.
+// Both siblings share a reference-counted descriptor lease; the session retains the held grants until it exits.
+const StdioTransportBase = StdioClientTransport as unknown as new (parameters: HeldStdioParameters) => Transport;
+class HeldStdioClientTransport extends StdioTransportBase {
+	private process?: ChildProcess;
+	private readonly readBuffer = new ReadBuffer();
+	private readonly errorStream = new PassThrough();
+	private released = false;
+
+	constructor(private readonly parameters: HeldStdioParameters) {
+		super(parameters);
+		parameters.descriptors.retain();
+	}
+
+	get stderr(): PassThrough {
+		return this.errorStream;
+	}
+
+	get pid(): number | null {
+		return this.process?.pid ?? null;
+	}
+
+	private releaseDescriptors(): void {
+		if (this.released) return;
+		this.released = true;
+		this.parameters.descriptors.release();
+	}
+
+	async start(): Promise<void> {
+		if (this.process) throw new Error("The backend transport is already running.");
+		await new Promise<void>((resolve, reject) => {
+			let child: ChildProcess;
+			try {
+				child = spawn(this.parameters.command, this.parameters.args ?? [], {
+					env: this.parameters.env,
+					cwd: this.parameters.cwd,
+					stdio: ["pipe", "pipe", this.parameters.stderr ?? "inherit", ...this.parameters.descriptors.pass],
+					shell: false,
+					windowsHide: process.platform === "win32",
+				});
+				this.process = child;
+			} catch (error) {
+				this.releaseDescriptors();
+				reject(error);
+				return;
+			}
+			child.once("spawn", resolve);
+			child.once("error", (error) => {
+				this.releaseDescriptors();
+				reject(error);
+				this.onerror?.(error);
+			});
+			child.once("close", () => {
+				if (this.process === child) this.process = undefined;
+				this.releaseDescriptors();
+				this.onclose?.();
+			});
+			child.stdin?.on("error", (error) => this.onerror?.(error));
+			child.stdout?.on("data", (chunk: Buffer) => {
+				try {
+					this.readBuffer.append(chunk);
+					for (;;) {
+						const message = this.readBuffer.readMessage();
+						if (message === null) break;
+						this.onmessage?.(message);
+					}
+				} catch (error) {
+					this.onerror?.(error as Error);
+				}
+			});
+			child.stdout?.on("error", (error) => this.onerror?.(error));
+			if (this.parameters.stderr === "pipe" && child.stderr) child.stderr.pipe(this.errorStream);
+		});
+	}
+
+	async close(): Promise<void> {
+		const child = this.process;
+		if (child && child.exitCode === null && child.signalCode === null) {
+			const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+			child.stdin?.end();
+			await Promise.race([exited, new Promise<void>((resolve) => setTimeout(resolve, 2_000).unref())]);
+			if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+			await Promise.race([exited, new Promise<void>((resolve) => setTimeout(resolve, 2_000).unref())]);
+			if (child.exitCode === null && child.signalCode === null) {
+				child.kill("SIGKILL");
+				await exited;
+			}
+		}
+		this.readBuffer.clear();
+		this.releaseDescriptors();
+	}
+
+	/** Used by the SDK only for its disposable protocol-negotiation sibling. */
+	async _dispose(): Promise<void> {
+		await this.close();
+	}
+
+	async send(message: JSONRPCMessage): Promise<void> {
+		const input = this.process?.stdin;
+		if (!input) throw new Error("The backend transport is not connected.");
+		const text = serializeMessage(message);
+		if (!input.write(text)) await new Promise<void>((resolve) => input.once("drain", resolve));
+	}
+}
+
+async function connectStdio(command: string, args: string[], env: Record<string, string>, cwd: string, ctx: BackendContext, launch: { pass?: number[]; release?: () => void } = {}): Promise<McpBackend> {
+	const parameters = { command, args, env, cwd, stderr: "pipe" as const };
+	const transport = launch.pass?.length || launch.release
+		? new HeldStdioClientTransport({ ...parameters, descriptors: descriptorLease([...(launch.pass ?? [])], launch.release ?? (() => undefined)) })
+		: new StdioClientTransport(parameters);
 	const stderr = transport.stderr;
-	stderr?.on("data", (chunk: Buffer) => {
+	(stderr as NodeJS.ReadableStream | null)?.on("data", (chunk: Buffer) => {
 		for (const line of chunk.toString("utf8").split("\n")) if (line.trim()) ctx.log(line);
 	});
-	return connectTransport(transport);
+	try {
+		return await connectTransport(transport);
+	} catch (error) {
+		await transport.close().catch(() => undefined);
+		throw error;
+	}
 }
 
 /** The MCP `_meta` key that names the calling session's project folder. */
@@ -321,7 +464,7 @@ export async function startBackend(manifest: AppManifest, ctx: BackendContext): 
 			const runner = runnerPath(ctx.runDir);
 			const launch = contained(process.execPath, [runner, join(ctx.dir, backend.main)], { writable: [ctx.dataDir], readable: [runner, ctx.dir], network, server: true, appData });
 			uncontainedOk(launch);
-			return connectStdio(launch.file, launch.args, { ...env, BUN_BE_BUN: "1", NO_COLOR: "1" }, ctx.dir, ctx);
+			return connectStdio(launch.file, launch.args, { ...env, BUN_BE_BUN: "1", NO_COLOR: "1" }, ctx.dir, ctx, launch);
 		}
 		case "command": {
 			const environment = hasEnvironment(ctx.dir) ? await inEnvironment(ctx.dir, backend.command, ctx.toolsDir, ctx.log, ctx.engineOwned === true) : undefined;
@@ -334,10 +477,12 @@ export async function startBackend(manifest: AppManifest, ctx: BackendContext): 
 				network,
 				server: true,
 				appData,
+				exact: environment !== undefined,
+				...(environment?.writeIdentity ? { writeIdentities: [environment.writeIdentity] } : {}),
 				...(environment?.engineWrite ? { engineWrite: [environment.engineWrite] } : {}),
 			});
 			uncontainedOk(launch);
-			return connectStdio(launch.file, launch.args, env, ctx.dir, ctx);
+			return connectStdio(launch.file, launch.args, env, ctx.dir, ctx, launch);
 		}
 		case "container": {
 			const runtime = containerRuntime();
@@ -387,19 +532,54 @@ export async function startBackend(manifest: AppManifest, ctx: BackendContext): 
 				network: servedBackendNetwork(ctx.network, ctx.serveNetwork === true),
 				server: true,
 				appData,
+				exact: environment !== undefined,
+				...(environment?.writeIdentity ? { writeIdentities: [environment.writeIdentity] } : {}),
 				...(environment?.engineWrite ? { engineWrite: [environment.engineWrite] } : {}),
 			});
 			uncontainedOk(launch);
-			const proc = spawn(launch.file, launch.args, { cwd: ctx.dir, env: { ...env, PORT: String(port), HOST: "127.0.0.1" }, stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" });
+			let released = false;
+			const release = () => {
+				if (released) return;
+				released = true;
+				launch.release?.();
+			};
+			let proc: ChildProcess;
+			try {
+				proc = spawn(launch.file, launch.args, {
+					cwd: ctx.dir,
+					env: { ...env, PORT: String(port), HOST: "127.0.0.1" },
+					stdio: ["ignore", "pipe", "pipe", ...(launch.pass ?? [])],
+					detached: process.platform !== "win32",
+				});
+			} catch (error) {
+				release();
+				throw error;
+			}
+			proc.once("error", release);
+			proc.once("exit", release);
 			for (const stream of [proc.stdout, proc.stderr]) stream?.on("data", (chunk: Buffer) => chunk.toString("utf8").split("\n").forEach((line) => line.trim() && ctx.log(line)));
 			const url = `http://127.0.0.1:${port}${backend.path ?? "/"}`;
 			try {
 				await waitForPort(url, proc, 90_000);
 			} catch (error) {
-				await stop(proc);
+				try {
+					await stop(proc);
+				} finally {
+					release();
+				}
 				throw error;
 			}
-			return { kind: "serve", url, close: () => stop(proc) };
+			return {
+				kind: "serve",
+				url,
+				close: async () => {
+					try {
+						await stop(proc);
+					} finally {
+						release();
+					}
+				},
+			};
 		}
 	}
 }

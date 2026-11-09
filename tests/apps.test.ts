@@ -9,6 +9,7 @@ import { containerBuildNetworkArgs, containerPullArgs, servedBackendNetwork, sta
 import { permissionKey, readManifest } from "../packages/engine/src/apps/manifest.ts";
 import { installApp, packApp } from "../packages/engine/src/apps/package.ts";
 import { templateFiles } from "../packages/engine/src/apps/templates.ts";
+import { RUNNER_SOURCE } from "../packages/engine/src/apps/runner.ts";
 import { paths } from "../packages/engine/src/paths.ts";
 import { contained, LocalWorkspace, sandboxer } from "../packages/engine/src/tools/workspace.ts";
 
@@ -139,6 +140,48 @@ describe("app host", () => {
 			if (savedHome === undefined) delete process.env.EL_HOME;
 			else process.env.EL_HOME = savedHome;
 		}
+	}, 60_000);
+
+	test.skipIf(process.platform !== "linux" || sandboxer() !== "bubblewrap")("a Linux command backend receives its held engine grant descriptors", () => {
+		const home = scratch("linux-command-grant-home");
+		const app = join(home, "apps", "grant-backend");
+		const environment = join(app, ".pixi");
+		const runner = join(app, "runner.mjs");
+		const main = join(app, "main.mjs");
+		mkdirSync(environment, { recursive: true });
+		writeFileSync(join(app, "app.json"), JSON.stringify({ name: "grant-backend", version: "1.0.0", backend: { runtime: "command", command: ["unused"] } }));
+		writeFileSync(join(app, "index.html"), "<!doctype html><title>Grant backend</title>");
+		writeFileSync(runner, RUNNER_SOURCE);
+		writeFileSync(main, `import { writeFileSync } from "node:fs";
+import { join } from "node:path";
+export const tools = { prove: { input: { type: "object", properties: {} }, run() { writeFileSync(join(import.meta.dir, ".pixi", "proof"), "held"); return { text: "ok", data: { held: true } }; } } };\n`);
+		const environmentsModule = join(import.meta.dir, "../packages/engine/src/apps/environments.ts");
+		const backendsModule = join(import.meta.dir, "../packages/engine/src/apps/backends.ts");
+		const manifestModule = join(import.meta.dir, "../packages/engine/src/apps/manifest.ts");
+		const workspaceModule = join(import.meta.dir, "../packages/engine/src/tools/workspace.ts");
+		const script = `import { mock } from "bun:test";
+const { createEngineWriteGrant } = await import(${JSON.stringify(workspaceModule)});
+const grant = createEngineWriteGrant(${JSON.stringify(environment)});
+mock.module(${JSON.stringify(environmentsModule)}, () => ({
+	hasEnvironment: () => true,
+	inEnvironment: async () => ({ command: [process.execPath, ${JSON.stringify(runner)}, ${JSON.stringify(main)}], engineWrite: grant }),
+}));
+const { startBackend } = await import(${JSON.stringify(backendsModule)});
+const { readManifest } = await import(${JSON.stringify(manifestModule)});
+let backend;
+try {
+	backend = await startBackend(readManifest(${JSON.stringify(app)}), {
+		dir: ${JSON.stringify(app)}, engineOwned: true, dataDir: ${JSON.stringify(join(home, "app-data", "grant-backend"))},
+		runDir: ${JSON.stringify(join(home, "runtime"))}, toolsDir: ${JSON.stringify(join(home, "tools"))}, network: false, log: () => undefined,
+	});
+	if (backend.kind !== "mcp") throw new Error("expected MCP backend");
+	const result = await backend.call("prove", {});
+	process.stdout.write(JSON.stringify(result.structuredContent));
+} finally { await backend?.close(); }`;
+		const ran = Bun.spawnSync([process.execPath, "-e", script], { env: { ...process.env, HOME: home, EL_HOME: home }, stdout: "pipe", stderr: "pipe", timeout: 30_000 });
+		expect(ran.exitCode, ran.stderr.toString() || ran.stdout.toString()).toBe(0);
+		expect(JSON.parse(ran.stdout.toString())).toEqual({ held: true });
+		expect(readFileSync(join(environment, "proof"), "utf8")).toBe("held");
 	}, 60_000);
 
 	test("a data app: consent, serving with CSP, a real Bun backend, and lab_ tools within permissions", async () => {

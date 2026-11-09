@@ -3,11 +3,11 @@
 
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { chmodSync, chownSync, closeSync, constants, existsSync, linkSync, lstatSync, mkdirSync, readdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, chownSync, closeSync, constants, existsSync, fsyncSync, linkSync, lstatSync, mkdirSync, readdirSync, mkdtempSync, openSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import type { LabConfig } from "../packages/engine/src/config.ts";
-import { inEnvironment } from "../packages/engine/src/apps/environments.ts";
+import { inEnvironment, type EnvironmentInstaller } from "../packages/engine/src/apps/environments.ts";
 import { allowKeys, decide, HIDDEN_REASON, PUSH_REASON, windowsInterpreterHandoff } from "../packages/engine/src/permissions.ts";
 import { restoreSnapshot, snapshot } from "../packages/engine/src/git.ts";
 import { holdGitEntries, mkdirPhysical, openPhysical, removeEmptyTreePhysical, unlinkPhysical } from "../packages/engine/src/tools/anchored.ts";
@@ -816,6 +816,75 @@ describe("round 6: containment is the boundary", () => {
 		}
 	});
 
+	test.skipIf(process.platform !== "linux")("recovery reports a move whose done record was fsynced before the result was returned", () => {
+		const base = realpathSync(mkdtempSync(join(tmpdir(), "el-git-done-recovery-")));
+		const project = join(base, "project");
+		const home = join(base, "state");
+		mkdirSync(project);
+		let held: ReturnType<typeof holdGitEntries> | undefined;
+		try {
+			const quarantine = gitQuarantineFolder(project, home);
+			held = holdGitEntries(project, 50_000, 64, undefined, quarantine);
+			const marker = gitQuarantineMarker(project, home);
+			mkdirSync(dirname(marker), { recursive: true, mode: 0o700 });
+			writeFileSync(marker, `${JSON.stringify({ version: 2, project, baseline: held.baseline, quarantine })}\n`, { mode: 0o600 });
+			mkdirSync(join(project, ".git"));
+			writeFileSync(join(project, ".git", "config"), "survives\n");
+			const append = (event: Record<string, unknown>) => {
+				const fd = openSync(marker, constants.O_WRONLY | constants.O_APPEND);
+				try {
+					writeSync(fd, `${JSON.stringify(event)}\n`);
+					fsyncSync(fd);
+				} finally {
+					closeSync(fd);
+				}
+			};
+			const result = held.quarantine(true, {
+				intent: (move) => append({ event: "intent", ...move }),
+				done: (move) => {
+					append({ event: "done", ...move });
+					throw new Error("simulated crash after done fsync");
+				},
+			});
+			expect(result.moved).toEqual([]);
+			expect(result.error).toContain("simulated crash");
+			held.release();
+			held = undefined;
+
+			const recovered = recoverGitQuarantine(project, home);
+			expect(recovered.moved).toHaveLength(1);
+			expect(recovered.moved[0]!.from).toBe(".git");
+			expect(readFileSync(join(recovered.moved[0]!.to, "config"), "utf8")).toBe("survives\n");
+			expect(existsSync(marker)).toBe(false);
+		} finally {
+			held?.release();
+			rmSync(base, { recursive: true, force: true });
+		}
+	});
+
+	test.skipIf(process.platform !== "linux")("quarantine fsyncs both rename directories before recording done", () => {
+		const base = realpathSync(mkdtempSync(join(tmpdir(), "el-git-directory-fsync-")));
+		const project = join(base, "project");
+		const quarantine = join(base, "quarantine");
+		mkdirSync(project);
+		const order: string[] = [];
+		const held = holdGitEntries(project, 50_000, 64, undefined, quarantine, {
+			directoryFsynced: (directory) => order.push(directory),
+		});
+		try {
+			mkdirSync(join(project, ".git"));
+			const result = held.quarantine(true, {
+				intent: () => order.push("intent"),
+				done: () => order.push("done"),
+			});
+			expect(result.error).toBeUndefined();
+			expect(order).toEqual(["intent", "source", "quarantine", "done"]);
+		} finally {
+			held.release();
+			rmSync(base, { recursive: true, force: true });
+		}
+	});
+
 	test.skipIf(process.platform !== "linux" || process.getuid?.() === 0 || sandboxer() !== "bubblewrap")("a foreground journal append failure blocks the command and later project writes", async () => {
 		const base = realpathSync(mkdtempSync(join(tmpdir(), "el-git-foreground-journal-")));
 		const project = join(base, "project");
@@ -854,6 +923,51 @@ describe("round 6: containment is the boundary", () => {
 			rmSync(base, { recursive: true, force: true });
 		}
 	}, 15_000);
+
+	test.skipIf(process.platform !== "linux" || process.getuid?.() === 0 || sandboxer() !== "bubblewrap")("the final pass resumes every intent after a transient foreground fsync failure", () => {
+		const base = realpathSync(mkdtempSync(join(tmpdir(), "el-git-final-retry-")));
+		const project = join(base, "project");
+		const home = join(base, "state");
+		mkdirSync(project);
+		try {
+			const marker = gitQuarantineMarker(project, home);
+			const workspaceModule = join(import.meta.dir, "../packages/engine/src/tools/workspace.ts");
+			const script = `import { mock } from "bun:test";
+import * as fs from "node:fs";
+const fsync = fs.fsyncSync;
+let failed = false;
+mock.module("node:fs", () => ({ ...fs, fsyncSync(fd) {
+	let path = "";
+	try { path = fs.readlinkSync("/proc/self/fd/" + fd); } catch {}
+	if (!failed && path === ${JSON.stringify(marker)}) {
+		const text = fs.readFileSync(${JSON.stringify(marker)}, "utf8");
+		if (text.includes('"event":"intent"') && !text.includes('"event":"done"')) {
+			failed = true;
+			throw Object.assign(new Error("EIO: injected foreground fsync failure"), { code: "EIO" });
+		}
+	}
+	return fsync(fd);
+} }));
+const { gitQuarantineFolder, LocalWorkspace } = await import(${JSON.stringify(workspaceModule)});
+const project = ${JSON.stringify(project)};
+const home = ${JSON.stringify(home)};
+const workspace = new LocalWorkspace(project, "workspace");
+const command = await workspace.exec("mkdir -p a/.git b/.git; printf a > a/.git/config; printf b > b/.git/config", { timeoutMs: 10_000, signal: AbortSignal.timeout(10_000) });
+let write = "";
+try { await workspace.write("after.txt", "ok"); write = "ok"; } catch (error) { write = String(error?.message ?? error); }
+const quarantine = gitQuarantineFolder(project, home);
+process.stdout.write(JSON.stringify({ failed, exitCode: command.exitCode, output: command.output, marker: fs.existsSync(${JSON.stringify(marker)}), a: fs.existsSync(project + "/a/.git"), b: fs.existsSync(project + "/b/.git"), quarantined: fs.readdirSync(quarantine).length, write }));`;
+			const ran = spawnSync(process.execPath, ["-e", script], { encoding: "utf8", env: { ...process.env, HOME: home, EL_HOME: home } });
+			expect(ran.status, ran.stderr || ran.stdout).toBe(0);
+			const result = JSON.parse(ran.stdout) as { failed: boolean; exitCode: number; output: string; marker: boolean; a: boolean; b: boolean; quarantined: number; write: string };
+			expect(result.failed).toBe(true);
+			expect(result.exitCode).toBe(125);
+			expect(result.output).toContain("foreground process exited");
+			expect(result).toMatchObject({ marker: false, a: false, b: false, quarantined: 2, write: "ok" });
+		} finally {
+			rmSync(base, { recursive: true, force: true });
+		}
+	}, 20_000);
 
 	test.skipIf(process.platform !== "linux")("Linux refuses existing .git links and final quarantine survives hostile modes", () => {
 		const base = realpathSync(mkdtempSync(join(tmpdir(), "el-git-hostile-")));
@@ -1394,6 +1508,45 @@ try { recoverGitQuarantine(${JSON.stringify(project)}, ${JSON.stringify(home)});
 		} finally {
 			if (savedHome === undefined) delete process.env.EL_HOME;
 			else process.env.EL_HOME = savedHome;
+			rmSync(base, { recursive: true, force: true });
+		}
+	});
+
+	test.skipIf(process.platform === "win32" || sandboxer() === undefined)("app package scripts cannot replace the recorded .pixi directory", async () => {
+		const base = realpathSync(mkdtempSync(join(tmpdir(), "el-pixi-install-identity-")));
+		const state = join(base, "state");
+		const home = join(base, "home");
+		const target = join(base, "target");
+		const savedHome = process.env.HOME;
+		const savedState = process.env.EL_HOME;
+		mkdirSync(home);
+		mkdirSync(target);
+		try {
+			process.env.HOME = home;
+			process.env.EL_HOME = state;
+			for (const replacement of ["link", "directory"] as const) {
+				const app = join(base, `app-${replacement}`);
+				const recorded = join(app, "recorded_environment");
+				mkdirSync(app);
+				writeFileSync(join(app, "pixi.toml"), "[workspace]\nname = \"test\"\nchannels = []\nplatforms = []\n");
+				const installer: EnvironmentInstaller = {
+					program: async () => "/bin/true",
+					run: async () => {
+						renameSync(join(app, ".pixi"), recorded);
+						if (replacement === "link") symlinkSync(target, join(app, ".pixi"));
+						else mkdirSync(join(app, ".pixi"));
+						return 0;
+					},
+				};
+				await expect(inEnvironment(app, ["true"], join(state, "tools"), () => undefined, false, installer)).rejects.toThrow("became a link or changed identity");
+				if (replacement === "link") expect(lstatSync(join(app, ".pixi")).isSymbolicLink()).toBe(true);
+				else expect(lstatSync(join(app, ".pixi"), { bigint: true }).ino).not.toBe(lstatSync(recorded, { bigint: true }).ino);
+			}
+		} finally {
+			if (savedHome === undefined) delete process.env.HOME;
+			else process.env.HOME = savedHome;
+			if (savedState === undefined) delete process.env.EL_HOME;
+			else process.env.EL_HOME = savedState;
 			rmSync(base, { recursive: true, force: true });
 		}
 	});

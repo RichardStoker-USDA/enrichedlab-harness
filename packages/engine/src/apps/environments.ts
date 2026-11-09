@@ -6,7 +6,7 @@
 import { createHash } from "node:crypto";
 import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { contained, containedTempEnvironment, createEngineWriteGrantIfEligible, type EngineWriteGrant, physical, safeTemp } from "../tools/workspace.ts";
+import { contained, containedTempEnvironment, createEngineWriteGrantIfEligible, type EngineWriteGrant, physical, safeTemp, type WriteDirectoryIdentity } from "../tools/workspace.ts";
 
 export const PIXI_VERSION = "0.82.0";
 
@@ -76,9 +76,35 @@ export interface EnvironmentCommand {
 	command: string[];
 	/** Present only for an environment the engine created under its own home. */
 	engineWrite?: EngineWriteGrant;
+	/** Present for a project environment whose directory identity the engine recorded before installation. */
+	writeIdentity?: WriteDirectoryIdentity;
 }
 
-export async function inEnvironment(dir: string, command: string[], tools: string, log: (line: string) => void, engineOwned = false): Promise<EnvironmentCommand> {
+interface EnvironmentInstallLaunch {
+	file: string;
+	args: string[];
+	pass?: number[];
+}
+
+/** Narrow executor seam around the untrusted installer process. */
+export interface EnvironmentInstaller {
+	program(tools: string, log: (line: string) => void): Promise<string>;
+	run(launch: EnvironmentInstallLaunch, env: Record<string, string>, log: (line: string) => void): Promise<number | null>;
+}
+
+const defaultEnvironmentInstaller: EnvironmentInstaller = {
+	program: pixi,
+	async run(launch, env, log) {
+		const install = Bun.spawn([launch.file, ...launch.args], { cwd: safeTemp(), stdio: ["ignore", "pipe", "pipe", ...(launch.pass ?? [])], env });
+		const lines = async (stream: ReadableStream<Uint8Array>) => {
+			for await (const chunk of stream) for (const line of new TextDecoder().decode(chunk).split(/\r|\n/)) if (line.trim()) log(line.trim());
+		};
+		await Promise.all([lines(install.stdout as ReadableStream<Uint8Array>), lines(install.stderr as ReadableStream<Uint8Array>), install.exited]);
+		return install.exitCode;
+	},
+};
+
+export async function inEnvironment(dir: string, command: string[], tools: string, log: (line: string) => void, engineOwned = false, installer: EnvironmentInstaller = defaultEnvironmentInstaller): Promise<EnvironmentCommand> {
 	// The app's own folder, where it really is, holding its own manifest: not a link to somewhere else.
 	const home = physical(dir);
 	if (lstatSync(dir, { throwIfNoEntry: false })?.isSymbolicLink() || !statSync(home, { throwIfNoEntry: false })?.isDirectory()) throw new Error("The app's folder is a link or missing, so its environment wasn't built.");
@@ -92,11 +118,22 @@ export async function inEnvironment(dir: string, command: string[], tools: strin
 	const cacheGrant = createEngineWriteGrantIfEligible(caches);
 	if (!cacheGrant) mkdirSync(caches, { recursive: true });
 	const environmentGrant = engineOwned ? createEngineWriteGrantIfEligible(environmentPath) : undefined;
+	if (!engineOwned) {
+		try {
+			mkdirSync(environmentPath, { mode: 0o700 });
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+		}
+	}
+	const environmentEntry = lstatSync(environmentPath, { bigint: true, throwIfNoEntry: false });
+	if (!environmentEntry?.isDirectory() || environmentEntry.isSymbolicLink()) throw new Error("The app's .pixi is not a real directory, so its environment wasn't built.");
+	const writeIdentity: WriteDirectoryIdentity = { path: environmentPath, dev: String(environmentEntry.dev), ino: String(environmentEntry.ino) };
+	if (environmentGrant && (environmentGrant.dev !== writeIdentity.dev || environmentGrant.ino !== writeIdentity.ino)) throw new Error("The app's .pixi changed while its identity was recorded, so its environment wasn't built.");
 	// An installed app's root is also engine-created. Pixi may update pixi.lock there during the install, but the
 	// backend later receives only the recorded .pixi identity.
 	const appGrant = engineOwned ? createEngineWriteGrantIfEligible(home) : undefined;
 	if (engineOwned && (!appGrant || !environmentGrant)) throw new Error("The installed app is not held below the engine home, so its environment wasn't built.");
-	const program = await pixi(tools, log);
+	const program = await installer.program(tools, log);
 	const inherited: Record<string, string> = { PIXI_NO_PATH_UPDATE: "1", PIXI_CACHE_DIR: caches, PIXI_HOME: caches };
 	for (const key of ["PATH", "HOME", "LANG", "LC_ALL", "SYSTEMROOT", "SSL_CERT_FILE", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY"]) if (process.env[key]) inherited[key] = process.env[key]!;
 	const env = containedTempEnvironment(inherited);
@@ -111,18 +148,21 @@ export async function inEnvironment(dir: string, command: string[], tools: strin
 	if (!launch.facility) throw new Error("This computer has no sandbox to contain the app's install (Seatbelt on macOS, bubblewrap on Linux), so nothing was installed.");
 	// From a scratch folder: some packages' install scripts write test files where they run, and the app's folder
 	// is watched for edits.
-	let install: ReturnType<typeof Bun.spawn>;
+	let exitCode: number | null;
 	try {
-		install = Bun.spawn([launch.file, ...launch.args], { cwd: safeTemp(), stdio: ["ignore", "pipe", "pipe", ...(launch.pass ?? [])], env });
-		const lines = async (stream: ReadableStream<Uint8Array>) => {
-			for await (const chunk of stream) for (const line of new TextDecoder().decode(chunk).split(/\r|\n/)) if (line.trim()) log(line.trim());
-		};
-		await Promise.all([lines(install.stdout as ReadableStream<Uint8Array>), lines(install.stderr as ReadableStream<Uint8Array>), install.exited]);
+		exitCode = await installer.run(launch, env, log);
 	} finally {
 		launch.release?.();
 	}
-	if (install.exitCode !== 0) throw new Error(`Building the app's environment failed; the app's log has pixi's output.`);
-	return { command: [program, "run", "--manifest-path", manifest, "--frozen", "--", ...command], ...(environmentGrant ? { engineWrite: environmentGrant } : {}) };
+	const installedEnvironment = lstatSync(environmentPath, { bigint: true, throwIfNoEntry: false });
+	if (!installedEnvironment?.isDirectory() || installedEnvironment.isSymbolicLink() || String(installedEnvironment.dev) !== writeIdentity.dev || String(installedEnvironment.ino) !== writeIdentity.ino) {
+		throw new Error("The app's .pixi became a link or changed identity while package scripts ran, so the environment was refused.");
+	}
+	if (exitCode !== 0) throw new Error(`Building the app's environment failed; the app's log has pixi's output.`);
+	return {
+		command: [program, "run", "--manifest-path", manifest, "--frozen", "--", ...command],
+		...(environmentGrant ? { engineWrite: environmentGrant } : { writeIdentity }),
+	};
 }
 
 /** What an environment would install, for the consent card, and a digest of its manifest for the grant. */

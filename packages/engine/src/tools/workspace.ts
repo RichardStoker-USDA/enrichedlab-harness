@@ -330,12 +330,15 @@ function trustedWritePath(path: string): string | undefined {
 	return trustedWritePaths().find((blocked) => targets.some((target) => pathAtOrBelow(target, foldedPath(blocked))));
 }
 
-/** An engine-created directory identity. A contained caller cannot turn a project path into this grant. */
-export interface EngineWriteGrant {
+/** A directory identity recorded before untrusted code runs. */
+export interface WriteDirectoryIdentity {
 	readonly path: string;
 	readonly dev: string;
 	readonly ino: string;
 }
+
+/** An engine-created directory identity. A contained caller cannot turn a project path into this grant. */
+export interface EngineWriteGrant extends WriteDirectoryIdentity {}
 
 const namedEngineHome = () => resolve(labHome());
 
@@ -379,6 +382,24 @@ function holdEngineWriteGrant(grant: EngineWriteGrant): number {
 	try {
 		const held = fstatSync(fd, { bigint: true });
 		if (!held.isDirectory() || String(held.dev) !== grant.dev || String(held.ino) !== grant.ino) throw new Error("An engine-owned write destination changed while it was opened, so nothing ran.");
+		return fd;
+	} catch (error) {
+		closeSync(fd);
+		throw error;
+	}
+}
+
+function holdWriteDirectory(identity: WriteDirectoryIdentity): number {
+	const path = resolve(identity.path);
+	if (path !== identity.path) throw new Error("A recorded write directory must use its absolute normalized path.");
+	const entry = lstatSync(path, { bigint: true, throwIfNoEntry: false });
+	if (!entry?.isDirectory() || entry.isSymbolicLink() || String(entry.dev) !== identity.dev || String(entry.ino) !== identity.ino) {
+		throw new Error("A recorded write directory is a link, missing, or no longer has its recorded identity, so nothing ran.");
+	}
+	const fd = openPhysical(path, constants.O_RDONLY | constants.O_DIRECTORY);
+	try {
+		const held = fstatSync(fd, { bigint: true });
+		if (!held.isDirectory() || String(held.dev) !== identity.dev || String(held.ino) !== identity.ino) throw new Error("A recorded write directory changed while it was opened, so nothing ran.");
 		return fd;
 	} catch (error) {
 		closeSync(fd);
@@ -473,13 +494,23 @@ function seatbeltProfile(writable: string[], network: NetworkAccess, readable: s
  * what is granted is that checked folder itself (bubblewrap binds a handle opened without following links, not the
  * name, so a link swapped in afterwards grants nothing; Seatbelt judges the real path of every write). The caller
  * hands `pass` to the program as its file descriptors 3, 4, ... (after stdin, stdout, stderr) and calls `release`
- * once it has exited. `protect`: paths inside the writable ones that stay read only (a
+ * once it has exited. `writeIdentities` binds ordinary writable directories from identities recorded before
+ * untrusted setup code ran; unlike `engineWrite`, these do not bypass private-path masks. `protect`: paths inside the writable ones that stay read only (a
  * repository's settings and hooks). `engineWrite` carries recorded identities for narrow engine-created app or
  * installer directories that may be reopened after the engine-home deny rule.
  */
-export function contained(file: string, args: string[], options: { writable: string[]; network: NetworkAccess; readable?: string[]; server?: boolean; temp?: boolean; exact?: boolean; protect?: string[]; protectPatterns?: string[]; waitForChildren?: boolean; appData?: { root: string; current: string }; engineWrite?: EngineWriteGrant[]; hidden?: string[] }): { file: string; args: string[]; facility?: Facility; pass?: number[]; release?: () => void; syncFd?: number } {
+export function contained(file: string, args: string[], options: { writable: string[]; network: NetworkAccess; readable?: string[]; server?: boolean; temp?: boolean; exact?: boolean; writeIdentities?: WriteDirectoryIdentity[]; protect?: string[]; protectPatterns?: string[]; waitForChildren?: boolean; appData?: { root: string; current: string }; engineWrite?: EngineWriteGrant[]; hidden?: string[] }): { file: string; args: string[]; facility?: Facility; pass?: number[]; release?: () => void; syncFd?: number } {
 	// Each path resolved once: the check and the grant are the same answer.
 	const resolved = options.writable.map(real);
+	const namedWritable = options.writable.map((path) => resolve(path));
+	const writeIdentities = [...(options.writeIdentities ?? [])].filter((identity, index, all) => all.findIndex((other) => other.path === identity.path && other.dev === identity.dev && other.ino === identity.ino) === index);
+	const checkedWriteIdentities = writeIdentities.map((identity) => {
+		if (!namedWritable.includes(identity.path)) throw new Error("A recorded write directory must also be an ordinary writable directory.");
+		const fd = holdWriteDirectory(identity);
+		closeSync(fd);
+		return identity;
+	});
+	const writeIdentityByPath = new Map(checkedWriteIdentities.map((identity) => [identity.path, identity]));
 	let appData: string | undefined;
 	if (options.appData) {
 		const root = real(options.appData.root);
@@ -531,8 +562,9 @@ export function contained(file: string, args: string[], options: { writable: str
 	// An exact folder is bound from a handle on the checked folder, passed to bubblewrap as an open file descriptor
 	// (--bind-fd), so it can't follow a link put in its place after the check.
 	const bind = (p: string) => {
-		if (!options.exact || !resolved.includes(p)) return ["--bind", p, p];
-		held.push(holdFolder(p));
+		const identity = writeIdentityByPath.get(p);
+		if (!identity && (!options.exact || !resolved.includes(p))) return ["--bind", p, p];
+		held.push(identity ? holdWriteDirectory(identity) : holdFolder(p));
 		return ["--bind-fd", String(2 + held.length), p];
 	};
 	let binds: string[];
@@ -766,6 +798,15 @@ function pendingGitQuarantineIntents(record: GitQuarantineRecord): GitQuarantine
 	return record.intents.filter((move) => !done.has(quarantineMoveKey(move)));
 }
 
+/** Every completed move represented by the durable journal, including imported version 1 moves. */
+function completedGitQuarantineMoves(record: GitQuarantineRecord): GitQuarantineResult["moved"] {
+	const done = new Set(record.done.map(quarantineMoveKey));
+	return [
+		...(record.moved ?? []),
+		...record.intents.filter((move) => done.has(quarantineMoveKey(move))).map(({ from, to }) => ({ from, to })),
+	];
+}
+
 /** Verify quarantine and finish pending cleanup before a contained command or file write can start. */
 export function recoverGitQuarantine(root: string, home = labHome()): GitRecovery {
 	const project = real(root);
@@ -789,20 +830,21 @@ export function recoverGitQuarantine(root: string, home = labHome()): GitRecover
 		// A pending pass stays bound to the journaled destination. Every real rename is the cross-mount proof.
 		const quarantine = verifyGitQuarantineFolder(record.quarantine, projectStat.dev);
 		held = holdGitEntries(project, GIT_SCAN_MAX, GIT_SCAN_DEPTH, record.baseline, quarantine);
-		const prior = [...(record.moved ?? [])];
-		for (const move of pendingGitQuarantineIntents(record)) {
+		const pending = new Set(pendingGitQuarantineIntents(record).map(quarantineMoveKey));
+		for (const move of record.intents) {
+			// Done records are checked too. Recovery never reports a mapping without reconciling its held identities.
 			held.recover(move);
-			appendGitQuarantineEvent(marker, record, { event: "done", ...move });
-			prior.push({ from: move.from, to: move.to });
+			if (pending.has(quarantineMoveKey(move))) appendGitQuarantineEvent(marker, record, { event: "done", ...move });
 		}
 		const journal = gitQuarantineJournal(marker, record);
 		const result = held.quarantine(true, journal);
 		if (result.error) throw new Error(result.error);
 		const verified = readGitQuarantineRecord(marker, record.project);
 		if (!verified || pendingGitQuarantineIntents(verified).length) throw new Error("the cleanup journal still has an intent without a done record");
+		const moved = completedGitQuarantineMoves(verified);
 		const removeError = removeGitQuarantineMarker(marker);
 		if (removeError) throw new Error(removeError);
-		return { moved: [...prior, ...result.moved] };
+		return { moved };
 	} catch (error) {
 		throw new Error(`A prior contained command left .git cleanup pending for this project. EnrichedLab retried the anchored quarantine before this launch, but it could not finish: ${(error as Error).message} No contained command ran.`);
 	} finally {
@@ -905,7 +947,7 @@ function guardedGitEntries(root: string, home = labHome()): ReturnType<typeof ho
 	const recovered = recoverGitQuarantine(project, home);
 	const quarantine = gitQuarantineFolder(project, home);
 	const held = holdGitEntries(project, GIT_SCAN_MAX, GIT_SCAN_DEPTH, undefined, quarantine);
-	const record: GitQuarantineRecord = { version: 2, project, baseline: held.baseline, quarantine, intents: [], done: [] };
+	let record: GitQuarantineRecord = { version: 2, project, baseline: held.baseline, quarantine, intents: [], done: [] };
 	try {
 		writeGitQuarantineRecord(marker, record);
 		activeGitQuarantines.add(marker);
@@ -914,26 +956,51 @@ function guardedGitEntries(root: string, home = labHome()): ReturnType<typeof ho
 		throw new Error(`EnrichedLab could not record the required .git cleanup state, so no contained command ran: ${(error as Error).message}`);
 	}
 	let final = false;
-	let failed: string | undefined;
+	const reported = new Set<string>();
+	const unreported = (moves: GitQuarantineResult["moved"]) => moves.filter((move) => {
+		if (reported.has(move.to)) return false;
+		reported.add(move.to);
+		return true;
+	});
 	return {
 		...held,
 		recovered,
 		quarantine(isFinal = true) {
+			if (isFinal && final) return { moved: [] };
+			if (isFinal) {
+				// A foreground append or fsync can leave an intent durable without changing the in-memory record.
+				// Re-read and finish every such intent before a scan can allocate another destination for the item.
+				try {
+					const persisted = readGitQuarantineRecord(marker, project);
+					if (!persisted) throw new Error("the cleanup journal disappeared before the final pass");
+					record = persisted;
+					for (const move of pendingGitQuarantineIntents(record)) {
+						held.recover(move);
+						appendGitQuarantineEvent(marker, record, { event: "done", ...move });
+					}
+				} catch (error) {
+					final = true;
+					activeGitQuarantines.delete(marker);
+					return { moved: [], error: (error as Error).message };
+				}
+			}
 			const result = held.quarantine(isFinal, gitQuarantineJournal(marker, record));
-			if (result.error) failed ??= result.error;
-			if (!isFinal || final) return result;
+			if (!isFinal) return { ...result, moved: unreported(result.moved) };
 			final = true;
 			activeGitQuarantines.delete(marker);
-			if (failed) return { ...result, error: failed };
+			if (result.error) return { ...result, moved: unreported(result.moved) };
+			let verified: GitQuarantineRecord;
 			try {
-				const verified = readGitQuarantineRecord(marker, project);
-				if (!verified || pendingGitQuarantineIntents(verified).length) return { ...result, error: "the cleanup journal still has an intent without a done record" };
+				const durable = readGitQuarantineRecord(marker, project);
+				if (!durable || pendingGitQuarantineIntents(durable).length) return { moved: unreported(result.moved), error: "the cleanup journal still has an intent without a done record" };
+				verified = durable;
 			} catch (error) {
-				return { ...result, error: (error as Error).message };
+				return { moved: unreported(result.moved), error: (error as Error).message };
 			}
 			const error = removeGitQuarantineMarker(marker);
-			if (error) return { ...result, error };
-			return result;
+			const moved = unreported(completedGitQuarantineMoves(verified));
+			if (error) return { moved, error };
+			return { moved };
 		},
 	};
 }

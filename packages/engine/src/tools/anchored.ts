@@ -6,7 +6,7 @@
 
 import { CString, dlopen, FFIType, toArrayBuffer, type Pointer } from "bun:ffi";
 import { randomBytes } from "node:crypto";
-import { chmodSync, closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, rmdirSync, rmSync } from "node:fs";
+import { chmodSync, closeSync, constants, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, rmdirSync, rmSync } from "node:fs";
 import { dirname, isAbsolute, join, sep } from "node:path";
 import { getSystemErrorName } from "node:util";
 
@@ -146,6 +146,11 @@ export interface GitQuarantineJournal {
 	done(move: GitQuarantineIntent): void;
 }
 
+/** Test observation point after a real directory fsync has completed. */
+export interface GitQuarantineHooks {
+	directoryFsynced?(directory: "source" | "quarantine", move: GitQuarantineIntent): void;
+}
+
 export interface HeldGitEntries {
 	paths: string[];
 	baseline: GitEntryBaseline;
@@ -177,7 +182,7 @@ export function holdPrivateFolder(path: string, device?: bigint): number {
  * Hold a Linux project through launch and cleanup. Every walk and rename is relative to held, no-follow folders.
  * A saved baseline is used only to finish a pass left pending by an earlier engine process.
  */
-export function holdGitEntries(path: string, maxEntries = 50_000, maxDepth = 64, saved?: GitEntryBaseline, quarantinePath = join(dirname(path), ".enrichedlab-git-quarantine")): HeldGitEntries {
+export function holdGitEntries(path: string, maxEntries = 50_000, maxDepth = 64, saved?: GitEntryBaseline, quarantinePath = join(dirname(path), ".enrichedlab-git-quarantine"), hooks: GitQuarantineHooks = {}): HeldGitEntries {
 	if (process.platform !== "linux") throw new Error("Git quarantine is for Linux.");
 	const root = holdFolder(path);
 	const rootStat = fstatSync(root, { bigint: true });
@@ -329,6 +334,28 @@ export function holdGitEntries(path: string, maxEntries = 50_000, maxDepth = 64,
 		}
 		return { dir, name };
 	};
+	const syncDirectory = (dir: number, directory: "source" | "quarantine", move: GitQuarantineIntent) => {
+		const stat = fstatSync(dir);
+		const originalMode = stat.mode & 0o7777;
+		const restoreMode = stat.uid === process.getuid?.() && (originalMode & 0o700) !== 0o700;
+		if (restoreMode) chmodSync(`/proc/self/fd/${dir}`, originalMode | 0o700);
+		let opened = -1;
+		try {
+			opened = lib().openat(dir, c("."), constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW | LINUX_O_CLOEXEC, 0);
+			if (opened < 0) throw new Error(`Couldn't open the ${directory} directory for the durable move from ${move.from}.`);
+			fsyncSync(opened);
+			hooks.directoryFsynced?.(directory, move);
+		} finally {
+			if (opened >= 0) lib().close(opened);
+			if (restoreMode) chmodSync(`/proc/self/fd/${dir}`, originalMode);
+		}
+	};
+	const syncMove = (source: number | undefined, move: GitQuarantineIntent) => {
+		if (source === undefined) throw new Error(`Couldn't hold the source directory for the durable move from ${move.from}.`);
+		// The rename must reach both directory journals before its done record can become durable.
+		syncDirectory(source, "source", move);
+		syncDirectory(quarantineRoot, "quarantine", move);
+	};
 	const recover = (move: GitQuarantineIntent): { moved: boolean } => {
 		if (dirname(move.to) !== quarantinePath || !/^git-[a-f0-9]{24}$/.test(move.to.split(sep).at(-1) ?? "")) throw new Error(`The recorded quarantine destination ${move.to} is invalid.`);
 		const source = sourceParent(move.from);
@@ -339,6 +366,7 @@ export function holdGitEntries(path: string, maxEntries = 50_000, maxDepth = 64,
 			const targetIdentity = identityIfPresent(quarantineRoot, targetName, move.to)?.id;
 			if (targetIdentity === move.item) {
 				if (sourceIdentity === move.item) throw new Error(`Both ${move.from} and ${move.to} name the recorded item; cleanup cannot choose between them.`);
+				syncMove(source.dir, move);
 				return { moved: false };
 			}
 			if (targetIdentity !== undefined) throw new Error(`${move.to} exists with a different identity.`);
@@ -350,6 +378,7 @@ export function holdGitEntries(path: string, maxEntries = 50_000, maxDepth = 64,
 			const movedIdentity = identityIfPresent(quarantineRoot, targetName, move.to)?.id;
 			const left = identityIfPresent(source.dir, source.name, move.from);
 			if (movedIdentity !== move.item || left) throw new Error(`The completed move from ${move.from} to ${move.to} did not match its recorded identity.`);
+			syncMove(source.dir, move);
 			return { moved: true };
 		} finally {
 			if (source.dir !== undefined) lib().close(source.dir);
@@ -403,6 +432,7 @@ export function holdGitEntries(path: string, maxEntries = 50_000, maxDepth = 64,
 					const target = identityIfPresent(quarantineRoot, blocked, intent.to)?.id;
 					const left = identityIfPresent(dir, name, relative);
 					if (target !== item || left) throw new Error(`The move from ${relative} to ${intent.to} did not match its recorded identity.`);
+					syncMove(dir, intent);
 					journal?.done(intent);
 					const move = { from: relative, to: intent.to };
 					moved.push(move);
