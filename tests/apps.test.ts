@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { AppHost } from "../packages/engine/src/apps/host.ts";
 import { containerBuildNetworkArgs, containerPullArgs, servedBackendNetwork, startBackend } from "../packages/engine/src/apps/backends.ts";
-import { readManifest } from "../packages/engine/src/apps/manifest.ts";
+import { permissionKey, readManifest } from "../packages/engine/src/apps/manifest.ts";
 import { installApp, packApp } from "../packages/engine/src/apps/package.ts";
 import { templateFiles } from "../packages/engine/src/apps/templates.ts";
 import { paths } from "../packages/engine/src/paths.ts";
@@ -83,6 +83,31 @@ describe("app host", () => {
 		expect(containerPullArgs(false)).toEqual(["--pull=never"]);
 		expect(containerPullArgs(true)).toEqual([]);
 		await apps.stop();
+	});
+
+	test("saved grants without network scope keys cannot authorize served or build network", async () => {
+		const home = scratch("old-network-grant-home");
+		const project = scratch("old-network-grant-project");
+		const dir = join(project, "apps", "networked");
+		writeApp(dir, { "index.html": "<!doctype html>" });
+		for (const backend of [
+			{ runtime: "serve", command: ["python", "app.py"] },
+			{ runtime: "container", image: "local/image:1", build: "." },
+		]) {
+			writeFileSync(join(dir, "app.json"), JSON.stringify({ name: "networked", backend }));
+			const before = host(home, project);
+			const opened = await before.open({ sessionId: "s1", path: "apps/networked" });
+			const manifest = readManifest(dir);
+			const stateFile = join(home, "apps.json");
+			const state = JSON.parse(readFileSync(stateFile, "utf8")) as { known: Record<string, unknown>; grants: Record<string, unknown> };
+			// This is the grant-key formula used before network consent became a separate scope.
+			state.grants[opened.app.id] = { key: `${permissionKey(manifest.permissions)}|${JSON.stringify(manifest.backend)}|`, allow: true, at: "2026-01-01T00:00:00.000Z" };
+			writeFileSync(stateFile, JSON.stringify(state));
+			await before.stop();
+			const upgraded = host(home, project);
+			expect((await upgraded.open({ sessionId: "s1", path: "apps/networked" })).app.granted).toBe(false);
+			await upgraded.stop();
+		}
 	});
 
 	test.skipIf(process.platform !== "linux")("a Linux served backend refuses to share the host network without its named consent", () => {

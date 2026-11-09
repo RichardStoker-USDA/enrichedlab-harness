@@ -122,7 +122,8 @@ and always `lab_store_get/set` and `lab_session`. `lab.share(text)` tells the mo
   engine. It reaches the host only through the bridge, and the network only at origins it declared.
 - An app that asks for permissions, or runs a program of its own, shows the person what it asks before anything loads.
   The grant covers exactly that list and backend definition; changing the command, build, image or permissions asks
-  again. Served backends and container builds do not start before their network line is granted.
+  again. Served backends and container builds do not start before their network line is granted. Each effective
+  network scope is saved with its backend, so a grant saved without that scope asks again after an upgrade.
 - In a session bound to a lab that keeps data inside, pages get no network or links, and other labs are refused.
 - An MCP server's view may call only its own server's tools marked for apps; app-only tools never reach the model.
 

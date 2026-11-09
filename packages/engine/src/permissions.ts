@@ -220,6 +220,79 @@ const NON_RUNNING = new Set(["ls", "cat", "head", "tail", "wc", "echo", "printf"
 /** Programs that run the program named in their arguments: an expanded word there could be git. */
 const WRAPPERS = new Set(["command", "builtin", "exec", "env", "xargs", "nice", "nohup", "timeout", "sudo", "doas", "time", "stdbuf", "ionice", "chrt", "taskset", "setsid", "flock", "watch", "parallel", "script", "unbuffer", "caffeinate", "arch", "ssh", "su", "runuser", "find", "fd"]);
 
+/** The argv a Windows child receives from one command-line string. Unbalanced quotes are not safe to interpret. */
+function windowsArguments(line: string): string[] | undefined {
+	const out: string[] = [];
+	let i = 0;
+	while (i < line.length) {
+		while (/\s/.test(line[i] ?? "")) i++;
+		if (i >= line.length) break;
+		let word = "";
+		let quoted = false;
+		while (i < line.length) {
+			if (!quoted && /\s/.test(line[i]!)) break;
+			if (line[i] === "\\") {
+				let slashes = 0;
+				while (line[i + slashes] === "\\") slashes++;
+				if (line[i + slashes] === '"') {
+					word += "\\".repeat(Math.floor(slashes / 2));
+					if (slashes % 2) word += '"';
+					else quoted = !quoted;
+					i += slashes + 1;
+					continue;
+				}
+				word += "\\".repeat(slashes);
+				i += slashes;
+				continue;
+			}
+			if (line[i] === '"') quoted = !quoted;
+			else word += line[i];
+			i++;
+		}
+		if (quoted) return undefined;
+		out.push(word);
+	}
+	return out;
+}
+
+/** Make literal PowerShell ArgumentList arrays readable by the constrained command reader. */
+function flattenPowerShellArrays(line: string): string | undefined {
+	let out = "";
+	let quote: "single" | "double" | undefined;
+	let arrays = 0;
+	for (let i = 0; i < line.length; i++) {
+		const character = line[i]!;
+		if (quote === "single") {
+			out += character;
+			if (character === "'" && line[i + 1] === "'") out += line[++i]!;
+			else if (character === "'") quote = undefined;
+			continue;
+		}
+		if (quote === "double") {
+			out += character;
+			if (character === '"') quote = undefined;
+			continue;
+		}
+		if (character === "'") {
+			quote = "single";
+			out += character;
+		} else if (character === '"') {
+			quote = "double";
+			out += character;
+		} else if (character === "@" && line[i + 1] === "(") {
+			arrays++;
+			out += " ";
+			i++;
+		} else if (character === ")" && arrays) {
+			arrays--;
+			out += " ";
+		} else if (character === ",") out += " ";
+		else if (arrays && ";|&\n\r".includes(character)) return undefined;
+		else out += character;
+	}
+	return arrays || quote ? undefined : out;
+}
+
 /**
  * PowerShell can hand text to interpreters whose quoting rules this reader does not implement. On Windows those
  * handoffs always count as publishing, even when reached through another program, so Full mode still asks.
@@ -236,10 +309,84 @@ export function windowsInterpreterHandoff(command: string): boolean {
 		if (program === "cmd" && rest.some((part) => /^\/[ck]/i.test(part))) return true;
 		return /^(ba)?sh$/.test(program) && rest.some((part) => /^-[a-z]*c[a-z]*$/i.test(part));
 	};
+	const startProcessNames = new Set(["saps", "start", "start-process"]);
+	const rough = command.match(/[^\s'"`;&|(),]+/g) ?? [];
 	const parsed = everyPowerShellCommand(command);
+	const hasStartProcess = parsed
+		? parsed.commands.some(({ words }) => words[0] !== undefined && startProcessNames.has(executable(words[0])))
+		: /(?:^|[;&|\r\n])\s*(?:&\s*)?['"]?(?:saps|start|start-process)(?:\.exe)?['"]?(?=\s|$)/i.test(command);
+	if (hasStartProcess) {
+		const flattened = flattenPowerShellArrays(command);
+		const startCommands = flattened === undefined ? undefined : everyPowerShellCommand(flattened)?.commands;
+		// A Start-Process expression outside the literal subset could hide either its executable or ArgumentList.
+		if (!startCommands) return true;
+		const parameters = [
+			["argumentlist", true, ["args"]], ["confirm", false, ["cf"]], ["credential", true, ["runas"]],
+			["debug", false, ["db"]], ["environment", true, []], ["erroraction", true, ["ea"]], ["errorvariable", true, ["ev"]],
+			["filepath", true, ["path", "pspath"]], ["informationaction", true, ["infa"]], ["informationvariable", true, ["iv"]],
+			["loaduserprofile", false, ["lup"]], ["nonewwindow", false, ["nnw"]], ["outbuffer", true, ["ob"]],
+			["outvariable", true, ["ov"]], ["passthru", false, []], ["pipelinevariable", true, ["pv"]], ["progressaction", true, ["proga"]],
+			["redirectstandarderror", true, ["rse"]], ["redirectstandardinput", true, ["rsi"]], ["redirectstandardoutput", true, ["rso"]],
+			["usenewenvironment", false, []], ["verb", true, []], ["verbose", false, ["vb"]], ["wait", false, []],
+			["warningaction", true, ["wa"]], ["warningvariable", true, ["wv"]], ["whatif", false, ["wi"]],
+			["windowstyle", true, []], ["workingdirectory", true, []],
+		] as const;
+		const parameter = (word: string): (typeof parameters)[number] | "ambiguous" | undefined => {
+			if (!/^-+[a-z]/i.test(word)) return undefined;
+			const short = word.replace(/^-+/, "").toLowerCase();
+			const matches = parameters.filter(([name, _takesValue, aliases]) => name.startsWith(short) || aliases.some((alias) => alias === short));
+			return matches.length === 1 ? matches[0] : "ambiguous";
+		};
+		for (const { words } of startCommands) {
+			if (words[0] === undefined || !startProcessNames.has(executable(words[0]))) continue;
+			let file: string | undefined;
+			let argumentList: string[] | undefined;
+			const positional: string[] = [];
+			for (let i = 1; i < words.length; i++) {
+				const word = words[i];
+				if (word === undefined) return true;
+				const found = parameter(word);
+				if (found === "ambiguous") return true;
+				if (!found) {
+					positional.push(word);
+					continue;
+				}
+				const [name, takesValue] = found;
+				if (!takesValue) continue;
+				if (name === "argumentlist") {
+					if (argumentList) return true;
+					argumentList = [];
+					while (i + 1 < words.length) {
+						const next = words[i + 1];
+						if (next === undefined) return true;
+						const nextParameter = parameter(next);
+						if (nextParameter && nextParameter !== "ambiguous") break;
+						argumentList.push(next);
+						i++;
+					}
+					if (!argumentList.length) return true;
+					continue;
+				}
+				const value = words[++i];
+				if (value === undefined || parameter(value)) return true;
+				if (name === "filepath") {
+					if (file !== undefined) return true;
+					file = value;
+				}
+			}
+			file ??= positional.shift();
+			if (!file) return true;
+			if (argumentList === undefined) {
+				if (positional.length > 1) return true;
+				argumentList = positional;
+			} else if (positional.length) return true;
+			const normalized = windowsArguments(argumentList.join(" "));
+			if (!normalized || riskyAt([file, ...normalized], 0)) return true;
+		}
+	}
 	// PowerShell aliases and native wrappers that start a later argv. Normalize `.exe` before this check so the
 	// native forms fail closed too. `saps` is PowerShell's built-in alias for Start-Process.
-	const runners = new Set(["env", "saps", "start", "start-process", "timeout", "xargs"]);
+	const runners = new Set(["env", ...startProcessNames, "timeout", "xargs"]);
 	if (parsed) return parsed.commands.some(({ words }) => {
 		if (riskyAt(words, 0)) return true;
 		const lead = words[0] === undefined ? undefined : executable(words[0]);
@@ -247,7 +394,6 @@ export function windowsInterpreterHandoff(command: string): boolean {
 	});
 	// When PowerShell syntax itself is outside the literal subset, retain enough token boundaries to fail closed on
 	// the same interpreter names and options. False positives ask; they never widen what may run.
-	const rough = command.match(/[^\s'"`;&|(),]+/g) ?? [];
 	return rough.some((_word, i) => riskyAt(rough, i));
 }
 

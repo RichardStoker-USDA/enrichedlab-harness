@@ -113,9 +113,11 @@ The engine's own work stays inside the same line:
   `.git` symbolic link, including a dangling one, because bubblewrap cannot protect the link entry and its target as
   one object. A scan error or its 50,000-entry or 64-level limit refuses the command. The engine also prepares one
   hidden sibling quarantine outside the project, named from the project's device and inode and on the same
-  filesystem. It makes the directory with mode 0700, then opens it without following any link and verifies from that
-  descriptor that it is owned by the person, still mode 0700 and on the project's device. An unsafe existing path
-  refuses the command.
+  filesystem. Only when the sibling does not exist and its parent is not writable does the engine try one per-user
+  quarantine root under its home on the project's device. It makes the chosen directory with mode 0700, then opens
+  it without following any link and verifies from that descriptor that it is a directory owned by the person, still
+  mode 0700 and on the project's device. An existing sibling that fails any check refuses the command instead of
+  trying the fallback. The error names the failed check, or why both locations were unavailable.
   Contained commands cannot read the quarantine.
 
   Before starting the command, the engine records the project identity, quarantine path and the
@@ -133,8 +135,9 @@ The engine's own work stays inside the same line:
   or local file-tool write in that project, the engine retries the anchored pass. An invalid record or another
   failure refuses that command or write before it creates anything. Reads remain available so the person's data is
   not hidden. Recovery also finds a pending record by folder identity after the project is renamed or reached through
-  another physical path. An existing sibling quarantine must pass the same descriptor checks even when no cleanup
-  record is found; file writes refuse an unsafe quarantine without waiting for a command to check it.
+  another physical path. The pending pass uses the quarantine recorded in its journal, even if a new sibling becomes
+  available. An existing sibling or selected per-user quarantine must pass the same descriptor checks even when no
+  cleanup record is found; file writes refuse an unsafe quarantine without waiting for a command to check it.
 
   There is a remaining window while a command runs: new metadata exists at its project path and Git in that command,
   or a simultaneous process outside containment, can use it. An engine crash or failed bounded pass can leave that
@@ -172,8 +175,10 @@ Accepted residuals, each with its reason:
   `Invoke-Expression`, any spelling or abbreviation of `-EncodedCommand`, and direct `cmd /c`, `cmd /k`, `sh -c`,
   `bash -c`, `wsl`, `powershell` or `pwsh` invocations count as a push and ask every time. Those interpreter handoffs
   also count behind `env`, `start`, `Start-Process`, its `saps` alias, `timeout` and `xargs`, including native `.exe`
-  forms. Other unsupported PowerShell syntax asks as a push when its raw text contains a publishing word and as
-  hidden otherwise. A script or program that pushes on its own isn't. "Pushes ask"
+  forms. `Start-Process` and its aliases normalize a literal `ArgumentList` supplied as one string or an array before
+  this check, including abbreviated parameter names; an unreadable form counts as a push. Other unsupported
+  PowerShell syntax asks as a push when its raw text contains a publishing word and as hidden otherwise. A script or
+  program that pushes on its own isn't. "Pushes ask"
   means pushes the line shows.
 - The lab fence by Landlock ABI. ABI 3 covers file contents, names, existence and truncation; refusing TCP needs ABI
   4, device ioctls ABI 5, and signals and abstract sockets to processes outside the fence ABI 6. Below those, a fenced
@@ -320,9 +325,10 @@ App backends and served apps run under the same facility, and app pages run in a
 content security policy (docs/apps.md). The page reaches only the origins the app names. A program behind it that
 asked for network reaches all of it. A served backend asks for its listening network before it starts; on Linux the
 card explains that bubblewrap must share the whole host network. A container build also names network access in the
-card. The build command uses `--network none` without that grant. A networkless container run uses `--pull=never`, so
-a missing image cannot trigger an unapproved pull. Building an app's pixi environment runs contained: pixi may write
-the app's folder and its own cache under `~/.el/tools`, never the person's shared package caches, and gets no keys.
+card. The saved grant key includes the effective network scope and backend, so a grant without those fields asks
+again. The build command uses `--network none` without that grant. A networkless container run uses `--pull=never`,
+so a missing image cannot trigger an unapproved pull. Building an app's pixi environment runs contained: pixi may
+write the app's folder and its own cache under `~/.el/tools`, never the person's shared package caches, and gets no keys.
 The card lists every package (conda, PyPI, other channels and indexes, and anything built from source), and a grant
 covers that exact `pixi.toml`: a change asks again. An app package is checked against its size limits before it is
 unpacked. Lab sandboxes are isolated by the lab.

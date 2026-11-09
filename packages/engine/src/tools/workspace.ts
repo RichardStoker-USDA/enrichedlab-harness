@@ -483,32 +483,59 @@ export function gitQuarantineMarker(root: string, home = labHome()): string {
 
 /** An engine-owned folder outside the project, on the same filesystem so each quarantine move is atomic. */
 export function gitQuarantineFolder(root: string, home = labHome()): string {
-	return checkedGitQuarantineFolder(root, true)!;
+	return checkedGitQuarantineFolder(root, true, home)!;
 }
 
 /** File writes verify an existing quarantine even without a journal, without making one for ordinary edits. */
-function checkedGitQuarantineFolder(root: string, create: boolean): string | undefined {
+function checkedGitQuarantineFolder(root: string, create: boolean, home = labHome()): string | undefined {
 	const project = real(root);
-	if (dirname(project) === project) throw new Error("Linux commands cannot write a filesystem root because no private .git quarantine can be placed beside it.");
 	const projectStat = statSync(project, { bigint: true });
 	const id = createHash("sha256").update(`${projectStat.dev}:${projectStat.ino}`).digest("hex");
-	const candidate = join(dirname(project), `.enrichedlab-git-quarantine-${id}`);
-	if (create) {
+	const sibling = dirname(project) === project ? undefined : join(dirname(project), `.enrichedlab-git-quarantine-${id}`);
+	const fallback = join(home, "quarantine", `git-${projectStat.dev}`);
+	const verify = (path: string): string => {
+		const held = holdPrivateFolder(path, projectStat.dev);
 		try {
-			mkdirSync(candidate, { mode: 0o700 });
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw new Error(`EnrichedLab could not make its private .git quarantine, so no contained command ran: ${(error as Error).message}`);
+			return path;
+		} finally {
+			closeSync(held);
 		}
-	}
-	let held: number | undefined;
+	};
+	let siblingReason = "the sibling does not exist";
 	try {
-		if (!create && !lstatSync(candidate, { throwIfNoEntry: false })) return undefined;
-		held = holdPrivateFolder(candidate, projectStat.dev);
-		return candidate;
+		if (!sibling) throw new Error("the project is a filesystem root");
+		// An existing entry is never a reason to fall back, including a dangling link or an unsafe directory.
+		if (lstatSync(sibling, { throwIfNoEntry: false })) return verify(sibling);
+		if (create) {
+			let made = false;
+			try {
+				mkdirSync(sibling, { mode: 0o700 });
+				made = true;
+			} catch (error) {
+				const code = (error as NodeJS.ErrnoException).code;
+				if (code === "EEXIST") return verify(sibling);
+				if (!["EACCES", "EPERM", "EROFS"].includes(code ?? "") || lstatSync(sibling, { throwIfNoEntry: false })) throw error;
+				siblingReason = (error as Error).message;
+			}
+			if (made) return verify(sibling);
+		}
 	} catch (error) {
-		throw new Error(`EnrichedLab could not verify its private .git quarantine, so no contained command ran: ${(error as Error).message}`);
-	} finally {
-		if (held !== undefined) closeSync(held);
+		throw new Error(`EnrichedLab could not verify its private .git quarantine, so no contained command ran. same-filesystem sibling: ${(error as Error).message}`);
+	}
+	try {
+		if (pathAtOrBelow(fallback, project)) throw new Error("its path would be inside the project");
+		if (!create && !lstatSync(fallback, { throwIfNoEntry: false })) return undefined;
+		if (create) {
+			mkdirPhysical(dirname(fallback));
+			try {
+				mkdirSync(fallback, { mode: 0o700 });
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+			}
+		}
+		return verify(fallback);
+	} catch (error) {
+		throw new Error(`EnrichedLab could not verify its private .git quarantine, so no contained command ran. same-filesystem sibling: ${siblingReason}; per-user fallback: ${(error as Error).message}`);
 	}
 }
 
@@ -585,7 +612,7 @@ export interface GitRecovery {
 /** Verify quarantine and finish pending cleanup before a contained command or file write can start. */
 export function recoverGitQuarantine(root: string, home = labHome()): GitRecovery {
 	const project = real(root);
-	const checkedQuarantine = checkedGitQuarantineFolder(project, false);
+	const checkedQuarantine = checkedGitQuarantineFolder(project, false, home);
 	let marker = gitQuarantineMarker(project, home);
 	let record: GitQuarantineRecord | undefined;
 	try {

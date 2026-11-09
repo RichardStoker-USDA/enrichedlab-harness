@@ -3,7 +3,7 @@
 
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { chmodSync, chownSync, closeSync, constants, existsSync, linkSync, lstatSync, mkdirSync, readdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, chownSync, closeSync, constants, existsSync, linkSync, lstatSync, mkdirSync, readdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import type { LabConfig } from "../packages/engine/src/config.ts";
@@ -43,6 +43,11 @@ describe("shell syntax", () => {
 			"env.exe powershell.exe -ec ZwBpAHQAIABwAHUAcwBoAA==",
 			"xargs.exe pwsh.exe -EncodedCommand ZwBpAHQAIABwAHUAcwBoAA==",
 			"saps powershell.exe -ArgumentList '-EncodedCommand ZwBpAHQAIABwAHUAcwBoAA=='",
+			"saps cmd.exe -ArgumentList '/d /c g^it p^ush origin main'",
+			"Start-Process -FilePath cmd.exe -ArgumentList @('/d','/c','g^it p^ush origin main')",
+			"start -Fi cmd.exe -Arg '/d /c g^it p^ush origin main'",
+			"saps -Path cmd.exe -Args '/d /c g^it p^ush origin main'",
+			"saps cmd.exe -ArgumentList @('/d',$unreadable)",
 			`iex '& ("g"+"it") ("p"+"ush") origin main'`,
 			"Invoke-Expression 'git push origin main'",
 			"cmd.exe /d /c g^it p^ush origin main",
@@ -50,7 +55,7 @@ describe("shell syntax", () => {
 			"wsl git push origin main",
 			"pwsh -NoProfile -Command 'git push origin main'",
 		]) expect([command, windowsInterpreterHandoff(command)]).toEqual([command, true]);
-		for (const command of ["Write-Output safe", "Write-Output powershell", "git status", "git -e path", "cmd.exe /?", "sh script.sh"]) expect([command, windowsInterpreterHandoff(command)]).toEqual([command, false]);
+		for (const command of ["Write-Output safe", "Write-Output powershell", "git status", "git -e path", "cmd.exe /?", "sh script.sh", "saps cmd.exe -ArgumentList '/d /q'", "saps -Path cmd.exe -Args '/d /q'"]) expect([command, windowsInterpreterHandoff(command)]).toEqual([command, false]);
 	});
 
 	test("anything more than text has no plain reading", () => {
@@ -503,6 +508,26 @@ describe("round 6: containment is the boundary", () => {
 		}
 	});
 
+	test.skipIf(process.platform !== "win32")("Start-Process ArgumentList strings and arrays cannot hide a push", () => {
+		const root = realpathSync(mkdtempSync(join(tmpdir(), "el-windows-start-process-")));
+		const workspace = new LocalWorkspace(root, "off");
+		const full = { permissions: { mode: "full", allowCommands: [] } } as unknown as LabConfig;
+		try {
+			for (const command of [
+				"saps cmd.exe -ArgumentList '/d /c g^it p^ush origin main'",
+				"Start-Process -FilePath cmd.exe -ArgumentList @('/d','/c','g^it p^ush origin main')",
+				"start -Fi cmd.exe -Arg '/d /c g^it p^ush origin main'",
+				"saps -Path cmd.exe -Args '/d /c g^it p^ush origin main'",
+				"saps cmd.exe -ArgumentList @('/d',$unreadable)",
+			]) {
+				expect([command, allowKeys(shell, { command }).keys[0]]).toEqual([command, "shell!push"]);
+				expect(decide(shell, { command }, workspace, full, new Set()).action).toBe("ask");
+			}
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	test.skipIf(process.platform !== "darwin")("a read-only subagent's commands run where nothing in the project can change, or not at all", async () => {
 		const root = realpathSync(mkdtempSync(join(tmpdir(), "el-readonly-")));
 		try {
@@ -820,6 +845,29 @@ describe("round 6: containment is the boundary", () => {
 		}
 	});
 
+	test.skipIf(process.platform !== "linux" || process.getuid?.() === 0)("Linux uses a verified per-user quarantine when the project parent is not writable", () => {
+		const base = realpathSync(mkdtempSync(join(tmpdir(), "el-git-fallback-quarantine-")));
+		const parent = join(base, "locked");
+		const root = join(parent, "project");
+		const home = join(base, "state");
+		mkdirSync(root, { recursive: true });
+		mkdirSync(home, { mode: 0o700 });
+		chmodSync(parent, 0o555);
+		let quarantine: string | undefined;
+		try {
+			quarantine = gitQuarantineFolder(root, home);
+			expect(quarantine).toStartWith(join(home, "quarantine"));
+			expect(statSync(quarantine, { bigint: true }).dev).toBe(statSync(root, { bigint: true }).dev);
+			expect(statSync(quarantine).mode & 0o777).toBe(0o700);
+			chmodSync(quarantine, 0o777);
+			expect(() => gitQuarantineFolder(root, home)).toThrow(/same-filesystem sibling: .*per-user fallback: .*mode 0700/i);
+		} finally {
+			if (quarantine) chmodSync(quarantine, 0o700);
+			chmodSync(parent, 0o700);
+			rmSync(base, { recursive: true, force: true });
+		}
+	});
+
 	test.skipIf(process.platform !== "linux" || sandboxer() !== "bubblewrap")("a pending .git journal blocks contained commands and file writes until an anchored pass succeeds", async () => {
 		const base = realpathSync(mkdtempSync(join(tmpdir(), "el-git-write-gate-")));
 		const root = join(base, "project");
@@ -856,6 +904,56 @@ describe("round 6: containment is the boundary", () => {
 		} finally {
 			if (savedHome === undefined) delete process.env.EL_HOME;
 			else process.env.EL_HOME = savedHome;
+			rmSync(base, { recursive: true, force: true });
+		}
+	});
+
+	test.skipIf(process.platform !== "linux" || process.getuid?.() === 0 || sandboxer() !== "bubblewrap")("a pending fallback .git journal stays bound to its quarantine when a sibling becomes available", async () => {
+		const base = realpathSync(mkdtempSync(join(tmpdir(), "el-git-fallback-write-gate-")));
+		const parent = join(base, "locked");
+		const root = join(parent, "project");
+		const home = join(base, "state");
+		const savedHome = process.env.EL_HOME;
+		mkdirSync(root, { recursive: true });
+		mkdirSync(home, { mode: 0o700 });
+		chmodSync(parent, 0o555);
+		try {
+			process.env.EL_HOME = home;
+			const quarantine = gitQuarantineFolder(root, home);
+			expect(quarantine).toStartWith(join(home, "quarantine"));
+			const held = holdGitEntries(root, 50_000, 64, undefined, quarantine);
+			const marker = gitQuarantineMarker(root, home);
+			try {
+				mkdirSync(dirname(marker), { recursive: true, mode: 0o700 });
+				writeFileSync(marker, JSON.stringify({ version: 1, project: root, baseline: held.baseline, quarantine }));
+			} finally {
+				held.release();
+			}
+			mkdirSync(join(root, ".git"));
+			writeFileSync(join(root, ".git", "config"), "keep\n");
+			// A safe new sibling cannot replace the destination recorded by the pending cleanup.
+			chmodSync(parent, 0o700);
+			expect(gitQuarantineFolder(root, home)).not.toBe(quarantine);
+			chmodSync(quarantine, 0o777);
+			const workspace = new LocalWorkspace(root, "workspace");
+			await expect(workspace.write("blocked.txt", "blocked")).rejects.toThrow("cleanup pending");
+			expect(existsSync(join(root, "blocked.txt"))).toBe(false);
+			const command = await workspace.exec("printf blocked > command.txt", { timeoutMs: 5_000, signal: AbortSignal.timeout(5_000) });
+			expect(command.exitCode).toBe(125);
+			expect(command.output).toContain("cleanup pending");
+			expect(existsSync(join(root, "command.txt"))).toBe(false);
+			expect(existsSync(marker)).toBe(true);
+			expect(readFileSync(join(root, ".git", "config"), "utf8")).toBe("keep\n");
+			chmodSync(quarantine, 0o700);
+			await workspace.write("recovered.txt", "ok");
+			expect(readFileSync(join(root, "recovered.txt"), "utf8")).toBe("ok");
+			expect(existsSync(join(root, ".git"))).toBe(false);
+			expect(existsSync(marker)).toBe(false);
+			expect(readdirSync(quarantine).some((name) => readFileSync(join(quarantine, name, "config"), "utf8") === "keep\n")).toBe(true);
+		} finally {
+			if (savedHome === undefined) delete process.env.EL_HOME;
+			else process.env.EL_HOME = savedHome;
+			chmodSync(parent, 0o700);
 			rmSync(base, { recursive: true, force: true });
 		}
 	});
