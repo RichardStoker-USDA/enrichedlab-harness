@@ -9,7 +9,7 @@ import { basename, join } from "node:path";
 import { pixi, pixiHere } from "../apps/environments.ts";
 import { type Tool, ToolError } from "./types.ts";
 import { openPhysical } from "./anchored.ts";
-import { contained, containedTempEnvironment, type NetworkAccess, physical, safeTemp } from "./workspace.ts";
+import { contained, containedTempEnvironment, createEngineWriteGrantIfEligible, type EngineWriteGrant, type NetworkAccess, physical, safeTemp } from "./workspace.ts";
 
 /** Where a lab's vetted packages come from (its descriptor's `packages`). */
 export interface PackageSources {
@@ -32,9 +32,9 @@ export function manifest(name: string, sources?: PackageSources): string {
 }
 
 /** Each installed package and its version, from `pixi list`. */
-async function installed(program: string, root: string, env: Record<string, string>, check: () => void): Promise<Map<string, string>> {
+async function installed(program: string, root: string, env: Record<string, string>, check: () => void, cacheGrant?: EngineWriteGrant): Promise<Map<string, string>> {
 	// Listing reads what is built: no network.
-	const out = await run(program, ["list", "--json", "--manifest-path", join(root, "pixi.toml")], root, env, () => undefined, check, "none").catch(() => "[]");
+	const out = await run(program, ["list", "--json", "--manifest-path", join(root, "pixi.toml")], root, env, () => undefined, check, "none", cacheGrant).catch(() => "[]");
 	const list = new Map<string, string>();
 	try {
 		for (const p of JSON.parse(out) as { name: string; version: string }[]) list.set(p.name, p.version);
@@ -45,11 +45,17 @@ async function installed(program: string, root: string, env: Record<string, stri
 }
 
 /** Run pixi contained: it may write the project (pixi.toml, pixi.lock, .pixi) and its own caches, and reach the indexes. */
-async function run(program: string, args: string[], root: string, env: Record<string, string>, log: (line: string) => void, check: () => void, network: NetworkAccess = "all"): Promise<string> {
+async function run(program: string, args: string[], root: string, env: Record<string, string>, log: (line: string) => void, check: () => void, network: NetworkAccess = "all", cacheGrant?: EngineWriteGrant): Promise<string> {
 	// The folder is judged again right before each launch: one moved during an earlier step isn't granted.
 	check();
 	const caches = env.PIXI_CACHE_DIR!;
-	const launch = contained(program, args, { writable: [root, physical(caches)], readable: [program], network, exact: true });
+	const launch = contained(program, args, {
+		writable: [root, ...(cacheGrant ? [] : [physical(caches)])],
+		readable: [program],
+		network,
+		exact: true,
+		...(cacheGrant ? { engineWrite: [cacheGrant] } : {}),
+	});
 	// Package install scripts never run uncontained: no facility here, no install.
 	if (!launch.facility) throw new ToolError("This computer has no sandbox to contain package installs (Seatbelt on macOS, bubblewrap on Linux), so nothing was installed.");
 	let child: ReturnType<typeof Bun.spawn>;
@@ -114,8 +120,9 @@ export const environmentTool: Tool<{ action: Action; packages?: string[]; pypi?:
 		if (args.action === "list" && !here) return { ok: true, content: `pixi isn't on this computer yet (or its copy didn't match its pinned hash), so this is what pixi.toml asks for (nothing is built):\n${readFileSync(join(root, "pixi.toml"), "utf8")}` };
 		const program = here ?? (await pixi(tools, (line) => ctx.output(`${line}\n`)));
 		const caches = join(tools, "pixi-cache");
-		// Made first: containment can only let the install write a folder that exists.
-		mkdirSync(caches, { recursive: true });
+		// A production cache below the engine home is made through a no-link chain and granted only by identity.
+		const cacheGrant = createEngineWriteGrantIfEligible(caches);
+		if (!cacheGrant) mkdirSync(caches, { recursive: true });
 		const inherited: Record<string, string> = { PIXI_NO_PATH_UPDATE: "1", PIXI_CACHE_DIR: caches, PIXI_HOME: caches };
 		for (const key of ["PATH", "HOME", "LANG", "LC_ALL", "SYSTEMROOT", "SSL_CERT_FILE", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY"]) if (process.env[key]) inherited[key] = process.env[key]!;
 		const env = containedTempEnvironment(inherited);
@@ -133,27 +140,27 @@ export const environmentTool: Tool<{ action: Action; packages?: string[]; pypi?:
 			}
 		}
 		const manifestPath = ["--manifest-path", file];
-		const before = made ? new Map<string, string>() : await installed(program, root, env, pinned);
+		const before = made ? new Map<string, string>() : await installed(program, root, env, pinned, cacheGrant);
 		const log = (line: string) => ctx.output(`${line}\n`);
 		pinned();
 		switch (args.action) {
 			case "list":
 				break;
 			case "add":
-				await run(program, ["add", ...(args.pypi ? ["--pypi"] : []), ...manifestPath, "--", ...packages], root, env, log, pinned);
+				await run(program, ["add", ...(args.pypi ? ["--pypi"] : []), ...manifestPath, "--", ...packages], root, env, log, pinned, "all", cacheGrant);
 				break;
 			case "remove":
-				await run(program, ["remove", ...(args.pypi ? ["--pypi"] : []), ...manifestPath, "--", ...packages], root, env, log, pinned);
+				await run(program, ["remove", ...(args.pypi ? ["--pypi"] : []), ...manifestPath, "--", ...packages], root, env, log, pinned, "all", cacheGrant);
 				break;
 			case "update":
-				await run(program, ["update", ...manifestPath, "--", ...packages], root, env, log, pinned);
+				await run(program, ["update", ...manifestPath, "--", ...packages], root, env, log, pinned, "all", cacheGrant);
 				break;
 			case "sync":
-				await run(program, ["install", ...manifestPath], root, env, log, pinned);
+				await run(program, ["install", ...manifestPath], root, env, log, pinned, "all", cacheGrant);
 				break;
 		}
-		if (args.action !== "list") await run(program, ["install", ...manifestPath], root, env, log, pinned);
-		const after = await installed(program, root, env, pinned);
+		if (args.action !== "list") await run(program, ["install", ...manifestPath], root, env, log, pinned, "all", cacheGrant);
+		const after = await installed(program, root, env, pinned, cacheGrant);
 		const sources = /channels\s*=\s*\[([^\]]*)\]/.exec(readFileSync(file, "utf8"))?.[1]?.replace(/"/g, "").trim() || "conda-forge";
 		const where = args.folder ?? "the project";
 		if (args.action === "list") {

@@ -4,13 +4,13 @@
 import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import type { Dirent } from "node:fs";
-import { accessSync, closeSync, constants, existsSync, fstatSync, ftruncateSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
+import { accessSync, closeSync, constants, existsSync, fstatSync, fsyncSync, ftruncateSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeSync } from "node:fs";
 import { readdir, readFile, stat } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { labHome } from "../paths.ts";
 import { expandHome, withoutSecrets } from "../util.ts";
-import { holdFolder, holdGitEntries, holdPrivateFolder, mkdirPhysical, openPhysical, type GitEntryBaseline, type GitQuarantineResult } from "./anchored.ts";
+import { holdFolder, holdGitEntries, holdPrivateFolder, mkdirPhysical, openPhysical, type GitEntryBaseline, type GitQuarantineIntent, type GitQuarantineJournal, type GitQuarantineResult } from "./anchored.ts";
 import { systemCommand, systemPowerShell } from "./windows_contain.ts";
 
 export interface Entry {
@@ -330,6 +330,62 @@ function trustedWritePath(path: string): string | undefined {
 	return trustedWritePaths().find((blocked) => targets.some((target) => pathAtOrBelow(target, foldedPath(blocked))));
 }
 
+/** An engine-created directory identity. A contained caller cannot turn a project path into this grant. */
+export interface EngineWriteGrant {
+	readonly path: string;
+	readonly dev: string;
+	readonly ino: string;
+}
+
+const namedEngineHome = () => resolve(labHome());
+
+/**
+ * Create an engine-home directory through a no-link chain and record the directory the engine made or found there.
+ * A named path outside the engine home is never eligible, even when a project link resolves into the engine home.
+ */
+export function createEngineWriteGrant(path: string): EngineWriteGrant {
+	const named = resolve(path);
+	const home = namedEngineHome();
+	if (foldedPath(named) === foldedPath(home) || !pathAtOrBelow(foldedPath(named), foldedPath(home))) throw new Error("An engine-owned write destination must be named below the engine home.");
+	mkdirPhysical(named);
+	const entry = lstatSync(named, { bigint: true });
+	if (!entry.isDirectory() || entry.isSymbolicLink()) throw new Error("An engine-owned write destination must be a real directory, not a link.");
+	const fd = openPhysical(named, constants.O_RDONLY | constants.O_DIRECTORY);
+	try {
+		const held = fstatSync(fd, { bigint: true });
+		if (!held.isDirectory() || held.dev !== entry.dev || held.ino !== entry.ino) throw new Error("An engine-owned write destination changed while its identity was recorded.");
+	} finally {
+		closeSync(fd);
+	}
+	return Object.freeze({ path: named, dev: String(entry.dev), ino: String(entry.ino) });
+}
+
+/** Create a recorded grant only for a path named below the engine home. */
+export function createEngineWriteGrantIfEligible(path: string): EngineWriteGrant | undefined {
+	const named = resolve(path);
+	const home = namedEngineHome();
+	return foldedPath(named) !== foldedPath(home) && pathAtOrBelow(foldedPath(named), foldedPath(home)) ? createEngineWriteGrant(named) : undefined;
+}
+
+function holdEngineWriteGrant(grant: EngineWriteGrant): number {
+	const path = resolve(grant.path);
+	const home = namedEngineHome();
+	if (path !== grant.path || path === home || !pathAtOrBelow(foldedPath(path), foldedPath(home))) throw new Error("An engine-owned write grant must name its recorded directory below the engine home.");
+	const entry = lstatSync(path, { bigint: true, throwIfNoEntry: false });
+	if (!entry?.isDirectory() || entry.isSymbolicLink() || String(entry.dev) !== grant.dev || String(entry.ino) !== grant.ino) {
+		throw new Error("An engine-owned write destination is a link, missing, or no longer has its recorded identity, so nothing ran.");
+	}
+	const fd = openPhysical(path, constants.O_RDONLY | constants.O_DIRECTORY);
+	try {
+		const held = fstatSync(fd, { bigint: true });
+		if (!held.isDirectory() || String(held.dev) !== grant.dev || String(held.ino) !== grant.ino) throw new Error("An engine-owned write destination changed while it was opened, so nothing ran.");
+		return fd;
+	} catch (error) {
+		closeSync(fd);
+		throw error;
+	}
+}
+
 /** What a contained program may reach: nothing, this computer's own loopback (a local web app), or the network. */
 export type NetworkAccess = "none" | "loopback" | "all";
 
@@ -418,10 +474,10 @@ function seatbeltProfile(writable: string[], network: NetworkAccess, readable: s
  * name, so a link swapped in afterwards grants nothing; Seatbelt judges the real path of every write). The caller
  * hands `pass` to the program as its file descriptors 3, 4, ... (after stdin, stdout, stderr) and calls `release`
  * once it has exited. `protect`: paths inside the writable ones that stay read only (a
- * repository's settings and hooks). `engineWrite` names narrow engine-owned app or installer destinations that may
- * be reopened after the engine-home deny rule.
+ * repository's settings and hooks). `engineWrite` carries recorded identities for narrow engine-created app or
+ * installer directories that may be reopened after the engine-home deny rule.
  */
-export function contained(file: string, args: string[], options: { writable: string[]; network: NetworkAccess; readable?: string[]; server?: boolean; temp?: boolean; exact?: boolean; protect?: string[]; protectPatterns?: string[]; waitForChildren?: boolean; appData?: { root: string; current: string }; engineWrite?: string[]; hidden?: string[] }): { file: string; args: string[]; facility?: Facility; pass?: number[]; release?: () => void; syncFd?: number } {
+export function contained(file: string, args: string[], options: { writable: string[]; network: NetworkAccess; readable?: string[]; server?: boolean; temp?: boolean; exact?: boolean; protect?: string[]; protectPatterns?: string[]; waitForChildren?: boolean; appData?: { root: string; current: string }; engineWrite?: EngineWriteGrant[]; hidden?: string[] }): { file: string; args: string[]; facility?: Facility; pass?: number[]; release?: () => void; syncFd?: number } {
 	// Each path resolved once: the check and the grant are the same answer.
 	const resolved = options.writable.map(real);
 	let appData: string | undefined;
@@ -430,23 +486,17 @@ export function contained(file: string, args: string[], options: { writable: str
 		appData = real(options.appData.current);
 		if (basename(root) !== "app-data" || dirname(appData) !== root || !resolved.includes(appData)) throw new Error("An app backend may write only its own direct app-data folder.");
 	}
-	const namedEngineHome = foldedPath(resolve(labHome()));
-	const engineHome = foldedPath(physical(labHome()));
 	const gitProtect = trustedGitWritePaths();
-	for (const path of options.engineWrite ?? []) {
-		if (pathAtOrBelow(foldedPath(resolve(path)), namedEngineHome) && !pathAtOrBelow(foldedPath(real(path)), engineHome)) {
-			throw new Error("An engine-owned write destination now leads outside the engine home, so nothing ran.");
-		}
-	}
-	const engineWrite = [...new Set([...(appData ? [appData] : []), ...(options.engineWrite ?? []).map(real)].filter((path) => existsSync(path) && pathAtOrBelow(foldedPath(path), engineHome)))];
-	for (const path of engineWrite) {
-		if (!resolved.includes(path) || !pathAtOrBelow(foldedPath(path), engineHome) || foldedPath(path) === engineHome) {
-			throw new Error("An engine-owned write grant must be an exact writable destination below the engine home.");
-		}
-		if (gitProtect.some((blocked) => pathAtOrBelow(foldedPath(path), foldedPath(blocked)) || pathAtOrBelow(foldedPath(blocked), foldedPath(path)))) {
+	const grants = [...(options.engineWrite ?? [])].filter((grant, index, all) => all.findIndex((other) => other.path === grant.path && other.dev === grant.dev && other.ino === grant.ino) === index);
+	const checkedGrants = grants.map((grant) => {
+		const fd = holdEngineWriteGrant(grant);
+		closeSync(fd);
+		if (gitProtect.some((blocked) => pathAtOrBelow(foldedPath(grant.path), foldedPath(blocked)) || pathAtOrBelow(foldedPath(blocked), foldedPath(grant.path)))) {
 			throw new Error("An engine-owned write grant cannot include trusted Git configuration.");
 		}
-	}
+		return grant;
+	});
+	const engineWrite = [...new Set([...(appData ? [appData] : []), ...checkedGrants.map((grant) => grant.path)])];
 	if (options.exact) resolved.forEach((p, i) => {
 		if (p !== options.writable[i]) throw new Error(`${options.writable[i]} now leads somewhere else (a link may have moved); nothing ran.`);
 	});
@@ -459,7 +509,7 @@ export function contained(file: string, args: string[], options: { writable: str
 		// This program runs the command under a write-restricted token (windows_contain.ts): the compiled binary
 		// itself, or bun with the CLI's source.
 		const self = selfCommand();
-		const writable = [...options.writable, ...(options.temp === false ? [] : [safeTemp()])].map((p) => resolve(p));
+		const writable = [...options.writable, ...engineWrite, ...(options.temp === false ? [] : [safeTemp()])].map((p) => resolve(p));
 		return { file: self[0]!, args: [...self.slice(1), "__contain", JSON.stringify(writable), "--", file, ...args], facility };
 	}
 	const writable = [...resolved, ...(options.temp === false ? [] : [safeTemp()])].filter((p, i, all) => existsSync(p) && all.indexOf(p) === i);
@@ -494,9 +544,15 @@ export function contained(file: string, args: string[], options: { writable: str
 			// Bound read only over the writable folder (only what exists: bubblewrap can't protect a missing path).
 			...protect.filter((p) => existsSync(p)).flatMap((p) => ["--ro-bind", p, p]),
 		];
-		// By engine-owned paths, placed after every mask. The untrusted process cannot replace these names, and app
-		// backends cannot hand the launcher extra file descriptors.
-		engineWriteBinds = engineWrite.flatMap((path) => ["--dir", path, "--bind", path, path]);
+		// By held recorded identities, placed after every mask. The untrusted process cannot redirect the source name
+		// between validation and bubblewrap's bind.
+		engineWriteBinds = [
+			...(appData ? ["--dir", appData, "--bind", appData, appData] : []),
+			...checkedGrants.flatMap((grant) => {
+				held.push(holdEngineWriteGrant(grant));
+				return ["--dir", grant.path, "--bind-fd", String(2 + held.length), grant.path];
+			}),
+		];
 	} catch (error) {
 		for (const fd of held) closeSync(fd);
 		throw error;
@@ -518,12 +574,18 @@ export function contained(file: string, args: string[], options: { writable: str
 }
 
 interface GitQuarantineRecord {
-	version: 1;
+	version: 1 | 2;
 	project: string;
 	baseline: GitEntryBaseline;
 	quarantine: string;
+	/** Completed moves imported from the version 1 journal. */
 	moved?: GitQuarantineResult["moved"];
+	intents: GitQuarantineIntent[];
+	done: GitQuarantineIntent[];
 }
+
+type GitQuarantineHeader = Omit<GitQuarantineRecord, "intents" | "done">;
+type GitQuarantineEvent = GitQuarantineIntent & { event: "intent" | "done" };
 
 const activeGitQuarantines = new Set<string>();
 
@@ -590,16 +652,23 @@ function checkedGitQuarantineFolder(root: string, create: boolean, home = labHom
 }
 
 function readGitQuarantineRecord(file: string, project?: string): GitQuarantineRecord | undefined {
-	const entry = lstatSync(file, { throwIfNoEntry: false });
-	if (!entry) return undefined;
-	if (!entry.isFile() || entry.isSymbolicLink()) throw new Error("the cleanup journal is not a regular file");
-	let value: unknown;
+	let entry: ReturnType<typeof lstatSync>;
 	try {
-		value = JSON.parse(readFileSync(file, "utf8"));
+		entry = lstatSync(file);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		throw error;
+	}
+	if (!entry.isFile() || entry.isSymbolicLink()) throw new Error("the cleanup journal is not a regular file");
+	let lines: unknown[];
+	try {
+		const text = readFileSync(file, "utf8");
+		if (!text.endsWith("\n")) throw new Error("the cleanup journal has an incomplete record");
+		lines = text.slice(0, -1).split("\n").map((line) => JSON.parse(line));
 	} catch (error) {
 		throw new Error(`the cleanup journal cannot be read: ${(error as Error).message}`);
 	}
-	const record = value as Partial<GitQuarantineRecord>;
+	const record = lines[0] as Partial<GitQuarantineHeader>;
 	const entries = record.baseline?.entries;
 	const validRelative = (path: unknown): path is string => typeof path === "string" && path.split("/").every((part) => part && part !== "." && part !== "..");
 	const validEntries = Array.isArray(entries) && entries.every((item) =>
@@ -614,18 +683,47 @@ function readGitQuarantineRecord(file: string, project?: string): GitQuarantineR
 	const validMoved = record.moved === undefined || (Array.isArray(record.moved) && record.moved.every((move) =>
 		move && validRelative(move.from) && move.from.split("/").at(-1)?.toLowerCase() === ".git" && typeof move.to === "string" && dirname(move.to) === record.quarantine && /^git-[a-f0-9]{24}$/.test(basename(move.to))
 	));
-	if (record.version !== 1 || typeof record.project !== "string" || !isAbsolute(record.project) || (project !== undefined && record.project !== project) || typeof record.baseline?.root !== "string" || !/^\d+:\d+$/.test(record.baseline.root) || !validEntries || !validQuarantine || !validMoved) {
+	if ((record.version !== 1 && record.version !== 2) || typeof record.project !== "string" || !isAbsolute(record.project) || (project !== undefined && record.project !== project) || typeof record.baseline?.root !== "string" || !/^\d+:\d+$/.test(record.baseline.root) || !validEntries || !validQuarantine || !validMoved) {
 		throw new Error("the cleanup journal is invalid");
 	}
-	return record as GitQuarantineRecord;
+	if (record.version === 1 && lines.length !== 1) throw new Error("the cleanup journal is invalid");
+	const intents: GitQuarantineIntent[] = [];
+	const done: GitQuarantineIntent[] = [];
+	const pending = new Map<string, GitQuarantineIntent>();
+	const key = (move: GitQuarantineIntent) => `${move.item}\0${move.from}\0${move.to}`;
+	for (const value of lines.slice(1)) {
+		const event = value as Partial<GitQuarantineEvent>;
+		const valid = (event.event === "intent" || event.event === "done")
+			&& typeof event.item === "string" && /^\d+:\d+$/.test(event.item)
+			&& validRelative(event.from) && event.from.split("/").at(-1)?.toLowerCase() === ".git"
+			&& typeof event.to === "string" && dirname(event.to) === record.quarantine && /^git-[a-f0-9]{24}$/.test(basename(event.to));
+		if (!valid) throw new Error("the cleanup journal is invalid");
+		const move = { item: event.item!, from: event.from!, to: event.to! };
+		const id = key(move);
+		if (event.event === "intent") {
+			if (pending.has(id) || done.some((item) => key(item) === id)) throw new Error("the cleanup journal has a duplicate intent");
+			pending.set(id, move);
+			intents.push(move);
+		} else {
+			if (!pending.delete(id)) throw new Error("the cleanup journal has a done record without its intent");
+			done.push(move);
+		}
+	}
+	return { ...(record as GitQuarantineHeader), intents, done };
 }
 
 function locateGitQuarantineRecord(project: string, home: string): { marker: string; record?: GitQuarantineRecord } {
 	const direct = gitQuarantineMarker(project, home);
-	// existsSync hides access and lookup errors as absence. Only ENOENT may mean there is no pending journal.
-	if (lstatSync(direct, { throwIfNoEntry: false })) return { marker: direct, record: readGitQuarantineRecord(direct, project) };
-	const current = statSync(project, { bigint: true, throwIfNoEntry: false });
-	if (!current) return { marker: direct };
+	// Only a confirmed ENOENT means there is no pending journal. Access, I/O and validation errors all block.
+	const directRecord = readGitQuarantineRecord(direct, project);
+	if (directRecord) return { marker: direct, record: directRecord };
+	let current: ReturnType<typeof statSync>;
+	try {
+		current = statSync(project, { bigint: true });
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return { marker: direct };
+		throw error;
+	}
 	const identity = `${current.dev}:${current.ino}`;
 	const directory = dirname(direct);
 	let matched: { marker: string; record: GitQuarantineRecord } | undefined;
@@ -638,15 +736,12 @@ function locateGitQuarantineRecord(project: string, home: string): { marker: str
 	}
 	for (const name of names.filter((name) => name.endsWith(".json"))) {
 		const marker = join(directory, name);
-		try {
-			const record = readGitQuarantineRecord(marker);
-			if (record?.baseline.root !== identity) continue;
-			if (matched) throw new Error("more than one cleanup journal names this project folder");
-			matched = { marker, record };
-		} catch (error) {
-			if ((error as Error).message.startsWith("more than one")) throw error;
-			// An invalid record for another project does not block this one. Its direct path still fails closed.
-		}
+		const record = readGitQuarantineRecord(marker);
+		// A candidate that disappeared after enumeration is a confirmed ENOENT and can be skipped. Every other error
+		// from lookup, reading or validation refuses recovery.
+		if (!record || record.baseline.root !== identity) continue;
+		if (matched) throw new Error("more than one cleanup journal names this project folder");
+		matched = { marker, record };
 	}
 	return matched ?? { marker: direct };
 }
@@ -662,6 +757,13 @@ function removeGitQuarantineMarker(file: string): string | undefined {
 
 export interface GitRecovery {
 	moved: { from: string; to: string }[];
+}
+
+const quarantineMoveKey = (move: GitQuarantineIntent) => `${move.item}\0${move.from}\0${move.to}`;
+
+function pendingGitQuarantineIntents(record: GitQuarantineRecord): GitQuarantineIntent[] {
+	const done = new Set(record.done.map(quarantineMoveKey));
+	return record.intents.filter((move) => !done.has(quarantineMoveKey(move)));
 }
 
 /** Verify quarantine and finish pending cleanup before a contained command or file write can start. */
@@ -681,14 +783,23 @@ export function recoverGitQuarantine(root: string, home = labHome()): GitRecover
 	}
 	let held: ReturnType<typeof holdGitEntries> | undefined;
 	try {
+		if (record.version === 1) record = upgradeGitQuarantineRecord(marker, record);
 		if (pathAtOrBelow(record.quarantine, project)) throw new Error("the recorded quarantine is now inside the project");
 		const projectStat = statSync(project, { bigint: true });
 		// A pending pass stays bound to the journaled destination. Every real rename is the cross-mount proof.
 		const quarantine = verifyGitQuarantineFolder(record.quarantine, projectStat.dev);
 		held = holdGitEntries(project, GIT_SCAN_MAX, GIT_SCAN_DEPTH, record.baseline, quarantine);
 		const prior = [...(record.moved ?? [])];
-		const result = held.quarantine(true, (move) => appendGitQuarantineMove(marker, record, move));
+		for (const move of pendingGitQuarantineIntents(record)) {
+			held.recover(move);
+			appendGitQuarantineEvent(marker, record, { event: "done", ...move });
+			prior.push({ from: move.from, to: move.to });
+		}
+		const journal = gitQuarantineJournal(marker, record);
+		const result = held.quarantine(true, journal);
 		if (result.error) throw new Error(result.error);
+		const verified = readGitQuarantineRecord(marker, record.project);
+		if (!verified || pendingGitQuarantineIntents(verified).length) throw new Error("the cleanup journal still has an intent without a done record");
 		const removeError = removeGitQuarantineMarker(marker);
 		if (removeError) throw new Error(removeError);
 		return { moved: [...prior, ...result.moved] };
@@ -701,28 +812,91 @@ export function recoverGitQuarantine(root: string, home = labHome()): GitRecover
 
 function writeGitQuarantineRecord(file: string, record: GitQuarantineRecord): void {
 	const directory = dirname(file);
-	mkdirSync(directory, { recursive: true, mode: 0o700 });
+	mkdirPhysical(directory);
+	fsyncDirectory(dirname(directory));
+	const header: GitQuarantineHeader = { version: record.version, project: record.project, baseline: record.baseline, quarantine: record.quarantine, ...(record.moved?.length ? { moved: record.moved } : {}) };
 	const temporary = join(directory, `.${basename(file)}.${process.pid}-${randomBytes(6).toString("hex")}.tmp`);
+	let fd: number | undefined;
 	try {
-		writeFileSync(temporary, `${JSON.stringify(record)}\n`, { encoding: "utf8", flag: "wx", mode: 0o600 });
+		fd = openPhysical(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
+		writeAll(fd, `${JSON.stringify(header)}\n`);
+		fsyncSync(fd);
+		closeSync(fd);
+		fd = undefined;
 		// A hard link publishes the complete record without replacing a journal another command made.
 		linkSync(temporary, file);
+		fsyncDirectory(directory);
 	} finally {
+		if (fd !== undefined) closeSync(fd);
 		rmSync(temporary, { force: true });
 	}
 }
 
-/** Persist every completed move before the pass attempts another item. */
-function appendGitQuarantineMove(file: string, record: GitQuarantineRecord, move: GitQuarantineResult["moved"][number]): void {
-	record.moved = [...(record.moved ?? []), move];
+function writeAll(fd: number, text: string): void {
+	const bytes = Buffer.from(text);
+	let offset = 0;
+	while (offset < bytes.length) {
+		const written = writeSync(fd, bytes, offset, bytes.length - offset);
+		if (written <= 0) throw new Error("the cleanup journal write made no progress");
+		offset += written;
+	}
+}
+
+function fsyncDirectory(directory: string): void {
+	const fd = openPhysical(directory, constants.O_RDONLY | constants.O_DIRECTORY);
+	try {
+		fsyncSync(fd);
+	} finally {
+		closeSync(fd);
+	}
+}
+
+function replaceGitQuarantineRecord(file: string, header: GitQuarantineHeader): void {
 	const directory = dirname(file);
 	const temporary = join(directory, `.${basename(file)}.${process.pid}-${randomBytes(6).toString("hex")}.tmp`);
+	let fd: number | undefined;
 	try {
-		writeFileSync(temporary, `${JSON.stringify(record)}\n`, { encoding: "utf8", flag: "wx", mode: 0o600 });
+		fd = openPhysical(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
+		writeAll(fd, `${JSON.stringify(header)}\n`);
+		fsyncSync(fd);
+		closeSync(fd);
+		fd = undefined;
 		renameSync(temporary, file);
+		fsyncDirectory(directory);
 	} finally {
+		if (fd !== undefined) closeSync(fd);
 		rmSync(temporary, { force: true });
 	}
+}
+
+function upgradeGitQuarantineRecord(file: string, record: GitQuarantineRecord): GitQuarantineRecord {
+	const upgraded: GitQuarantineRecord = { ...record, version: 2, intents: [], done: [] };
+	replaceGitQuarantineRecord(file, { version: 2, project: record.project, baseline: record.baseline, quarantine: record.quarantine, ...(record.moved?.length ? { moved: record.moved } : {}) });
+	return upgraded;
+}
+
+/** Append and fsync one write-ahead event. The in-memory record changes only after the durable append succeeds. */
+function appendGitQuarantineEvent(file: string, record: GitQuarantineRecord, event: GitQuarantineEvent): void {
+	if (record.version !== 2) throw new Error("the cleanup journal was not upgraded before a move");
+	const fd = openPhysical(file, constants.O_WRONLY | constants.O_APPEND);
+	try {
+		const entry = fstatSync(fd);
+		if (!entry.isFile()) throw new Error("the cleanup journal is not a regular file");
+		writeAll(fd, `${JSON.stringify(event)}\n`);
+		fsyncSync(fd);
+	} finally {
+		closeSync(fd);
+	}
+	const move = { item: event.item, from: event.from, to: event.to };
+	if (event.event === "intent") record.intents.push(move);
+	else record.done.push(move);
+}
+
+function gitQuarantineJournal(file: string, record: GitQuarantineRecord): GitQuarantineJournal {
+	return {
+		intent: (move) => appendGitQuarantineEvent(file, record, { event: "intent", ...move }),
+		done: (move) => appendGitQuarantineEvent(file, record, { event: "done", ...move }),
+	};
 }
 
 function guardedGitEntries(root: string, home = labHome()): ReturnType<typeof holdGitEntries> & { recovered: GitRecovery } {
@@ -731,7 +905,7 @@ function guardedGitEntries(root: string, home = labHome()): ReturnType<typeof ho
 	const recovered = recoverGitQuarantine(project, home);
 	const quarantine = gitQuarantineFolder(project, home);
 	const held = holdGitEntries(project, GIT_SCAN_MAX, GIT_SCAN_DEPTH, undefined, quarantine);
-	const record: GitQuarantineRecord = { version: 1, project, baseline: held.baseline, quarantine, moved: [] };
+	const record: GitQuarantineRecord = { version: 2, project, baseline: held.baseline, quarantine, intents: [], done: [] };
 	try {
 		writeGitQuarantineRecord(marker, record);
 		activeGitQuarantines.add(marker);
@@ -740,18 +914,25 @@ function guardedGitEntries(root: string, home = labHome()): ReturnType<typeof ho
 		throw new Error(`EnrichedLab could not record the required .git cleanup state, so no contained command ran: ${(error as Error).message}`);
 	}
 	let final = false;
+	let failed: string | undefined;
 	return {
 		...held,
 		recovered,
 		quarantine(isFinal = true) {
-			const result = held.quarantine(isFinal, (move) => appendGitQuarantineMove(marker, record, move));
+			const result = held.quarantine(isFinal, gitQuarantineJournal(marker, record));
+			if (result.error) failed ??= result.error;
 			if (!isFinal || final) return result;
 			final = true;
 			activeGitQuarantines.delete(marker);
-			if (!result.error) {
-				const error = removeGitQuarantineMarker(marker);
-				if (error) return { ...result, error };
+			if (failed) return { ...result, error: failed };
+			try {
+				const verified = readGitQuarantineRecord(marker, project);
+				if (!verified || pendingGitQuarantineIntents(verified).length) return { ...result, error: "the cleanup journal still has an intent without a done record" };
+			} catch (error) {
+				return { ...result, error: (error as Error).message };
 			}
+			const error = removeGitQuarantineMarker(marker);
+			if (error) return { ...result, error };
 			return result;
 		},
 	};
@@ -1145,9 +1326,9 @@ export class LocalWorkspace implements Workspace {
 				const result = launch.quarantine?.(final);
 				if (!result) return;
 				for (const { from, to } of result.moved) take(Buffer.from(`\nEnrichedLab moved ${JSON.stringify(from)} to ${JSON.stringify(to)} because it was created during a contained command. Nothing was deleted.\n`));
-				if (result.error && final) {
+				if (result.error) {
 					cleanupFailed = true;
-					take(Buffer.from(`\nEnrichedLab could not finish checking new .git entries: ${result.error} Later contained commands and file writes are blocked until an anchored quarantine pass succeeds.\n`));
+					take(Buffer.from(`\nEnrichedLab could not finish checking new .git entries${final ? "" : " after the foreground process exited"}: ${result.error} Later contained commands and file writes are blocked until an anchored quarantine pass succeeds.\n`));
 				}
 			};
 			// Foreground completion and, separately, the end of every background child. The sync pipe is part of

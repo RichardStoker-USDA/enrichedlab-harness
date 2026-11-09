@@ -493,6 +493,7 @@ export class AppHost {
 				? Promise.reject(new Error(`${session!.place} keeps its data inside, so this app's backend runs in its sandbox. Sign in to ${session!.place}, with its sandbox on, first.`))
 				: startBackend(app.manifest, {
 					dir: app.dir,
+					engineOwned: app.source !== "project",
 					dataDir: this.dataDir(app.id),
 					// A shared lab backend sees the folder holding every session's project; each call names its own.
 					projectDir: session?.place === "local" ? session.project : lab ? dirname(session!.workspace.root) : undefined,

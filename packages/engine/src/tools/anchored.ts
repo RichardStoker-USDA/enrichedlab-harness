@@ -134,11 +134,25 @@ export interface GitQuarantineResult {
 	error?: string;
 }
 
+export interface GitQuarantineIntent {
+	/** Device and inode of the entry named when the intent was recorded. */
+	item: string;
+	from: string;
+	to: string;
+}
+
+export interface GitQuarantineJournal {
+	intent(move: GitQuarantineIntent): void;
+	done(move: GitQuarantineIntent): void;
+}
+
 export interface HeldGitEntries {
 	paths: string[];
 	baseline: GitEntryBaseline;
 	quarantinePath: string;
-	quarantine(final?: boolean, onMove?: (move: GitQuarantineResult["moved"][number]) => void): GitQuarantineResult;
+	/** Reconcile a durable intent left without its durable done record. */
+	recover(move: GitQuarantineIntent): { moved: boolean };
+	quarantine(final?: boolean, journal?: GitQuarantineJournal): GitQuarantineResult;
 	release(): void;
 }
 
@@ -207,15 +221,18 @@ export function holdGitEntries(path: string, maxEntries = 50_000, maxDepth = 64,
 		release();
 		throw error;
 	}
-	const walk = (visit: (dir: number, name: string, relative: string) => void, final = false) => {
+	const walk = (visit: (dir: number, name: string, relative: string) => void, ownerAccess: "check" | "defer" | "restore" = "check") => {
 		if (released) throw new Error("The project folder is no longer held.");
 		let seen = 0;
 		const descend = (dir: number, relative: string, depth: number) => {
 			// After every sandbox process has ended, temporarily restore owner access that the command removed. The
 			// held descriptor names the same directory even if its path was renamed. Restore the command's mode after
-			// the scan. The earlier foreground pass never changes modes while a background child may still be running.
-			const originalMode = fstatSync(dir).mode & 0o7777;
-			const changedMode = final && (originalMode & 0o700) !== 0o700;
+			// the scan. The foreground pass defers owned folders that need this recovery until every child has ended.
+			const directory = fstatSync(dir);
+			const originalMode = directory.mode & 0o7777;
+			const needsOwnerAccess = (originalMode & 0o700) !== 0o700;
+			if (ownerAccess === "defer" && directory.uid === process.getuid?.() && needsOwnerAccess) return;
+			const changedMode = ownerAccess === "restore" && needsOwnerAccess;
 			if (changedMode) chmodSync(`/proc/self/fd/${dir}`, originalMode | 0o700);
 			let stream: Pointer | null = null;
 			try {
@@ -265,14 +282,77 @@ export function holdGitEntries(path: string, maxEntries = 50_000, maxDepth = 64,
 		};
 		descend(root, "", 0);
 	};
-	const identity = (dir: number, name: string): { id: string; symlink: boolean } => {
+	const identityIfPresent = (dir: number, name: string, display: string): { id: string; symlink: boolean } | undefined => {
+		errno[0] = 0;
 		const fd = lib().openat(dir, c(name), LINUX_O_PATH | constants.O_NOFOLLOW | LINUX_O_CLOEXEC, 0);
-		if (fd < 0) throw new Error(`Couldn't check the identity of ${name}.`);
+		if (fd < 0) {
+			if (errno[0] === 2) return undefined;
+			throw new Error(`Couldn't check the identity of ${display}: errno ${errno[0]}.`);
+		}
 		try {
 			const stat = fstatSync(fd, { bigint: true });
 			return { id: `${stat.dev}:${stat.ino}`, symlink: stat.isSymbolicLink() };
 		} finally {
 			lib().close(fd);
+		}
+	};
+	const identity = (dir: number, name: string, display = name): { id: string; symlink: boolean } => {
+		const found = identityIfPresent(dir, name, display);
+		if (!found) throw new Error(`Couldn't check the identity of ${display}: it disappeared.`);
+		return found;
+	};
+	const sourceParent = (relative: string): { dir?: number; name: string } => {
+		const names = relative.split("/");
+		const name = names.pop();
+		if (!name || names.some((part) => !part || part === "." || part === "..")) throw new Error(`The recorded quarantine source ${relative} is invalid.`);
+		let dir = lib().dup(root);
+		if (dir < 0) throw new Error(`Couldn't hold the recorded quarantine source ${relative}.`);
+		for (let index = 0; index < names.length; index++) {
+			const part = names[index]!;
+			errno[0] = 0;
+			const child = lib().openat(dir, c(part), LINUX_O_PATH | constants.O_DIRECTORY | constants.O_NOFOLLOW | LINUX_O_CLOEXEC, 0);
+			const code = errno[0];
+			lib().close(dir);
+			if (child < 0) {
+				if (code === 2) return { name };
+				throw new Error(`Couldn't check the recorded quarantine source ${relative}: errno ${code}.`);
+			}
+			try {
+				const childStat = fstatSync(child, { bigint: true });
+				const childMount = mountId(child, names.slice(0, index + 1).join("/"));
+				if (childStat.dev !== rootStat.dev || childMount !== rootMount) throw new Error(`The recorded quarantine source ${relative} crosses a mount boundary.`);
+			} catch (error) {
+				lib().close(child);
+				throw error;
+			}
+			dir = child;
+		}
+		return { dir, name };
+	};
+	const recover = (move: GitQuarantineIntent): { moved: boolean } => {
+		if (dirname(move.to) !== quarantinePath || !/^git-[a-f0-9]{24}$/.test(move.to.split(sep).at(-1) ?? "")) throw new Error(`The recorded quarantine destination ${move.to} is invalid.`);
+		const source = sourceParent(move.from);
+		let sourceIdentity: string | undefined;
+		try {
+			sourceIdentity = source.dir === undefined ? undefined : identityIfPresent(source.dir, source.name, move.from)?.id;
+			const targetName = move.to.split(sep).at(-1)!;
+			const targetIdentity = identityIfPresent(quarantineRoot, targetName, move.to)?.id;
+			if (targetIdentity === move.item) {
+				if (sourceIdentity === move.item) throw new Error(`Both ${move.from} and ${move.to} name the recorded item; cleanup cannot choose between them.`);
+				return { moved: false };
+			}
+			if (targetIdentity !== undefined) throw new Error(`${move.to} exists with a different identity.`);
+			if (sourceIdentity === undefined) throw new Error(`Neither ${move.from} nor ${move.to} contains the recorded item.`);
+			if (sourceIdentity !== move.item) throw new Error(`${move.from} exists with a different identity and ${move.to} is missing.`);
+			if (source.dir === undefined) throw new Error(`${move.from} is missing.`);
+			errno[0] = 0;
+			if (lib().renameat2(source.dir, c(source.name), quarantineRoot, c(targetName), 1) !== 0) throw new Error(`Couldn't complete the recorded move from ${move.from} to ${move.to}: errno ${errno[0]}.`);
+			const movedIdentity = identityIfPresent(quarantineRoot, targetName, move.to)?.id;
+			const left = identityIfPresent(source.dir, source.name, move.from);
+			if (movedIdentity !== move.item || left) throw new Error(`The completed move from ${move.from} to ${move.to} did not match its recorded identity.`);
+			return { moved: true };
+		} finally {
+			if (source.dir !== undefined) lib().close(source.dir);
 		}
 	};
 	const initial = new Map<string, string>(saved?.entries ?? []);
@@ -294,14 +374,19 @@ export function holdGitEntries(path: string, maxEntries = 50_000, maxDepth = 64,
 		paths: [...initial.keys()].map((relative) => join(path, relative)),
 		baseline: { root: rootIdentity, entries: [...initial] },
 		quarantinePath,
+		recover,
 		release,
-		quarantine(final = true, onMove) {
+		quarantine(final = true, journal) {
 			const moved: { from: string; to: string }[] = [];
 			try {
 				walk((dir, name, relative) => {
 					// Moving an old metadata directory away and making a new one at its name is still a new entry.
-					if (initial.get(relative) === identity(dir, name).id) return;
+					const item = identity(dir, name, relative).id;
+					if (initial.get(relative) === item) return;
 					const blocked = `git-${randomBytes(12).toString("hex")}`;
+					const intent = { item, from: relative, to: join(quarantinePath, blocked) };
+					// The durable intent must exist before the rename. The durable done record follows verification.
+					journal?.intent(intent);
 					// renameat2 never follows the final entry, even if it is a symlink. NOREPLACE prevents any loss of
 					// existing data at the destination. The destination is engine-owned and outside the project.
 					errno[0] = 0;
@@ -315,10 +400,17 @@ export function holdGitEntries(path: string, maxEntries = 50_000, maxDepth = 64,
 						}
 						throw new Error(`Couldn't move aside ${relative}: ${name}.`);
 					}
-					const move = { from: relative, to: join(quarantinePath, blocked) };
+					const target = identityIfPresent(quarantineRoot, blocked, intent.to)?.id;
+					const left = identityIfPresent(dir, name, relative);
+					if (target !== item || left) throw new Error(`The move from ${relative} to ${intent.to} did not match its recorded identity.`);
+					journal?.done(intent);
+					const move = { from: relative, to: intent.to };
 					moved.push(move);
-					onMove?.(move);
-				}, final);
+				}, final ? "restore" : "defer");
+				// With all sandbox children gone, the project must match the baseline before its journal can be removed.
+				if (final) walk((dir, name, relative) => {
+					if (initial.get(relative) !== identity(dir, name, relative).id) throw new Error(`${relative} changed during the final .git verification scan.`);
+				}, "restore");
 				return { moved };
 			} catch (error) {
 				return { moved, error: (error as Error).message };

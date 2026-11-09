@@ -101,13 +101,18 @@ The engine's own work stays inside the same line:
 - App backends (`bun`, `command`, `serve`) run contained or not at all. Their only grant inside the hidden
   `app-data` tree is the current app's own data folder, bound by its engine-owned path after the private-folder masks;
   sibling app data stays hidden. The engine home is otherwise read only. The current app-data folder and an installed
-  app's own `.pixi` folder are reopened only by their exact engine-owned grants after that mask. On Windows, where
+  app's own `.pixi` folder are reopened only by their exact engine-owned grants after that mask. The engine makes an
+  installed app's `.pixi` directory through a no-link path walk and records its device and inode. Each launch refuses
+  a link, a missing directory or a different identity. A project app's `.pixi` path is never an engine-home grant,
+  including when a project link points into the engine home. On Windows, where
   servers run as the person, the consent card says so before anything starts. A served backend needs a named network
   grant before it starts. Seatbelt limits that grant to loopback unless the manifest asks for network. Bubblewrap
   cannot provide loopback without sharing the host network, so the Linux card names that whole-network access.
 - Package installs and listings run contained with the pinned pixi, checked against its SHA-256 before each use. An
-  installed app environment can write only its exact app and cache destinations below the engine home. A listing
-  never downloads pixi and gets no network.
+  installed app environment can write only its recorded app, environment and cache directory identities below the
+  engine home. The ordinary project environment uses the same recorded-identity exception for its engine-owned
+  package cache without adding that cache to the project write grant. A listing never downloads pixi and gets no
+  network.
 - File tools reject a `.git` component before and after following links on every platform. They also refuse every
   write to the active engine home and the trusted Git configuration paths listed above, before creating or opening
   the target and after resolving links. On macOS and Linux the final write uses the same anchored no-follow path
@@ -132,23 +137,30 @@ The engine's own work stays inside the same line:
   Before starting the command, the engine records the project identity, quarantine path and the
   identities of existing `.git` entries in its own `run` folder. If that record cannot be written, the command does
   not start. When the foreground command exits, the engine makes a bounded cleanup pass without changing modes while
-  background children may still run. After every child ends, the final anchored pass uses the same 50,000-entry and
+  background children may still run. It defers owned folders that need owner-access recovery to the final pass.
+  After every child ends, the final anchored pass uses the same 50,000-entry and
   64-level bounds. Every directory is compared with the held project root by both device and Linux mount ID. A
   nested mount is refused instead of crossed, including a bind mount of the same filesystem. The pass temporarily
-  adds owner access to a directory the command made inaccessible, moves each new or replaced `.git` entry atomically
-  into the held quarantine descriptor, records that completed move in the engine-owned journal before trying the
-  next item, then restores the directory's mode. It
+  adds owner access to a directory the command made inaccessible, then handles each new or replaced `.git` entry with
+  a write-ahead journal. It appends the item identity, source and destination as an intent and fsyncs the journal
+  before the anchored rename. After the rename it verifies both names through the held descriptors, appends a done
+  record and fsyncs again before trying the next item. It then restores the directory's mode. It
   reports the original path and exact quarantine path in command output. Nothing is deleted or overwritten, and
   cleanup never follows a link. A lifecycle pipe keeps final cleanup attached to background children even when they
-  redirect output; the command result waits for them to end. A successful final pass removes the cleanup record.
+  redirect output; the command result waits for them to end. The final pass scans again to confirm the baseline. It
+  removes the cleanup record only after that scan succeeds and every intent has its done record.
 
-  A final scan or move error returns exit 125 and leaves the project and cleanup record in place. It does not move
+  Any foreground or final journal append, fsync, rename, verification or scan error returns exit 125 and leaves the
+  cleanup record in place. It does not move
   the project, leave its access bits changed or delete data to enforce the rule. Before any later contained command
   or local file-tool write in that project, the engine retries the anchored pass. An invalid record, a journal lookup
-  or directory access error, or another failure refuses that command or write before it creates anything. Reads
+  or directory access error, or another failure refuses that command or write before it creates anything. Candidate
+  journal lookup, validation and read errors are refused; only a confirmed `ENOENT` counts as absence. Reads
   remain available so the person's data is not hidden. Recovery also finds a pending record by folder identity after
   the project is renamed or reached through another physical path. The pending pass uses the quarantine recorded in
-  its journal, even if a new sibling becomes available. It retries the real renames against that exact destination.
+  its journal, even if a new sibling becomes available. For an intent without a done record, recovery checks the
+  source and destination identities through the held descriptors. It completes a move still at its source, records a
+  move already at its destination as done, or refuses an absent, mismatched or ambiguous item.
   With no cleanup record, an
   ordinary file write verifies an existing sibling but does not create or check a hypothetical fallback.
 
@@ -351,7 +363,8 @@ card explains that bubblewrap must share the whole host network. A container bui
 card. The saved grant key includes the effective network scope and backend, so a grant without those fields asks
 again. The build command uses `--network none` without that grant. A networkless container run uses `--pull=never`,
 so a missing image cannot trigger an unapproved pull. Building an app's pixi environment runs contained: pixi may
-write the app's folder and its own cache under `~/.el/tools`, never the person's shared package caches, and gets no keys.
+write the app's recorded folder and environment identities and its recorded cache under `~/.el/tools`, never the
+person's shared package caches, and gets no keys.
 The card lists every package (conda, PyPI, other channels and indexes, and anything built from source), and a grant
 covers that exact `pixi.toml`: a change asks again. An app package is checked against its size limits before it is
 unpacked. Lab sandboxes are isolated by the lab.

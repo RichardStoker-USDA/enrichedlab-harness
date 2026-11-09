@@ -6,7 +6,7 @@
 import { createHash } from "node:crypto";
 import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { contained, containedTempEnvironment, physical, safeTemp } from "../tools/workspace.ts";
+import { contained, containedTempEnvironment, createEngineWriteGrantIfEligible, type EngineWriteGrant, physical, safeTemp } from "../tools/workspace.ts";
 
 export const PIXI_VERSION = "0.82.0";
 
@@ -72,21 +72,41 @@ export const hasEnvironment = (dir: string): boolean => existsSync(join(dir, "pi
  * write only the app's folder and its own caches under `tools` (never the person's shared pixi or uv caches, which
  * other projects read), and it gets no keys or tokens. The app itself then runs offline in its sandbox.
  */
-export async function inEnvironment(dir: string, command: string[], tools: string, log: (line: string) => void): Promise<string[]> {
-	const program = await pixi(tools, log);
+export interface EnvironmentCommand {
+	command: string[];
+	/** Present only for an environment the engine created under its own home. */
+	engineWrite?: EngineWriteGrant;
+}
+
+export async function inEnvironment(dir: string, command: string[], tools: string, log: (line: string) => void, engineOwned = false): Promise<EnvironmentCommand> {
 	// The app's own folder, where it really is, holding its own manifest: not a link to somewhere else.
 	const home = physical(dir);
 	if (lstatSync(dir, { throwIfNoEntry: false })?.isSymbolicLink() || !statSync(home, { throwIfNoEntry: false })?.isDirectory()) throw new Error("The app's folder is a link or missing, so its environment wasn't built.");
 	for (const name of ["pixi.toml", "pixi.lock"]) if (lstatSync(join(home, name), { throwIfNoEntry: false })?.isSymbolicLink()) throw new Error(`The app's ${name} is a link, so its environment wasn't built.`);
+	const environmentPath = join(home, ".pixi");
+	if (lstatSync(environmentPath, { throwIfNoEntry: false })?.isSymbolicLink()) throw new Error("The app's .pixi is a link, so its environment wasn't built.");
 	const manifest = join(home, "pixi.toml");
 	log(existsSync(join(dir, "pixi.lock")) ? "Checking the app's environment" : "Building the app's environment (first run takes a few minutes)");
 	// pixi keeps conda packages, repodata and its uv cache under PIXI_CACHE_DIR.
 	const caches = join(tools, "pixi-cache");
-	mkdirSync(caches, { recursive: true });
+	const cacheGrant = createEngineWriteGrantIfEligible(caches);
+	if (!cacheGrant) mkdirSync(caches, { recursive: true });
+	const environmentGrant = engineOwned ? createEngineWriteGrantIfEligible(environmentPath) : undefined;
+	// An installed app's root is also engine-created. Pixi may update pixi.lock there during the install, but the
+	// backend later receives only the recorded .pixi identity.
+	const appGrant = engineOwned ? createEngineWriteGrantIfEligible(home) : undefined;
+	if (engineOwned && (!appGrant || !environmentGrant)) throw new Error("The installed app is not held below the engine home, so its environment wasn't built.");
+	const program = await pixi(tools, log);
 	const inherited: Record<string, string> = { PIXI_NO_PATH_UPDATE: "1", PIXI_CACHE_DIR: caches, PIXI_HOME: caches };
 	for (const key of ["PATH", "HOME", "LANG", "LC_ALL", "SYSTEMROOT", "SSL_CERT_FILE", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY"]) if (process.env[key]) inherited[key] = process.env[key]!;
 	const env = containedTempEnvironment(inherited);
-	const launch = contained(program, ["install", "--manifest-path", manifest], { writable: [home, physical(caches)], readable: [program], network: "all", exact: true, engineWrite: [home, physical(caches)] });
+	const launch = contained(program, ["install", "--manifest-path", manifest], {
+		writable: [home, ...(cacheGrant ? [] : [physical(caches)])],
+		readable: [program],
+		network: "all",
+		exact: true,
+		engineWrite: [appGrant, environmentGrant, cacheGrant].filter((grant): grant is EngineWriteGrant => grant !== undefined),
+	});
 	// Build scripts never run uncontained: without a facility here, nothing is installed (the consent card says contained).
 	if (!launch.facility) throw new Error("This computer has no sandbox to contain the app's install (Seatbelt on macOS, bubblewrap on Linux), so nothing was installed.");
 	// From a scratch folder: some packages' install scripts write test files where they run, and the app's folder
@@ -102,7 +122,7 @@ export async function inEnvironment(dir: string, command: string[], tools: strin
 		launch.release?.();
 	}
 	if (install.exitCode !== 0) throw new Error(`Building the app's environment failed; the app's log has pixi's output.`);
-	return [program, "run", "--manifest-path", manifest, "--frozen", "--", ...command];
+	return { command: [program, "run", "--manifest-path", manifest, "--frozen", "--", ...command], ...(environmentGrant ? { engineWrite: environmentGrant } : {}) };
 }
 
 /** What an environment would install, for the consent card, and a digest of its manifest for the grant. */

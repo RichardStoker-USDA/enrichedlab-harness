@@ -63,6 +63,8 @@ export type Backend = McpBackend | ServedBackend;
 export interface BackendContext {
 	/** The app's folder. */
 	dir: string;
+	/** True only when the engine installed this app folder, never when a project path resolved into engine storage. */
+	engineOwned?: boolean;
 	/** Its writable folder. */
 	dataDir: string;
 	/** The project of the session that opened it, when there is one. */
@@ -322,9 +324,18 @@ export async function startBackend(manifest: AppManifest, ctx: BackendContext): 
 			return connectStdio(launch.file, launch.args, { ...env, BUN_BE_BUN: "1", NO_COLOR: "1" }, ctx.dir, ctx);
 		}
 		case "command": {
-			const command = hasEnvironment(ctx.dir) ? await inEnvironment(ctx.dir, backend.command, ctx.toolsDir, ctx.log) : backend.command;
+			const environment = hasEnvironment(ctx.dir) ? await inEnvironment(ctx.dir, backend.command, ctx.toolsDir, ctx.log, ctx.engineOwned === true) : undefined;
+			const command = environment?.command ?? backend.command;
 			const [program, ...args] = command;
-			const launch = contained(program!, args, { writable: [ctx.dataDir, join(ctx.dir, ".pixi")], readable: [ctx.dir, ctx.toolsDir], network, server: true, appData, engineWrite: [join(ctx.dir, ".pixi")] });
+			const environmentPath = join(ctx.dir, ".pixi");
+			const launch = contained(program!, args, {
+				writable: [ctx.dataDir, ...(environment && !environment.engineWrite ? [environmentPath] : [])],
+				readable: [ctx.dir, ctx.toolsDir],
+				network,
+				server: true,
+				appData,
+				...(environment?.engineWrite ? { engineWrite: [environment.engineWrite] } : {}),
+			});
 			uncontainedOk(launch);
 			return connectStdio(launch.file, launch.args, env, ctx.dir, ctx);
 		}
@@ -364,11 +375,20 @@ export async function startBackend(manifest: AppManifest, ctx: BackendContext): 
 			const port = await freePort();
 			// "$PORT" in the command is the port the app serves on (it's also in the environment as PORT).
 			const wanted = backend.command.map((part) => part.replaceAll("$PORT", String(port)));
-			const command = hasEnvironment(ctx.dir) ? await inEnvironment(ctx.dir, wanted, ctx.toolsDir, ctx.log) : wanted;
+			const environment = hasEnvironment(ctx.dir) ? await inEnvironment(ctx.dir, wanted, ctx.toolsDir, ctx.log, ctx.engineOwned === true) : undefined;
+			const command = environment?.command ?? wanted;
 			const [program, ...args] = command;
 			// Writes go to the data folder (and the environment's own cache), so history files don't touch the app's
 			// folder and its reload.
-			const launch = contained(program!, args, { writable: [ctx.dataDir, join(ctx.dir, ".pixi")], readable: [ctx.dir, ctx.toolsDir], network: servedBackendNetwork(ctx.network, ctx.serveNetwork === true), server: true, appData, engineWrite: [join(ctx.dir, ".pixi")] });
+			const environmentPath = join(ctx.dir, ".pixi");
+			const launch = contained(program!, args, {
+				writable: [ctx.dataDir, ...(environment && !environment.engineWrite ? [environmentPath] : [])],
+				readable: [ctx.dir, ctx.toolsDir],
+				network: servedBackendNetwork(ctx.network, ctx.serveNetwork === true),
+				server: true,
+				appData,
+				...(environment?.engineWrite ? { engineWrite: [environment.engineWrite] } : {}),
+			});
 			uncontainedOk(launch);
 			const proc = spawn(launch.file, launch.args, { cwd: ctx.dir, env: { ...env, PORT: String(port), HOST: "127.0.0.1" }, stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" });
 			for (const stream of [proc.stdout, proc.stderr]) stream?.on("data", (chunk: Buffer) => chunk.toString("utf8").split("\n").forEach((line) => line.trim() && ctx.log(line)));

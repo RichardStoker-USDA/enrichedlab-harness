@@ -7,12 +7,13 @@ import { chmodSync, chownSync, closeSync, constants, existsSync, linkSync, lstat
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import type { LabConfig } from "../packages/engine/src/config.ts";
+import { inEnvironment } from "../packages/engine/src/apps/environments.ts";
 import { allowKeys, decide, HIDDEN_REASON, PUSH_REASON, windowsInterpreterHandoff } from "../packages/engine/src/permissions.ts";
 import { restoreSnapshot, snapshot } from "../packages/engine/src/git.ts";
 import { holdGitEntries, mkdirPhysical, openPhysical, removeEmptyTreePhysical, unlinkPhysical } from "../packages/engine/src/tools/anchored.ts";
 import { allowedCommand, isReadOnlyCommand } from "../packages/engine/src/tools/shell.ts";
 import type { Tool } from "../packages/engine/src/tools/types.ts";
-import { contained, containedTempEnvironment, engineEnvironment, engineTemp, gitQuarantineFolder, gitQuarantineMarker, LocalWorkspace, privateBindPath, projectGitPaths, projectGitPattern, recoverGitQuarantine, safeTemp, sandboxer, trustedGit } from "../packages/engine/src/tools/workspace.ts";
+import { contained, containedTempEnvironment, createEngineWriteGrant, engineEnvironment, engineTemp, gitQuarantineFolder, gitQuarantineMarker, LocalWorkspace, privateBindPath, projectGitPaths, projectGitPattern, recoverGitQuarantine, safeTemp, sandboxer, trustedGit } from "../packages/engine/src/tools/workspace.ts";
 import { everyCommand, everyPowerShellCommand, plainCommands } from "../packages/engine/src/tools/shell_syntax.ts";
 import { FENCE_PY } from "../packages/engine/src/sites/sandbox_fence.ts";
 import { bashPattern, type SandboxApi, SandboxWorkspace } from "../packages/engine/src/sites/sandbox_workspace.ts";
@@ -782,6 +783,78 @@ describe("round 6: containment is the boundary", () => {
 		}
 	});
 
+	test.skipIf(process.platform !== "linux")("recovery completes a rename whose durable intent has no done record", () => {
+		const base = realpathSync(mkdtempSync(join(tmpdir(), "el-git-intent-recovery-")));
+		const project = join(base, "project");
+		const home = join(base, "state");
+		mkdirSync(project);
+		try {
+			const quarantine = gitQuarantineFolder(project, home);
+			const held = holdGitEntries(project, 50_000, 64, undefined, quarantine);
+			const baseline = held.baseline;
+			held.release();
+			mkdirSync(join(project, ".git"));
+			writeFileSync(join(project, ".git", "config"), "survives\n");
+			const itemStat = lstatSync(join(project, ".git"), { bigint: true });
+			const item = `${itemStat.dev}:${itemStat.ino}`;
+			const target = join(quarantine, "git-0123456789abcdef01234567");
+			const marker = gitQuarantineMarker(project, home);
+			mkdirSync(dirname(marker), { recursive: true, mode: 0o700 });
+			const header = { version: 2, project, baseline, quarantine };
+			const intent = { event: "intent", item, from: ".git", to: target };
+			writeFileSync(marker, `${JSON.stringify(header)}\n${JSON.stringify(intent)}\n`, { mode: 0o600 });
+			// This is the crash point: rename completed, but no done event reached the journal.
+			renameSync(join(project, ".git"), target);
+
+			const recovered = recoverGitQuarantine(project, home);
+			expect(recovered.moved).toEqual([{ from: ".git", to: target }]);
+			expect(readFileSync(join(target, "config"), "utf8")).toBe("survives\n");
+			expect(existsSync(join(project, ".git"))).toBe(false);
+			expect(existsSync(marker)).toBe(false);
+		} finally {
+			rmSync(base, { recursive: true, force: true });
+		}
+	});
+
+	test.skipIf(process.platform !== "linux" || process.getuid?.() === 0 || sandboxer() !== "bubblewrap")("a foreground journal append failure blocks the command and later project writes", async () => {
+		const base = realpathSync(mkdtempSync(join(tmpdir(), "el-git-foreground-journal-")));
+		const project = join(base, "project");
+		const home = join(base, "state");
+		const savedHome = process.env.EL_HOME;
+		mkdirSync(project);
+		try {
+			process.env.EL_HOME = home;
+			const marker = gitQuarantineMarker(project, home);
+			let locked = false;
+			const workspace = new LocalWorkspace(project, "workspace");
+			const command = await workspace.exec("mkdir .git; printf ready; sleep 0.2", {
+				timeoutMs: 5_000,
+				signal: AbortSignal.timeout(5_000),
+				onOutput(text) {
+					if (!locked && text.includes("ready")) {
+						chmodSync(marker, 0o400);
+						locked = true;
+					}
+				},
+			});
+			expect(locked).toBe(true);
+			expect(command.exitCode).toBe(125);
+			expect(command.output).toContain("foreground process exited");
+			expect(existsSync(marker)).toBe(true);
+			await expect(workspace.write("blocked", "bad")).rejects.toThrow("cleanup pending");
+			expect(existsSync(join(project, "blocked"))).toBe(false);
+			chmodSync(marker, 0o600);
+			recoverGitQuarantine(project, home);
+			expect(existsSync(marker)).toBe(false);
+			expect(existsSync(join(project, ".git"))).toBe(false);
+		} finally {
+			if (existsSync(gitQuarantineMarker(project, home))) chmodSync(gitQuarantineMarker(project, home), 0o600);
+			if (savedHome === undefined) delete process.env.EL_HOME;
+			else process.env.EL_HOME = savedHome;
+			rmSync(base, { recursive: true, force: true });
+		}
+	}, 15_000);
+
 	test.skipIf(process.platform !== "linux")("Linux refuses existing .git links and final quarantine survives hostile modes", () => {
 		const base = realpathSync(mkdtempSync(join(tmpdir(), "el-git-hostile-")));
 		const linked = join(base, "linked");
@@ -805,6 +878,8 @@ describe("round 6: containment is the boundary", () => {
 			writeFileSync(join(root, "extra-two"), "2");
 			chmodSync(join(root, "sealed"), 0);
 			chmodSync(root, 0);
+			expect(held.quarantine(false)).toEqual({ moved: [] });
+			expect(lstatSync(root).mode & 0o777).toBe(0);
 			const result = held.quarantine();
 			expect(result.error).toBeUndefined();
 			expect(result.moved.map((move) => move.from)).toEqual(["sealed/deeper/.git"]);
@@ -945,7 +1020,7 @@ describe("round 6: containment is the boundary", () => {
 		try {
 			const bwrap = ["/usr/bin/bwrap", "/bin/bwrap", "/usr/local/bin/bwrap"].find(existsSync)!;
 			const workspaceModule = join(import.meta.dir, "../packages/engine/src/tools/workspace.ts");
-			const script = `import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";\nimport { dirname, join } from "node:path";\nimport { gitQuarantineFolder, gitQuarantineMarker, LocalWorkspace, recoverGitQuarantine } from ${JSON.stringify(workspaceModule)};\nconst project = ${JSON.stringify(project)}; const state = ${JSON.stringify(state)}; const root = statSync(project, { bigint: true }); const baseline = { root: String(root.dev) + ":" + String(root.ino), entries: [] }; const quarantine = gitQuarantineFolder(project, state); const marker = gitQuarantineMarker(project, state); mkdirSync(dirname(marker), { recursive: true, mode: 0o700 }); writeFileSync(marker, JSON.stringify({ version: 1, project, baseline, quarantine, moved: [] })); mkdirSync(join(project, "a", ".git")); writeFileSync(join(project, "a", ".git", "config"), "moved"); let recovery = ""; try { recoverGitQuarantine(project, state); } catch (error) { recovery = String(error?.message ?? error); } const journal = JSON.parse(readFileSync(marker, "utf8")); const workspace = new LocalWorkspace(project); let write = ""; try { await workspace.write("blocked", "bad"); } catch (error) { write = String(error?.message ?? error); } process.stdout.write(JSON.stringify({ recovery, write, journal, target: journal.moved[0] && readFileSync(join(journal.moved[0].to, "config"), "utf8"), marker: existsSync(marker), git: existsSync(join(project, "a", ".git")), file: existsSync(join(project, "blocked")) }));`;
+			const script = `import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";\nimport { dirname, join } from "node:path";\nimport { gitQuarantineFolder, gitQuarantineMarker, LocalWorkspace, recoverGitQuarantine } from ${JSON.stringify(workspaceModule)};\nconst project = ${JSON.stringify(project)}; const state = ${JSON.stringify(state)}; const root = statSync(project, { bigint: true }); const baseline = { root: String(root.dev) + ":" + String(root.ino), entries: [] }; const quarantine = gitQuarantineFolder(project, state); const marker = gitQuarantineMarker(project, state); mkdirSync(dirname(marker), { recursive: true, mode: 0o700 }); writeFileSync(marker, JSON.stringify({ version: 1, project, baseline, quarantine, moved: [] }) + "\\n"); mkdirSync(join(project, "a", ".git")); writeFileSync(join(project, "a", ".git", "config"), "moved"); let recovery = ""; try { recoverGitQuarantine(project, state); } catch (error) { recovery = String(error?.message ?? error); } const events = readFileSync(marker, "utf8").trim().split("\\n").map(JSON.parse); const moved = events.filter((event) => event.event === "done").map(({ from, to }) => ({ from, to })); const journal = { moved }; const workspace = new LocalWorkspace(project); let write = ""; try { await workspace.write("blocked", "bad"); } catch (error) { write = String(error?.message ?? error); } process.stdout.write(JSON.stringify({ recovery, write, journal, target: journal.moved[0] && readFileSync(join(journal.moved[0].to, "config"), "utf8"), marker: existsSync(marker), git: existsSync(join(project, "a", ".git")), file: existsSync(join(project, "blocked")) }));`;
 			const ran = spawnSync(bwrap, [
 				"--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
 				"--bind", source, views, "--bind", nestedSource, join(project, "z-mount"), "--bind", stateSource, state,
@@ -966,7 +1041,7 @@ describe("round 6: containment is the boundary", () => {
 			mkdirSync(quarantine);
 			// The outer user namespace leaves system-root ownership unmapped, so the inner launcher cannot discover
 			// trusted bubblewrap. Select its branch directly; journal lookup and the real kernel renames stay intact.
-			const retry = `import { existsSync, readFileSync } from "node:fs";\nimport { join } from "node:path";\nimport { gitQuarantineMarker, LocalWorkspace, recoverGitQuarantine } from ${JSON.stringify(workspaceModule)};\nconst project = ${JSON.stringify(project)}; const state = ${JSON.stringify(state)}; let recovery = ""; try { recoverGitQuarantine(project, state); } catch (error) { recovery = String(error?.message ?? error); } const workspace = new LocalWorkspace(project); Object.defineProperty(workspace, "sandboxed", { value: "bubblewrap" }); let write = ""; try { await workspace.write("blocked", "bad"); } catch (error) { write = String(error?.message ?? error); } const command = await workspace.exec("printf bad > command", { timeoutMs: 5_000, signal: AbortSignal.timeout(5_000) }); const marker = gitQuarantineMarker(project, state); const journal = JSON.parse(readFileSync(marker, "utf8")); process.stdout.write(JSON.stringify({ recovery, write, command, journal, marker: existsSync(marker), git: existsSync(join(project, "second", ".git")), file: existsSync(join(project, "blocked")), commandFile: existsSync(join(project, "command")) }));`;
+			const retry = `import { existsSync, readFileSync } from "node:fs";\nimport { join } from "node:path";\nimport { gitQuarantineMarker, LocalWorkspace, recoverGitQuarantine } from ${JSON.stringify(workspaceModule)};\nconst project = ${JSON.stringify(project)}; const state = ${JSON.stringify(state)}; let recovery = ""; try { recoverGitQuarantine(project, state); } catch (error) { recovery = String(error?.message ?? error); } const workspace = new LocalWorkspace(project); Object.defineProperty(workspace, "sandboxed", { value: "bubblewrap" }); let write = ""; try { await workspace.write("blocked", "bad"); } catch (error) { write = String(error?.message ?? error); } const command = await workspace.exec("printf bad > command", { timeoutMs: 5_000, signal: AbortSignal.timeout(5_000) }); const marker = gitQuarantineMarker(project, state); const events = readFileSync(marker, "utf8").trim().split("\\n").map(JSON.parse); const journal = { moved: events.filter((event) => event.event === "done").map(({ from, to }) => ({ from, to })) }; process.stdout.write(JSON.stringify({ recovery, write, command, journal, marker: existsSync(marker), git: existsSync(join(project, "second", ".git")), file: existsSync(join(project, "blocked")), commandFile: existsSync(join(project, "command")) }));`;
 			const retried = spawnSync(bwrap, [
 				"--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
 				"--tmpfs", "/tmp",
@@ -1002,7 +1077,7 @@ describe("round 6: containment is the boundary", () => {
 				directory = dirname(marker);
 				try {
 					mkdirSync(directory, { recursive: true, mode: 0o700 });
-					writeFileSync(marker, JSON.stringify({ version: 1, project: original, baseline: held.baseline, quarantine, moved: [] }));
+					writeFileSync(marker, `${JSON.stringify({ version: 1, project: original, baseline: held.baseline, quarantine, moved: [] })}\n`);
 				} finally {
 					held.release();
 				}
@@ -1032,6 +1107,51 @@ describe("round 6: containment is the boundary", () => {
 			}
 		} finally {
 			if (directory) chmodSync(directory, 0o700);
+			if (savedHome === undefined) delete process.env.EL_HOME;
+			else process.env.EL_HOME = savedHome;
+			rmSync(base, { recursive: true, force: true });
+		}
+	});
+
+	test.skipIf(process.platform !== "linux" || process.getuid?.() === 0 || sandboxer() !== "bubblewrap")("renamed-project recovery refuses EACCES and EIO from every journal candidate", () => {
+		const base = realpathSync(mkdtempSync(join(tmpdir(), "el-git-journal-candidate-errors-")));
+		const original = join(base, "original");
+		const project = join(base, "renamed");
+		const home = join(base, "state");
+		const savedHome = process.env.EL_HOME;
+		mkdirSync(original);
+		let marker = "";
+		try {
+			process.env.EL_HOME = home;
+			const quarantine = gitQuarantineFolder(original, home);
+			const held = holdGitEntries(original, 50_000, 64, undefined, quarantine);
+			marker = gitQuarantineMarker(original, home);
+			mkdirSync(dirname(marker), { recursive: true, mode: 0o700 });
+			writeFileSync(marker, `${JSON.stringify({ version: 1, project: original, baseline: held.baseline, quarantine })}\n`, { mode: 0o600 });
+			held.release();
+			renameSync(original, project);
+
+			chmodSync(marker, 0);
+			expect(() => recoverGitQuarantine(project, home)).toThrow(/cleanup pending.*cleanup journal cannot be read/i);
+			chmodSync(marker, 0o600);
+
+			const workspaceModule = join(import.meta.dir, "../packages/engine/src/tools/workspace.ts");
+			// Inject EIO at this candidate read. A /proc/self/mem bind can fail with EACCES under user namespaces.
+			const script = `import { mock } from "bun:test";
+import * as fs from "node:fs";
+const readFile = fs.readFileSync;
+mock.module("node:fs", () => ({ ...fs, readFileSync(file, ...args) {
+	if (file === ${JSON.stringify(marker)}) throw Object.assign(new Error("EIO: input/output error"), { code: "EIO" });
+	return readFile(file, ...args);
+} }));
+const { recoverGitQuarantine } = await import(${JSON.stringify(workspaceModule)});
+try { recoverGitQuarantine(${JSON.stringify(project)}, ${JSON.stringify(home)}); process.exit(2); } catch (error) { const message = String(error?.message ?? error); process.stdout.write(message); if (!new RegExp("cleanup pending.*cleanup journal cannot be read.*(EIO|I/O error)", "i").test(message)) process.exit(3); }`;
+			const ran = spawnSync(process.execPath, ["-e", script], { encoding: "utf8", env: { ...process.env, HOME: home, EL_HOME: home } });
+			expect(ran.status, ran.stderr || ran.stdout).toBe(0);
+			expect(ran.stdout).toMatch(/cleanup journal cannot be read.*(EIO|I\/O error)/i);
+			expect(existsSync(marker)).toBe(true);
+		} finally {
+			if (marker && existsSync(marker)) chmodSync(marker, 0o600);
 			if (savedHome === undefined) delete process.env.EL_HOME;
 			else process.env.EL_HOME = savedHome;
 			rmSync(base, { recursive: true, force: true });
@@ -1125,7 +1245,7 @@ describe("round 6: containment is the boundary", () => {
 			const held = holdGitEntries(root, 50_000, 64, undefined, quarantine);
 			const marker = gitQuarantineMarker(root, home);
 			mkdirSync(dirname(marker), { recursive: true, mode: 0o700 });
-			writeFileSync(marker, JSON.stringify({ version: 1, project: root, baseline: held.baseline, quarantine }));
+			writeFileSync(marker, `${JSON.stringify({ version: 1, project: root, baseline: held.baseline, quarantine })}\n`);
 			held.release();
 			mkdirSync(join(root, ".git"));
 			writeFileSync(join(root, ".git", "config"), "keep\n");
@@ -1170,7 +1290,7 @@ describe("round 6: containment is the boundary", () => {
 			const marker = gitQuarantineMarker(root, home);
 			try {
 				mkdirSync(dirname(marker), { recursive: true, mode: 0o700 });
-				writeFileSync(marker, JSON.stringify({ version: 1, project: root, baseline: held.baseline, quarantine }));
+				writeFileSync(marker, `${JSON.stringify({ version: 1, project: root, baseline: held.baseline, quarantine })}\n`);
 			} finally {
 				held.release();
 			}
@@ -1246,7 +1366,39 @@ describe("round 6: containment is the boundary", () => {
 		}
 	});
 
-	test.skipIf(process.platform !== "linux" || sandboxer() !== "bubblewrap")("bubblewrap refuses private binds and applies credential masks after project binds", () => {
+	test.skipIf(process.platform === "win32")("project .pixi links cannot become engine-home write grants", async () => {
+		const base = realpathSync(mkdtempSync(join(tmpdir(), "el-pixi-engine-grant-")));
+		const state = join(base, "state");
+		const project = join(base, "project");
+		const other = join(state, "apps", "other", ".pixi");
+		const config = join(state, "config.json");
+		const savedHome = process.env.EL_HOME;
+		try {
+			process.env.EL_HOME = state;
+			mkdirSync(project);
+			mkdirSync(other, { recursive: true });
+			writeFileSync(join(project, "pixi.toml"), "[workspace]\nname = \"project\"\nchannels = [\"conda-forge\"]\nplatforms = []\n\n[dependencies]\n");
+			writeFileSync(config, "trusted\n");
+			for (const target of [config, other]) {
+				symlinkSync(target, join(project, ".pixi"));
+				await expect(inEnvironment(project, ["true"], join(state, "tools"), () => undefined)).rejects.toThrow(".pixi is a link");
+				expect(() => createEngineWriteGrant(join(project, ".pixi"))).toThrow("named below the engine home");
+				rmSync(join(project, ".pixi"), { force: true });
+			}
+
+			const recorded = createEngineWriteGrant(other);
+			const moved = join(state, "apps", "other", "saved-environment");
+			renameSync(other, moved);
+			symlinkSync(config, other);
+			expect(() => contained("/bin/true", [], { writable: [], network: "none", engineWrite: [recorded] })).toThrow("link, missing, or no longer has its recorded identity");
+		} finally {
+			if (savedHome === undefined) delete process.env.EL_HOME;
+			else process.env.EL_HOME = savedHome;
+			rmSync(base, { recursive: true, force: true });
+		}
+	});
+
+	test.skipIf(process.platform !== "linux" || sandboxer() !== "bubblewrap")("bubblewrap masks private paths and recorded package-cache grants write without widening writable", () => {
 		const base = realpathSync(mkdtempSync(join(tmpdir(), "el-private-mount-")));
 		const savedHome = process.env.EL_HOME;
 		try {
@@ -1291,10 +1443,12 @@ describe("round 6: containment is the boundary", () => {
 			mkdirSync(installed, { recursive: true });
 			mkdirSync(cache, { recursive: true });
 			writeFileSync(join(state, "config.json"), "trusted\n");
+			const installedGrant = createEngineWriteGrant(installed);
+			const cacheGrant = createEngineWriteGrant(cache);
 			const installer = contained("/bin/bash", ["-c", 'printf app > "$1/result"; printf cache > "$2/result"; printf bad > "$3" 2>/dev/null || true', "--", installed, cache, join(state, "config.json")], {
-				writable: [installed, cache],
+				writable: [],
 				network: "none",
-				engineWrite: [installed, cache],
+				engineWrite: [installedGrant, cacheGrant],
 			});
 			try {
 				const ran = spawnSync(installer.file, installer.args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe", ...(installer.pass ?? [])] });
@@ -1322,7 +1476,7 @@ describe("round 6: containment is the boundary", () => {
 			const held = holdGitEntries(root, 50_000, 64, undefined, quarantine);
 			const marker = gitQuarantineMarker(root, home);
 			mkdirSync(dirname(marker), { recursive: true });
-			writeFileSync(marker, JSON.stringify({ version: 1, project: root, baseline: held.baseline, quarantine }));
+			writeFileSync(marker, `${JSON.stringify({ version: 1, project: root, baseline: held.baseline, quarantine })}\n`);
 			held.release();
 			mkdirSync(join(root, "left", ".git"), { recursive: true });
 			writeFileSync(join(root, "left", ".git", "config"), "keep");
@@ -1333,7 +1487,7 @@ describe("round 6: containment is the boundary", () => {
 			expect(readFileSync(join(recovered.moved[0]!.to, "config"), "utf8")).toBe("keep");
 
 			const renamedHeld = holdGitEntries(root, 50_000, 64, undefined, quarantine);
-			writeFileSync(marker, JSON.stringify({ version: 1, project: root, baseline: renamedHeld.baseline, quarantine }));
+			writeFileSync(marker, `${JSON.stringify({ version: 1, project: root, baseline: renamedHeld.baseline, quarantine })}\n`);
 			renamedHeld.release();
 			const renamed = join(base, "renamed-project");
 			renameSync(root, renamed);
@@ -1343,7 +1497,7 @@ describe("round 6: containment is the boundary", () => {
 			expect(foundByIdentity.moved.map((entry) => entry.from)).toEqual(["alias/.git"]);
 			expect(existsSync(join(renamed, "alias", ".git"))).toBe(false);
 			renameSync(renamed, root);
-			writeFileSync(marker, "not json");
+			writeFileSync(marker, "not json\n");
 			expect(() => recoverGitQuarantine(root, home)).toThrow("No contained command ran");
 			expect(existsSync(marker)).toBe(true);
 		} finally {
@@ -1387,8 +1541,10 @@ describe("round 6: containment is the boundary", () => {
 			expect(output.join("")).toContain('EnrichedLab moved "later/.git"');
 			const hostile = await ws.exec("mkdir -p sealed/deeper/.git && printf keep > sealed/deeper/.git/config && chmod 000 sealed && chmod 500 .", options);
 			expect(hostile.exitCode).toBe(0);
+			expect(existsSync(gitQuarantineMarker(root))).toBe(false);
 			expect(lstatSync(root).mode & 0o777).toBe(0o500);
 			chmodSync(root, 0o700);
+			expect(lstatSync(join(root, "sealed")).mode & 0o777).toBe(0);
 			chmodSync(join(root, "sealed"), 0o700);
 			expect(existsSync(join(root, "sealed", "deeper", ".git"))).toBe(false);
 			expect(readdirSync(quarantine).map((name) => join(quarantine, name)).some((path) => lstatSync(path).isDirectory() && readFileSync(join(path, "config"), "utf8") === "keep")).toBe(true);
