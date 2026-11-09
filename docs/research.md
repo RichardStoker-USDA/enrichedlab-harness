@@ -9,7 +9,7 @@ is the plan and its state; the wire shapes are in [labs.md](labs.md) and [contra
 | Lab | Role | Serves the contract through | State (November 6, 2026) |
 |---|---|---|---|
 | Home Lab | the development lab: every addition is built and broken here first | Gate | the contract through `2026-11`, 36 of 38 `el lab check` rows pass (2 skipped by design); desktop sandboxes live since publication 67 |
-| WHNRC EnrichedLab | the production lab: scientists, research data, reviewed tools | the WHNRC research broker, as a versioned adapter | not started: the broker has its own API at research.whnrc.com; the adapter waits for Rich's go-ahead and an owner |
+| WHNRC EnrichedLab | the production lab: scientists, research data, reviewed tools | the WHNRC research broker, as a versioned adapter | not started: the broker has its own API on the lab's research host; the adapter waits for Rich's go-ahead and an owner |
 
 Each lab names itself in its descriptor (`title`). Nothing in EnrichedLab names a lab: a person sees a lab only after
 joining it from its invite and signing in, and a lab never learns which other labs a person uses. A lab that holds
@@ -175,9 +175,9 @@ contract rows show.
    052's classifiers, and `/v1/usage`.
 2. **Sign-in.** That hostname's Cloudflare Access application with managed OAuth, so EnrichedLab signs in with the
    institution's sign-in and MFA in the browser and refreshes on its own (CILogon stays the identity provider).
-3. **Sandboxes on the sandbox node.** Kata (`kata-clh`) microVMs on whnrc-srv4 through the OpenShell gateway, with
-   sized profiles. srv4 also holds every production database primary, so sandbox profiles and queues need limits that
-   keep the databases' CPU and memory reserved.
+3. **Sandboxes on the sandbox node.** Kata (`kata-clh`) microVMs on the lab's sandbox node through the OpenShell gateway,
+   with sized profiles. That node also runs other production services, so sandbox profiles and queues need limits that
+   keep their CPU and memory reserved.
 4. **Desktop image.** The same desktop image as Home Lab, qualified under Kata.
 5. **Discovery mode.** The `discovery` capability mapped onto `research.discovery.autonomous`.
 6. **The research web front end.** EnrichedLab's own web package, served by the lab, so a session changed in the
@@ -200,5 +200,5 @@ contract rows show.
 | 9 | Runs on Rein and scheduled tasks | Home Lab | next |
 | 10 | Discovery grant and approval holds | Home Lab | after Rich confirms to its owner |
 | 11 | Broker adapter | WHNRC broker lane | confirmed by Rich, November 7; in WHNRC's research-agent work |
-| 12 | Hostname, Access managed OAuth, srv4 sandbox limits | WHNRC, with Rich | to settle |
+| 12 | Hostname, Access managed OAuth, sandbox node limits | WHNRC, with Rich | to settle |
 | 13 | Web package served by a lab (a lab transport for its store) | EnrichedLab | after runs |
