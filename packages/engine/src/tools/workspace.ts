@@ -10,7 +10,7 @@ import { homedir, tmpdir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { labHome } from "../paths.ts";
 import { expandHome, withoutSecrets } from "../util.ts";
-import { holdFolder, holdGitEntries, mkdirPhysical, movePhysicalNoReplace, openPhysical, type GitEntryBaseline } from "./anchored.ts";
+import { holdFolder, holdGitEntries, holdPrivateFolder, mkdirPhysical, openPhysical, type GitEntryBaseline } from "./anchored.ts";
 import { systemCommand, systemPowerShell } from "./windows_contain.ts";
 
 export interface Entry {
@@ -470,7 +470,6 @@ interface GitQuarantineRecord {
 	project: string;
 	baseline: GitEntryBaseline;
 	quarantine?: string;
-	rootMode?: number;
 }
 
 const activeGitQuarantines = new Set<string>();
@@ -484,22 +483,33 @@ export function gitQuarantineMarker(root: string, home = labHome()): string {
 
 /** An engine-owned folder outside the project, on the same filesystem so each quarantine move is atomic. */
 export function gitQuarantineFolder(root: string, home = labHome()): string {
+	return checkedGitQuarantineFolder(root, true)!;
+}
+
+/** File writes verify an existing quarantine even without a journal, without making one for ordinary edits. */
+function checkedGitQuarantineFolder(root: string, create: boolean): string | undefined {
 	const project = real(root);
-	if (dirname(project) === project) throw new Error("Linux commands cannot write a filesystem root because it cannot be moved aside after a failed .git cleanup.");
-	const id = createHash("sha256").update(project).digest("hex");
-	const candidates = [join(home, "quarantine", "git", id), join(dirname(project), ".enrichedlab-git-quarantine", id)];
-	const projectDevice = statSync(project, { bigint: true }).dev;
-	for (const candidate of candidates) {
+	if (dirname(project) === project) throw new Error("Linux commands cannot write a filesystem root because no private .git quarantine can be placed beside it.");
+	const projectStat = statSync(project, { bigint: true });
+	const id = createHash("sha256").update(`${projectStat.dev}:${projectStat.ino}`).digest("hex");
+	const candidate = join(dirname(project), `.enrichedlab-git-quarantine-${id}`);
+	if (create) {
 		try {
-			mkdirSync(candidate, { recursive: true, mode: 0o700 });
-			const folder = real(candidate);
-			if (pathAtOrBelow(folder, project) || statSync(folder, { bigint: true }).dev !== projectDevice) continue;
-			return folder;
-		} catch {
-			// Try the sibling folder, which is normally on the project's filesystem.
+			mkdirSync(candidate, { mode: 0o700 });
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw new Error(`EnrichedLab could not make its private .git quarantine, so no contained command ran: ${(error as Error).message}`);
 		}
 	}
-	throw new Error("EnrichedLab could not make an engine-owned .git quarantine outside the project on the same filesystem, so no contained command ran.");
+	let held: number | undefined;
+	try {
+		if (!create && !lstatSync(candidate, { throwIfNoEntry: false })) return undefined;
+		held = holdPrivateFolder(candidate, projectStat.dev);
+		return candidate;
+	} catch (error) {
+		throw new Error(`EnrichedLab could not verify its private .git quarantine, so no contained command ran: ${(error as Error).message}`);
+	} finally {
+		if (held !== undefined) closeSync(held);
+	}
 }
 
 function readGitQuarantineRecord(file: string, project?: string): GitQuarantineRecord | undefined {
@@ -524,8 +534,7 @@ function readGitQuarantineRecord(file: string, project?: string): GitQuarantineR
 		&& /^\d+:\d+$/.test(item[1])
 	);
 	const validQuarantine = record.quarantine === undefined || (typeof record.quarantine === "string" && isAbsolute(record.quarantine) && typeof record.project === "string" && !pathAtOrBelow(record.quarantine, record.project));
-	const validMode = record.rootMode === undefined || (Number.isInteger(record.rootMode) && record.rootMode! >= 0 && record.rootMode! <= 0o7777);
-	if (record.version !== 1 || typeof record.project !== "string" || !isAbsolute(record.project) || (project !== undefined && record.project !== project) || typeof record.baseline?.root !== "string" || !/^\d+:\d+$/.test(record.baseline.root) || !validEntries || !validQuarantine || !validMode) {
+	if (record.version !== 1 || typeof record.project !== "string" || !isAbsolute(record.project) || (project !== undefined && record.project !== project) || typeof record.baseline?.root !== "string" || !/^\d+:\d+$/.test(record.baseline.root) || !validEntries || !validQuarantine) {
 		throw new Error("the cleanup journal is invalid");
 	}
 	return record as GitQuarantineRecord;
@@ -571,12 +580,12 @@ function removeGitQuarantineMarker(file: string): string | undefined {
 
 export interface GitRecovery {
 	moved: { from: string; to: string }[];
-	restored?: { from: string; to: string };
 }
 
-/** Finish a journal left by a crash or failed cleanup before another contained command can start. */
+/** Verify quarantine and finish pending cleanup before a contained command or file write can start. */
 export function recoverGitQuarantine(root: string, home = labHome()): GitRecovery {
 	const project = real(root);
+	const checkedQuarantine = checkedGitQuarantineFolder(project, false);
 	let marker = gitQuarantineMarker(project, home);
 	let record: GitQuarantineRecord | undefined;
 	try {
@@ -588,25 +597,13 @@ export function recoverGitQuarantine(root: string, home = labHome()): GitRecover
 	if (!record) return { moved: [] };
 	let held: ReturnType<typeof holdGitEntries> | undefined;
 	try {
-		const quarantine = record.quarantine ?? gitQuarantineFolder(project, home);
-		const displaced = join(quarantine, "project");
-		const atProject = lstatSync(project, { throwIfNoEntry: false });
-		const atQuarantine = lstatSync(displaced, { throwIfNoEntry: false });
-		if (atProject && atQuarantine) throw new Error("both the original project path and its quarantined copy exist");
-		if (!atProject && !atQuarantine) throw new Error("neither the original project path nor its quarantined copy exists");
-		const scanRoot = atQuarantine ? displaced : project;
-		held = holdGitEntries(scanRoot, GIT_SCAN_MAX, GIT_SCAN_DEPTH, record.baseline, quarantine);
+		const quarantine = record.quarantine ?? checkedQuarantine ?? gitQuarantineFolder(project, home);
+		held = holdGitEntries(project, GIT_SCAN_MAX, GIT_SCAN_DEPTH, record.baseline, quarantine);
 		const result = held.quarantine(true);
 		if (result.error) throw new Error(result.error);
-		if (record.rootMode !== undefined) held.restoreRootMode(record.rootMode);
-		let restored: GitRecovery["restored"];
-		if (atQuarantine) {
-			movePhysicalNoReplace(displaced, project);
-			restored = { from: displaced, to: project };
-		}
 		const removeError = removeGitQuarantineMarker(marker);
 		if (removeError) throw new Error(removeError);
-		return { moved: result.moved, ...(restored ? { restored } : {}) };
+		return { moved: result.moved };
 	} catch (error) {
 		throw new Error(`A prior contained command left .git cleanup pending for this project. EnrichedLab retried the anchored quarantine before this launch, but it could not finish: ${(error as Error).message} No contained command ran.`);
 	} finally {
@@ -632,10 +629,9 @@ function guardedGitEntries(root: string, home = labHome()): ReturnType<typeof ho
 	const marker = gitQuarantineMarker(project, home);
 	const recovered = recoverGitQuarantine(project, home);
 	const quarantine = gitQuarantineFolder(project, home);
-	if (existsSync(join(quarantine, "project"))) throw new Error("A quarantined project copy exists without a matching cleanup journal, so no contained command ran.");
 	const held = holdGitEntries(project, GIT_SCAN_MAX, GIT_SCAN_DEPTH, undefined, quarantine);
 	try {
-		writeGitQuarantineRecord(marker, { version: 1, project, baseline: held.baseline, quarantine, rootMode: held.rootMode });
+		writeGitQuarantineRecord(marker, { version: 1, project, baseline: held.baseline, quarantine });
 		activeGitQuarantines.add(marker);
 	} catch (error) {
 		held.release();
@@ -791,16 +787,16 @@ export class LocalWorkspace implements Workspace {
 			if (readOnly) {
 				const recovered = recoverGitQuarantine(root);
 				const quarantine = gitQuarantineFolder(root);
-				return { ...contained(plain.file, plain.args, { writable: [], network: "none", hidden: [dirname(quarantine)] }), recovered };
+				return { ...contained(plain.file, plain.args, { writable: [], network: "none", hidden: [quarantine] }), recovered };
 			}
 			const entries = guardedGitEntries(root);
 			try {
-				const launch = contained(plain.file, plain.args, { writable: [root], protect: entries.paths, network: "none", exact: true, waitForChildren: true, hidden: [dirname(entries.quarantinePath)] });
+				const launch = contained(plain.file, plain.args, { writable: [root], protect: entries.paths, network: "none", exact: true, waitForChildren: true, hidden: [entries.quarantinePath] });
 				return { ...launch, quarantine: entries.quarantine, recovered: entries.recovered, release: () => { launch.release?.(); entries.release(); } };
 			} catch (error) {
 				const cleanup = entries.quarantine(true);
 				entries.release();
-				if (cleanup.error) throw new Error(`${(error as Error).message} The required .git cleanup also failed: ${cleanup.error}${cleanup.displaced ? ` The project was moved from ${cleanup.displaced.from} to ${cleanup.displaced.to}.` : cleanup.sealed ? ` The project at ${cleanup.sealed} was made temporarily inaccessible.` : ""}`);
+				if (cleanup.error) throw new Error(`${(error as Error).message} The required .git cleanup also failed: ${cleanup.error} Later contained commands and file writes are blocked until an anchored quarantine pass succeeds.`);
 				throw error;
 			}
 		}
@@ -909,6 +905,7 @@ export class LocalWorkspace implements Workspace {
 	}
 
 	async write(path: string, data: string | Buffer, options: { outside?: boolean } = {}): Promise<void> {
+		if (process.platform === "linux") recoverGitQuarantine(this.root);
 		if (this.gitPath(this.lexical(path))) throw new Error(`${this.display(path)} has a .git path component; EnrichedLab doesn't edit repository metadata.`);
 		const full = this.open(path);
 		// Where it leads now, links followed once, judged before anything is made: a link changed since the decision
@@ -1012,7 +1009,7 @@ export class LocalWorkspace implements Workspace {
 			} catch (error) {
 				const cleanup = launch.quarantine?.(true);
 				launch.release?.();
-				if (cleanup?.error) throw new Error(`${(error as Error).message} The required .git cleanup also failed: ${cleanup.error}${cleanup.displaced ? ` The project was moved from ${cleanup.displaced.from} to ${cleanup.displaced.to}.` : cleanup.sealed ? ` The project at ${cleanup.sealed} was made temporarily inaccessible.` : ""}`);
+				if (cleanup?.error) throw new Error(`${(error as Error).message} The required .git cleanup also failed: ${cleanup.error} Later contained commands and file writes are blocked until an anchored quarantine pass succeeds.`);
 				throw error;
 			}
 			// Keep the start and the end of long output; the middle is what a person scrolls past anyway.
@@ -1036,7 +1033,6 @@ export class LocalWorkspace implements Workspace {
 				options.onOutput?.(text);
 			};
 			for (const { from, to } of launch.recovered?.moved ?? []) take(Buffer.from(`EnrichedLab moved ${JSON.stringify(from)} to ${JSON.stringify(to)} while finishing .git cleanup left by an earlier command. Nothing was deleted.\n`));
-			if (launch.recovered?.restored) take(Buffer.from(`EnrichedLab restored the project from ${JSON.stringify(launch.recovered.restored.from)} to ${JSON.stringify(launch.recovered.restored.to)} after cleanup finished.\n`));
 			child.stdout!.on("data", take);
 			child.stderr!.on("data", take);
 			let cleanupFailed = false;
@@ -1044,11 +1040,9 @@ export class LocalWorkspace implements Workspace {
 				const result = launch.quarantine?.(final);
 				if (!result) return;
 				for (const { from, to } of result.moved) take(Buffer.from(`\nEnrichedLab moved ${JSON.stringify(from)} to ${JSON.stringify(to)} because it was created during a contained command. Nothing was deleted.\n`));
-				if (result.displaced) take(Buffer.from(`\nEnrichedLab moved the project from ${JSON.stringify(result.displaced.from)} to ${JSON.stringify(result.displaced.to)} because the final .git cleanup could not finish. Nothing was deleted.\n`));
-				if (result.sealed) take(Buffer.from(`\nEnrichedLab made the project at ${JSON.stringify(result.sealed)} temporarily inaccessible because neither .git cleanup nor moving the project aside could finish. Nothing was deleted.\n`));
 				if (result.error && final) {
 					cleanupFailed = true;
-					take(Buffer.from(`\nEnrichedLab could not finish checking new .git entries: ${result.error}\n`));
+					take(Buffer.from(`\nEnrichedLab could not finish checking new .git entries: ${result.error} Later contained commands and file writes are blocked until an anchored quarantine pass succeeds.\n`));
 				}
 			};
 			// Foreground completion and, separately, the end of every background child. The sync pipe is part of

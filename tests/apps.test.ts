@@ -5,7 +5,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { AppHost } from "../packages/engine/src/apps/host.ts";
-import { startBackend } from "../packages/engine/src/apps/backends.ts";
+import { containerBuildNetworkArgs, containerPullArgs, servedBackendNetwork, startBackend } from "../packages/engine/src/apps/backends.ts";
 import { readManifest } from "../packages/engine/src/apps/manifest.ts";
 import { installApp, packApp } from "../packages/engine/src/apps/package.ts";
 import { templateFiles } from "../packages/engine/src/apps/templates.ts";
@@ -60,6 +60,36 @@ describe("manifest", () => {
 });
 
 describe("app host", () => {
+	test("serve and container-build consent names network access and changes with the backend", async () => {
+		const home = scratch("network-consent-home");
+		const project = scratch("network-consent-project");
+		const dir = join(project, "apps", "networked");
+		writeApp(dir, {
+			"index.html": "<!doctype html>",
+			"app.json": JSON.stringify({ name: "networked", backend: { runtime: "serve", command: ["python", "app.py"] } }),
+		});
+		const apps = host(home, project);
+		const served = await apps.open({ sessionId: "s1", path: "apps/networked" });
+		expect(served.asks).toContain(process.platform === "linux"
+			? "Let its served backend use this computer's whole network; bubblewrap cannot provide loopback alone"
+			: "Let its served backend listen on this computer's loopback");
+		apps.grant(served.app.id, true);
+		writeFileSync(join(dir, "app.json"), JSON.stringify({ name: "networked", backend: { runtime: "container", image: "local/image:1", build: "." } }));
+		const built = await apps.open({ sessionId: "s1", id: served.app.id });
+		expect(built.app.granted).toBe(false);
+		expect(built.asks).toContain("Let its container build reach the network: any address");
+		expect(containerBuildNetworkArgs(false)).toEqual(["--network", "none"]);
+		expect(containerBuildNetworkArgs(true)).toEqual(["--network", "default"]);
+		expect(containerPullArgs(false)).toEqual(["--pull=never"]);
+		expect(containerPullArgs(true)).toEqual([]);
+		await apps.stop();
+	});
+
+	test.skipIf(process.platform !== "linux")("a Linux served backend refuses to share the host network without its named consent", () => {
+		expect(() => servedBackendNetwork(false, false)).toThrow("explicit consent for the whole network");
+		expect(servedBackendNetwork(false, true)).toBe("all");
+	});
+
 	test.skipIf(process.platform !== "linux" || sandboxer() !== "bubblewrap")("the default Bun app backend starts with its private app-data grant under bubblewrap", async () => {
 		const home = scratch("linux-backend-home");
 		const app = join(home, "apps", "demo");

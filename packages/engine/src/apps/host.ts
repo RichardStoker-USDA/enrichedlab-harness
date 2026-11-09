@@ -256,7 +256,13 @@ export class AppHost {
 		if (b?.runtime === "bun" && process.platform === "win32") lines.push(`Run its backend (${b.main}) on this computer with your access`);
 		// The page is held to the origins it names; the program behind it reaches the network as a whole.
 		if (b && m.permissions.network?.length) lines.push("Let its program reach the network: any address, not only the ones named above");
-		if (b?.runtime === "container") lines.push(`Run the container ${b.image}${b.build !== undefined ? " (built from its folder)" : ""}`);
+		if (b?.runtime === "serve" && !m.permissions.network?.length) lines.push(process.platform === "linux"
+			? "Let its served backend use this computer's whole network; bubblewrap cannot provide loopback alone"
+			: "Let its served backend listen on this computer's loopback");
+		if (b?.runtime === "container") {
+			lines.push(`Run the container ${b.image}${b.build !== undefined ? " (built from its folder)" : ""}`);
+			if (b.build !== undefined) lines.push("Let its container build reach the network: any address");
+		}
 		const program = b && (b.runtime !== "bun" || process.platform === "win32") ? JSON.stringify(b) : "";
 		return { lines, key: `${permissionKey(m.permissions)}|${program}|${plan?.digest ?? ""}` };
 	}
@@ -480,6 +486,8 @@ export class AppHost {
 					runDir: join(this.deps.paths.home, "runtime"),
 					toolsDir: join(this.deps.paths.home, "tools"),
 					network: !session?.sealed && (app.manifest.permissions.network?.length ?? 0) > 0,
+					buildNetwork: app.manifest.backend?.runtime === "container" && app.manifest.backend.build !== undefined,
+					serveNetwork: app.manifest.backend?.runtime === "serve",
 					log,
 				});
 			const started = running;

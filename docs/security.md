@@ -38,16 +38,16 @@ person approves to run uncontained gets the whole environment.
 
 ## What is trusted
 
-Approvals and fences guard against what the agent does and what a project holds, not against the person's own
-computer.
+Approvals and fences guard against untrusted project work, not against the person or the EnrichedLab engine.
 
-- Untrusted: the model's output, every file in a project (its `.git/config`, `.gitattributes`, `.pixi`, scripts and
-  data), packages and run packages from others, and whatever a contained command leaves behind.
-- Trusted: the person's own environment as EnrichedLab starts in it (`PATH` and loader variables, global and system
-  git settings, Homebrew's folders), and a lab's image and the environment its gate gives each command. Whoever can
-  change those already runs code as the person. That holds only while they lead to what only the person controls:
-  a `PATH` entry, an `include.path` or a loader library inside a project hands that trust to project content, so
-  don't set one up that way.
+- Untrusted: code running in a contained shell, app backends, container builds, the model's output, every file in a
+  project (including `.git/config`, `.gitattributes`, `.pixi`, scripts and data), packages from others, and whatever
+  a contained process leaves behind.
+- Trusted: the person and the EnrichedLab engine. The person's environment as EnrichedLab starts in it (`PATH` and
+  loader variables, global and system git settings, Homebrew's folders) is part of that trust. A lab's image and the
+  environment its gate gives each command are trusted by that lab. This holds only while those paths lead to content
+  the person or lab controls. A `PATH` entry, `include.path` or loader library inside a project hands that trust to
+  untrusted project content, so do not configure one that way.
 - What the person approves extends trust. An approved uncontained command or package install can change trusted
   places (Homebrew, global git settings, the package cache), and the result counts as the person's. EnrichedLab
   checks one of them itself: its own pixi, compared with the pinned SHA-256 before every use.
@@ -97,9 +97,11 @@ The engine's own work stays inside the same line:
 - Bringing work back from a lab (committing what's left, then bundling) runs only under the lab's fence, with
   hooks, fsmonitor and signing off. A lab where the fence doesn't hold refuses it.
 - App backends (`bun`, `command`, `serve`) run contained or not at all. Their only grant inside the hidden
-  `app-data` tree is the current app's own data folder, rebound from a held folder after the private-folder masks;
+  `app-data` tree is the current app's own data folder, bound by its engine-owned path after the private-folder masks;
   sibling app data stays hidden. On Windows, where servers run as the person, the consent card says so before
-  anything starts.
+  anything starts. A served backend needs a named network grant before it starts. Seatbelt limits that grant to
+  loopback unless the manifest asks for network. Bubblewrap cannot provide loopback without sharing the host network,
+  so the Linux card names that whole-network access.
 - Package installs and listings run contained with the pinned pixi, checked against its SHA-256 before each use. A
   listing never downloads it and gets no network.
 - File tools reject a `.git` component before and after following links on every platform. On macOS, Seatbelt denies
@@ -109,36 +111,39 @@ The engine's own work stays inside the same line:
 - On Linux, contained commands can write the project. Before launch, an anchored scan finds existing `.git`
   directories and pointer files, including case variants, and bubblewrap binds them read only. The scan refuses any
   `.git` symbolic link, including a dangling one, because bubblewrap cannot protect the link entry and its target as
-  one object. A scan error or its 50,000-entry or 64-level limit refuses the command. The engine also prepares a
-  private quarantine outside the project on the same filesystem. It normally uses `~/.el/quarantine/git/<project>`;
-  when that is on another filesystem it uses a hidden sibling quarantine. Contained commands cannot read either
-  location.
+  one object. A scan error or its 50,000-entry or 64-level limit refuses the command. The engine also prepares one
+  hidden sibling quarantine outside the project, named from the project's device and inode and on the same
+  filesystem. It makes the directory with mode 0700, then opens it without following any link and verifies from that
+  descriptor that it is owned by the person, still mode 0700 and on the project's device. An unsafe existing path
+  refuses the command.
+  Contained commands cannot read the quarantine.
 
-  Before starting the command, the engine records the project identity, initial root mode, quarantine path and the
+  Before starting the command, the engine records the project identity, quarantine path and the
   identities of existing `.git` entries in its own `run` folder. If that record cannot be written, the command does
   not start. When the foreground command exits, the engine makes a bounded cleanup pass without changing modes while
-  background children may still run. After every child ends, the final anchored pass does not reuse the launch
-  scan's entry or depth limits. It temporarily adds owner access to a directory the command made inaccessible, moves
-  each new or replaced `.git` entry atomically into the external quarantine, then restores the directory's mode. It
+  background children may still run. After every child ends, the final anchored pass uses the same 50,000-entry and
+  64-level bounds. It temporarily adds owner access to a directory the command made inaccessible, moves each new or
+  replaced `.git` entry atomically into the held quarantine descriptor, then restores the directory's mode. It
   reports the original path and exact quarantine path in command output. Nothing is deleted or overwritten, and
   cleanup never follows a link. A lifecycle pipe keeps final cleanup attached to background children even when they
   redirect output; the command result waits for them to end. A successful final pass removes the cleanup record.
 
-  A final scan or move error returns exit 125 and leaves the record. The engine then atomically moves the whole
-  project to the recorded quarantine before returning. If that move also fails, it removes all access bits from the
-  held project root. It reports which action held the data. Recovery scans the original or displaced folder by its
-  saved identity. It also finds a pending record by folder identity after the project is renamed or reached through
-  another physical path. Recovery moves only new or replaced metadata, restores the root mode and original project
-  path, and refuses a conflicting replacement at that path. An invalid record at that project path or a failed
-  recovery blocks every later contained shell command, including a read-only one. These fallbacks preserve both the
-  person's files and the agent's files.
+  A final scan or move error returns exit 125 and leaves the project and cleanup record in place. It does not move
+  the project, leave its access bits changed or delete data to enforce the rule. Before any later contained command
+  or local file-tool write in that project, the engine retries the anchored pass. An invalid record or another
+  failure refuses that command or write before it creates anything. Reads remain available so the person's data is
+  not hidden. Recovery also finds a pending record by folder identity after the project is renamed or reached through
+  another physical path. An existing sibling quarantine must pass the same descriptor checks even when no cleanup
+  record is found; file writes refuse an unsafe quarantine without waiting for a command to check it.
 
   There is a remaining window while a command runs: new metadata exists at its project path and Git in that command,
-  or a simultaneous process outside containment, can use it. An engine crash can leave that window open until the
-  saved record is recovered after restart. Quarantine does not undo work already done with the metadata. Landlock
-  and bubblewrap grant access by existing paths or inodes, and seccomp cannot safely inspect pathname strings, so
-  none can deny every future entry named `.git` inside an otherwise writable project. Lab file tools apply the same
-  `.git` check as local file tools; the accepted lab write-mode metadata limit remains.
+  or a simultaneous process outside containment, can use it. An engine crash or failed bounded pass can leave that
+  metadata readable in the project until recovery succeeds. Later contained commands and file writes are refused,
+  but an already-open directory handle or a process outside containment is not revoked. Quarantine does not undo work
+  already done with the metadata. Landlock and bubblewrap grant access by existing paths or inodes, and seccomp
+  cannot safely inspect pathname strings, so none can deny every future entry named `.git` inside an otherwise
+  writable project. Lab file tools apply the same `.git` check as local file tools; the accepted lab write-mode
+  metadata limit remains.
 - Commits use `git_commit`, not shell `git commit`. The permission decision records the repository, worktree admin
   directory, branch and current commit. Execution checks them again. A recorded session worktree must still point
   back to its own admin directory and its admin `HEAD` must still name the recorded branch. A session without a
@@ -164,10 +169,11 @@ Accepted residuals, each with its reason:
 - Pushes the line doesn't show. In `full` mode and for commands the person approves outside containment, only pushes
   the command line shows are caught (`git push`, `send-pack`, `http-push`, `svn dcommit`, `p4 submit`,
   `send-email`, including the supported quoting, wrapping and POSIX escape forms). On Windows, `iex`,
-  `Invoke-Expression`, any spelling or abbreviation of `-EncodedCommand`, and any nested `cmd /c`, `cmd /k`,
-  `sh -c`, `bash -c`, `wsl`, `powershell` or `pwsh` invocation count as a push and ask every time. Other unsupported
-  PowerShell syntax asks as a push when its raw text contains a publishing word and as hidden otherwise. A script or
-  program that pushes on its own isn't. "Pushes ask"
+  `Invoke-Expression`, any spelling or abbreviation of `-EncodedCommand`, and direct `cmd /c`, `cmd /k`, `sh -c`,
+  `bash -c`, `wsl`, `powershell` or `pwsh` invocations count as a push and ask every time. Those interpreter handoffs
+  also count behind `env`, `start`, `Start-Process`, its `saps` alias, `timeout` and `xargs`, including native `.exe`
+  forms. Other unsupported PowerShell syntax asks as a push when its raw text contains a publishing word and as
+  hidden otherwise. A script or program that pushes on its own isn't. "Pushes ask"
   means pushes the line shows.
 - The lab fence by Landlock ABI. ABI 3 covers file contents, names, existence and truncation; refusing TCP needs ABI
   4, device ioctls ABI 5, and signals and abstract sockets to processes outside the fence ABI 6. Below those, a fenced
@@ -229,8 +235,8 @@ word is text only when nothing expands or substitutes in it: no variable, substi
 (`tools/shell_syntax.ts`). On Windows, the publishing gate reads a constrained set of literal PowerShell
 native-command words, where a backslash in `C:\Tools\Git\git.exe` stays a backslash. Variables and expression
 syntax outside that literal subset, splatting, script blocks, block comments, backtick escapes and the stop-parsing
-token fail closed and ask in every mode. The Windows interpreter handoffs listed above count as pushes before this
-parsing, at any nesting depth. Bracket expressions are outside that Windows subset. A supported glob word (`*` or
+token fail closed and ask in every mode. The Windows interpreter handoffs and executor wrappers listed above count
+as pushes before this parsing. Bracket expressions are outside that Windows subset. A supported glob word (`*` or
 `?`, plus `[..]` on POSIX shells) is judged by the names it matches: on
 this computer they are listed at decision time and each must be inside the project, links
 followed; in a fenced lab sandbox each
@@ -311,13 +317,15 @@ network on Windows needs a one-time administrator setup (a sandbox account and f
 place for that kind of work.
 
 App backends and served apps run under the same facility, and app pages run in an opaque origin with their own
-content security policy (docs/apps.md). The page reaches only the origins the app names; a program behind it that
-asked for any network reaches all of it, and the consent card says so. Building an app's environment runs contained
-too: pixi may write the app's folder and its own cache under `~/.el/tools`, never the person's shared package caches,
-and gets no keys. The card lists every package (conda, PyPI, other channels and indexes, and anything built from
-source), and a grant covers that exact `pixi.toml`: a change asks again. An app package is checked against its size
-limits before it is unpacked. Lab sandboxes are isolated by
-the lab.
+content security policy (docs/apps.md). The page reaches only the origins the app names. A program behind it that
+asked for network reaches all of it. A served backend asks for its listening network before it starts; on Linux the
+card explains that bubblewrap must share the whole host network. A container build also names network access in the
+card. The build command uses `--network none` without that grant. A networkless container run uses `--pull=never`, so
+a missing image cannot trigger an unapproved pull. Building an app's pixi environment runs contained: pixi may write
+the app's folder and its own cache under `~/.el/tools`, never the person's shared package caches, and gets no keys.
+The card lists every package (conda, PyPI, other channels and indexes, and anything built from source), and a grant
+covers that exact `pixi.toml`: a change asks again. An app package is checked against its size limits before it is
+unpacked. Lab sandboxes are isolated by the lab.
 
 The engine listens on loopback only, checks `Host` and `Origin`, and authenticates every surface (docs/architecture.md).
 `el app` hands a browser its one-time pairing address through an owner-only page in `~/.el/run`, never on a command

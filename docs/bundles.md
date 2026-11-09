@@ -18,8 +18,9 @@ How EnrichedLab handles git on a person's computer and in a lab sandbox, and how
   commands can write the worktree. Existing regular `.git` entries are bound read only, existing `.git` symbolic
   links refuse launch, and normal completion moves new entries to an engine-owned quarantine outside the project
   after all background children end. A new `.git` exists until cleanup. Before launch the engine records what existed
-  and where the external quarantine is. A failed final pass moves the project there or removes its access bits; a
-  later anchored recovery restores the project before another contained shell command; see [security.md](security.md).
+  and where the private same-filesystem sibling quarantine is. A failed bounded final pass leaves the project and
+  cleanup record in place. Later contained commands and local file-tool writes refuse to run until an anchored
+  recovery pass succeeds; see [security.md](security.md).
   `git_commit` stages all changes and commits
   through an isolated staging repository, then rechecks the recorded repository, worktree admin directory, branch
   and old commit before advancing only that branch. Its staging scratch is not in the temp folder agent commands can

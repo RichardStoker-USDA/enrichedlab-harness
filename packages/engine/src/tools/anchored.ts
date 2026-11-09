@@ -129,36 +129,30 @@ export interface GitEntryBaseline {
 export interface GitQuarantineResult {
 	moved: { from: string; to: string }[];
 	error?: string;
-	/** The whole project was moved out of its original path after a final scan failed. */
-	displaced?: { from: string; to: string };
-	/** Moving the project failed too, so its held root was made inaccessible instead. */
-	sealed?: string;
 }
 
 export interface HeldGitEntries {
 	paths: string[];
 	baseline: GitEntryBaseline;
 	quarantinePath: string;
-	rootMode: number;
 	quarantine(final?: boolean): GitQuarantineResult;
-	restoreRootMode(mode: number): void;
 	release(): void;
 }
 
-/** Move one physical Linux path without following links or replacing anything at the destination. */
-export function movePhysicalNoReplace(from: string, to: string): void {
-	if (process.platform !== "linux") throw new Error("Anchored moves are for Linux.");
-	const source = linuxParent(from);
-	const destination = linuxParent(to);
+/** Hold a private engine folder, checking the opened directory rather than trusting its path. */
+export function holdPrivateFolder(path: string, device?: bigint): number {
+	if (process.platform !== "linux") throw new Error("Private folder handles are for Linux.");
+	const held = holdFolder(path);
 	try {
-		const errno = new Int32Array(toArrayBuffer(lib().__errno_location(), 0, 4));
-		errno[0] = 0;
-		if (lib().renameat2(source.dir, c(source.name), destination.dir, c(destination.name), 1) !== 0) {
-			throw new Error(`Couldn't move ${from} to ${to} without replacing data (errno ${errno[0]}).`);
+		const stat = fstatSync(held, { bigint: true });
+		const uid = process.getuid?.();
+		if (!stat.isDirectory() || uid === undefined || stat.uid !== BigInt(uid) || (stat.mode & 0o7777n) !== 0o700n || (device !== undefined && stat.dev !== device)) {
+			throw new Error("The .git quarantine must be a no-link directory owned by this user, mode 0700, on the project's filesystem.");
 		}
-	} finally {
-		lib().close(source.dir);
-		lib().close(destination.dir);
+		return held;
+	} catch (error) {
+		lib().close(held);
+		throw error;
 	}
 }
 
@@ -169,17 +163,20 @@ export function movePhysicalNoReplace(from: string, to: string): void {
 export function holdGitEntries(path: string, maxEntries = 50_000, maxDepth = 64, saved?: GitEntryBaseline, quarantinePath = join(dirname(path), ".enrichedlab-git-quarantine")): HeldGitEntries {
 	if (process.platform !== "linux") throw new Error("Git quarantine is for Linux.");
 	const root = holdFolder(path);
-	mkdirSync(quarantinePath, { recursive: true, mode: 0o700 });
-	const quarantineRoot = holdFolder(quarantinePath);
 	const rootStat = fstatSync(root, { bigint: true });
-	const quarantineStat = fstatSync(quarantineRoot, { bigint: true });
-	if (rootStat.dev !== quarantineStat.dev) {
+	let quarantineRoot: number;
+	try {
+		try {
+			mkdirSync(quarantinePath, { mode: 0o700 });
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+		}
+		quarantineRoot = holdPrivateFolder(quarantinePath, rootStat.dev);
+	} catch (error) {
 		lib().close(root);
-		lib().close(quarantineRoot);
-		throw new Error("The .git quarantine is on another filesystem, so the command did not run.");
+		throw error;
 	}
 	const rootIdentity = `${rootStat.dev}:${rootStat.ino}`;
-	const rootMode = Number(rootStat.mode & 0o7777n);
 	let released = false;
 	const release = () => {
 		if (!released) {
@@ -218,7 +215,7 @@ export function holdGitEntries(path: string, maxEntries = 50_000, maxDepth = 64,
 					}
 					const name = new CString(entry, 19).toString();
 					if (name === "." || name === "..") continue;
-					if (!final && ++seen > maxEntries) throw new Error(`The project has more than ${maxEntries} entries; .git protection couldn't be completed.`);
+					if (++seen > maxEntries) throw new Error(`The project has more than ${maxEntries} entries; .git protection couldn't be completed.`);
 					const next = relative ? `${relative}/${name}` : name;
 					if (name.toLowerCase() === ".git") {
 						visit(dir, name, next);
@@ -228,7 +225,7 @@ export function holdGitEntries(path: string, maxEntries = 50_000, maxDepth = 64,
 					if (child < 0) throw new Error(`Couldn't check ${next} during the .git scan.`);
 					try {
 						if (fstatSync(child).isDirectory()) {
-							if (!final && depth >= maxDepth) throw new Error(`The project is deeper than ${maxDepth} folders; .git protection couldn't be completed.`);
+							if (depth >= maxDepth) throw new Error(`The project is deeper than ${maxDepth} folders; .git protection couldn't be completed.`);
 							descend(child, next, depth + 1);
 						}
 					} finally {
@@ -271,11 +268,6 @@ export function holdGitEntries(path: string, maxEntries = 50_000, maxDepth = 64,
 		paths: [...initial.keys()].map((relative) => join(path, relative)),
 		baseline: { root: rootIdentity, entries: [...initial] },
 		quarantinePath,
-		rootMode,
-		restoreRootMode(mode: number) {
-			if (released) throw new Error("The project folder is no longer held.");
-			chmodSync(`/proc/self/fd/${root}`, mode & 0o7777);
-		},
 		release,
 		quarantine(final = true) {
 			const moved: { from: string; to: string }[] = [];
@@ -292,22 +284,7 @@ export function holdGitEntries(path: string, maxEntries = 50_000, maxDepth = 64,
 				}, final);
 				return { moved };
 			} catch (error) {
-				if (!final) return { moved, error: (error as Error).message };
-				const reason = (error as Error).message;
-				const displaced = join(quarantinePath, "project");
-				try {
-					const current = lstatSync(path, { bigint: true, throwIfNoEntry: false });
-					if (!current || `${current.dev}:${current.ino}` !== rootIdentity) throw new Error("the original project path no longer names the held folder");
-					movePhysicalNoReplace(path, displaced);
-					return { moved, error: reason, displaced: { from: path, to: displaced } };
-				} catch (moveError) {
-					try {
-						chmodSync(`/proc/self/fd/${root}`, 0);
-						return { moved, error: `${reason} Moving the project aside also failed: ${(moveError as Error).message}`, sealed: path };
-					} catch (sealError) {
-						return { moved, error: `${reason} Moving the project aside also failed: ${(moveError as Error).message} Making the project inaccessible failed too: ${(sealError as Error).message}` };
-					}
-				}
+				return { moved, error: (error as Error).message };
 			}
 		},
 	};

@@ -90,11 +90,12 @@ MCP `_meta["org.enrichedlab/project"]`, which a `bun` backend gets as `app.proje
 | --- | --- | --- |
 | `bun` | a module exporting `tools`, on the Bun runtime inside `el` (`BUN_BE_BUN=1`); nothing to install | OS sandbox: writes only to the app's data folder, no network unless `permissions.network`; without one (Linux without bubblewrap) it doesn't start, and on Windows it runs as the person, which the consent card says |
 | `command` | any MCP server on stdio the person has (`uv run server.py`, `Rscript srv.R`) | the same |
-| `container` | an MCP server on stdio in an image, built from the folder when `build` is set (Docker, Podman or nerdctl) | the container: `--network none` unless allowed, app folder read-only |
-| `serve` | a web app on `$PORT` (R or Python Shiny, Streamlit, a dev server); the page is its address | OS sandbox with loopback only |
+| `container` | an MCP server on stdio in an image, built from the folder when `build` is set (Docker, Podman or nerdctl) | the container: app folder read-only; runtime network off and image pulls disabled unless `permissions.network`; builds use `--network none` until the person grants the build-network line on the consent card |
+| `serve` | a web app on `$PORT` (R or Python Shiny, Streamlit, a dev server); the page is its address | OS sandbox after network consent: loopback on macOS; the whole host network on Linux because bubblewrap cannot provide loopback alone; on Windows it runs as the person |
 
 On macOS and Linux, `bun`, `command` and `serve` backends receive one explicit write grant for the current app's
-folder under the engine home's `app-data` directory. That folder is exposed after the engine-data mask is applied;
+folder under the engine home's `app-data` directory. Linux binds that engine-owned path after the engine-data mask
+is applied; the MCP stdio transport cannot pass a held folder descriptor to the child. On both platforms,
 sibling apps' data and the rest of the engine's private folders stay hidden.
 
 ## What a page can call
@@ -120,7 +121,8 @@ and always `lab_store_get/set` and `lab_session`. `lab.share(text)` tells the mo
 - A page gets an opaque origin from its CSP (`sandbox allow-scripts`): no access to the workbench, its storage or the
   engine. It reaches the host only through the bridge, and the network only at origins it declared.
 - An app that asks for permissions, or runs a program of its own, shows the person what it asks before anything loads.
-  The grant covers exactly that list; asking for more asks again.
+  The grant covers exactly that list and backend definition; changing the command, build, image or permissions asks
+  again. Served backends and container builds do not start before their network line is granted.
 - In a session bound to a lab that keeps data inside, pages get no network or links, and other labs are refused.
 - An MCP server's view may call only its own server's tools marked for apps; app-only tools never reach the model.
 

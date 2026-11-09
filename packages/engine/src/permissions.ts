@@ -225,21 +225,24 @@ const WRAPPERS = new Set(["command", "builtin", "exec", "env", "xargs", "nice", 
  * handoffs always count as publishing, even when reached through another program, so Full mode still asks.
  */
 export function windowsInterpreterHandoff(command: string): boolean {
+	const executable = (word: string) => word.replace(/^.*[\\/]/, "").toLowerCase().replace(/\.exe$/, "");
 	const riskyAt = (words: readonly (string | undefined)[], i: number) => {
 		const word = words[i];
 		if (word === undefined) return false;
-		const program = word.replace(/^.*[\\/]/, "").toLowerCase();
+		const program = executable(word);
 		const rest = words.slice(i + 1).filter((part): part is string => part !== undefined);
 		if (program === "iex" || program === "invoke-expression") return true;
-		if (/^(powershell|pwsh)(\.exe)?$/.test(program) || /^(wsl)(\.exe)?$/.test(program)) return true;
-		if (/^cmd(\.exe)?$/.test(program) && rest.some((part) => /^\/[ck]/i.test(part))) return true;
-		return /^(ba)?sh(\.exe)?$/.test(program) && rest.some((part) => /^-[a-z]*c[a-z]*$/i.test(part));
+		if (/^(powershell|pwsh|wsl)$/.test(program)) return true;
+		if (program === "cmd" && rest.some((part) => /^\/[ck]/i.test(part))) return true;
+		return /^(ba)?sh$/.test(program) && rest.some((part) => /^-[a-z]*c[a-z]*$/i.test(part));
 	};
 	const parsed = everyPowerShellCommand(command);
-	const runners = new Set(["env", "start", "start-process", "timeout", "xargs"]);
+	// PowerShell aliases and native wrappers that start a later argv. Normalize `.exe` before this check so the
+	// native forms fail closed too. `saps` is PowerShell's built-in alias for Start-Process.
+	const runners = new Set(["env", "saps", "start", "start-process", "timeout", "xargs"]);
 	if (parsed) return parsed.commands.some(({ words }) => {
 		if (riskyAt(words, 0)) return true;
-		const lead = words[0]?.replace(/^.*[\\/]/, "").toLowerCase();
+		const lead = words[0] === undefined ? undefined : executable(words[0]);
 		return lead !== undefined && runners.has(lead) && words.some((_word, i) => i > 0 && riskyAt(words, i));
 	});
 	// When PowerShell syntax itself is outside the literal subset, retain enough token boundaries to fail closed on

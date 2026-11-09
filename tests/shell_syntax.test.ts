@@ -3,7 +3,7 @@
 
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { chmodSync, closeSync, constants, existsSync, linkSync, lstatSync, mkdirSync, readdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, chownSync, closeSync, constants, existsSync, linkSync, lstatSync, mkdirSync, readdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import type { LabConfig } from "../packages/engine/src/config.ts";
@@ -40,6 +40,9 @@ describe("shell syntax", () => {
 		for (const command of [
 			"cmd.exe /c powershell.exe -EncodedCommand ZwBpAHQAIABwAHUAcwBoAA==",
 			"env powershell.exe -ec ZwBpAHQAIABwAHUAcwBoAA==",
+			"env.exe powershell.exe -ec ZwBpAHQAIABwAHUAcwBoAA==",
+			"xargs.exe pwsh.exe -EncodedCommand ZwBpAHQAIABwAHUAcwBoAA==",
+			"saps powershell.exe -ArgumentList '-EncodedCommand ZwBpAHQAIABwAHUAcwBoAA=='",
 			`iex '& ("g"+"it") ("p"+"ush") origin main'`,
 			"Invoke-Expression 'git push origin main'",
 			"cmd.exe /d /c g^it p^ush origin main",
@@ -481,6 +484,9 @@ describe("round 6: containment is the boundary", () => {
 			for (const command of [
 				"cmd.exe /c powershell.exe -EncodedCommand ZwBpAHQAIABwAHUAcwBoAA==",
 				"env powershell.exe -enc ZwBpAHQAIABwAHUAcwBoAA==",
+				"env.exe powershell.exe -enc ZwBpAHQAIABwAHUAcwBoAA==",
+				"xargs.exe pwsh.exe -EncodedCommand ZwBpAHQAIABwAHUAcwBoAA==",
+				"saps powershell.exe -ArgumentList '-EncodedCommand ZwBpAHQAIABwAHUAcwBoAA=='",
 				"powershell.exe -ec ZwBpAHQAIABwAHUAcwBoAA==",
 				`iex '& ("g"+"it") ("p"+"ush") origin main'`,
 				"Invoke-Expression 'git push origin main'",
@@ -725,7 +731,7 @@ describe("round 6: containment is the boundary", () => {
 		}
 	});
 
-	test.skipIf(process.platform !== "linux")("Linux refuses existing .git links and final quarantine survives hostile modes and launch bounds", () => {
+	test.skipIf(process.platform !== "linux")("Linux refuses existing .git links and final quarantine survives hostile modes", () => {
 		const base = realpathSync(mkdtempSync(join(tmpdir(), "el-git-hostile-")));
 		const linked = join(base, "linked");
 		const dangling = join(base, "dangling");
@@ -740,7 +746,7 @@ describe("round 6: containment is the boundary", () => {
 		symlinkSync(join(base, "missing"), join(dangling, ".GiT"));
 		expect(() => holdGitEntries(linked)).toThrow("symbolic link");
 		expect(() => holdGitEntries(dangling)).toThrow("symbolic link");
-		const held = holdGitEntries(root, 1, 0, undefined, quarantine);
+		const held = holdGitEntries(root, 50_000, 64, undefined, quarantine);
 		try {
 			mkdirSync(join(root, "sealed", "deeper", ".git"), { recursive: true });
 			writeFileSync(join(root, "sealed", "deeper", ".git", "config"), "keep\n");
@@ -748,7 +754,6 @@ describe("round 6: containment is the boundary", () => {
 			writeFileSync(join(root, "extra-two"), "2");
 			chmodSync(join(root, "sealed"), 0);
 			chmodSync(root, 0);
-			expect(held.quarantine(false).error).toBeDefined();
 			const result = held.quarantine();
 			expect(result.error).toBeUndefined();
 			expect(result.moved.map((move) => move.from)).toEqual(["sealed/deeper/.git"]);
@@ -769,31 +774,113 @@ describe("round 6: containment is the boundary", () => {
 		}
 	});
 
-	test.skipIf(process.platform !== "linux")("Linux makes the project inaccessible when neither metadata nor the project can move to quarantine", () => {
-		const base = realpathSync(mkdtempSync(join(tmpdir(), "el-git-fail-closed-")));
+	test.skipIf(process.platform !== "linux")("Linux bounds the final .git scan without moving or chmodding the project", () => {
+		const base = realpathSync(mkdtempSync(join(tmpdir(), "el-git-bounded-final-")));
 		const root = join(base, "project");
 		const quarantine = join(base, "quarantine");
-		mkdirSync(root);
-		const held = holdGitEntries(root, 50_000, 64, undefined, quarantine);
+		mkdirSync(root, { mode: 0o700 });
+		const held = holdGitEntries(root, 1, 64, undefined, quarantine);
 		try {
 			mkdirSync(join(root, ".git"));
 			writeFileSync(join(root, ".git", "config"), "keep\n");
-			// The held destination disappears, as it could after a host filesystem failure.
-			rmSync(quarantine, { recursive: true });
+			writeFileSync(join(root, "extra"), "enough to exceed the final bound");
 			const result = held.quarantine(true);
-			expect(result.error).toContain("Moving the project aside also failed");
-			expect(result.sealed).toBe(root);
-			expect(lstatSync(root).mode & 0o777).toBe(0);
-			if (process.getuid?.() !== 0) expect(spawnSync("/bin/cat", [join(root, ".git", "config")]).status).not.toBe(0);
-			held.restoreRootMode(0o700);
-			expect(readFileSync(join(root, ".git", "config"), "utf8")).toBe("keep\n");
+			expect(result.error).toContain("more than 1 entries");
+			expect(existsSync(root)).toBe(true);
+			expect(lstatSync(root).mode & 0o777).toBe(0o700);
 		} finally {
 			held.release();
-			try {
-				chmodSync(root, 0o700);
-			} catch {
-				// The setup may have failed before changing modes.
+			rmSync(base, { recursive: true, force: true });
+		}
+	});
+
+	test.skipIf(process.platform !== "linux")("Linux verifies the sibling quarantine owner and mode through a no-link handle", () => {
+		const base = realpathSync(mkdtempSync(join(tmpdir(), "el-git-private-quarantine-")));
+		const root = join(base, "project");
+		const target = join(base, "target");
+		mkdirSync(root);
+		try {
+			const quarantine = gitQuarantineFolder(root, join(base, "state"));
+			rmSync(quarantine, { recursive: true });
+			mkdirSync(quarantine, { mode: 0o777 });
+			chmodSync(quarantine, 0o777);
+			expect(() => gitQuarantineFolder(root, join(base, "state"))).toThrow("mode 0700");
+			rmSync(quarantine, { recursive: true });
+			if (process.getuid?.() === 0) {
+				mkdirSync(quarantine, { mode: 0o700 });
+				chownSync(quarantine, 65534, 65534);
+				expect(() => gitQuarantineFolder(root, join(base, "state"))).toThrow("owned by this user");
+				rmSync(quarantine, { recursive: true });
 			}
+			mkdirSync(target, { mode: 0o700 });
+			symlinkSync(target, quarantine);
+			expect(() => gitQuarantineFolder(root, join(base, "state"))).toThrow("could not verify");
+		} finally {
+			rmSync(base, { recursive: true, force: true });
+		}
+	});
+
+	test.skipIf(process.platform !== "linux" || sandboxer() !== "bubblewrap")("a pending .git journal blocks contained commands and file writes until an anchored pass succeeds", async () => {
+		const base = realpathSync(mkdtempSync(join(tmpdir(), "el-git-write-gate-")));
+		const root = join(base, "project");
+		const home = join(base, "state");
+		const savedHome = process.env.EL_HOME;
+		mkdirSync(root);
+		try {
+			process.env.EL_HOME = home;
+			const quarantine = gitQuarantineFolder(root, home);
+			const held = holdGitEntries(root, 50_000, 64, undefined, quarantine);
+			const marker = gitQuarantineMarker(root, home);
+			mkdirSync(dirname(marker), { recursive: true, mode: 0o700 });
+			writeFileSync(marker, JSON.stringify({ version: 1, project: root, baseline: held.baseline, quarantine }));
+			held.release();
+			mkdirSync(join(root, ".git"));
+			writeFileSync(join(root, ".git", "config"), "keep\n");
+			chmodSync(quarantine, 0o777);
+			const workspace = new LocalWorkspace(root, "workspace");
+			await expect(workspace.write("blocked.txt", "blocked")).rejects.toThrow(/cleanup pending|could not verify its private \.git quarantine/);
+			expect(existsSync(join(root, "blocked.txt"))).toBe(false);
+			const command = await workspace.exec("printf blocked > command.txt", { timeoutMs: 5_000, signal: AbortSignal.timeout(5_000) });
+			// Refused either at the quarantine check (its mode was broken above) or at the pending cleanup.
+			expect(command.exitCode).toBe(125);
+			expect(command.output).toMatch(/cleanup pending|could not verify its private \.git quarantine/);
+			expect(existsSync(join(root, "command.txt"))).toBe(false);
+			await expect(workspace.write("blocked.txt", "blocked")).rejects.toThrow(/cleanup pending|could not verify its private \.git quarantine/);
+			expect(existsSync(join(root, "blocked.txt"))).toBe(false);
+			expect(existsSync(marker)).toBe(true);
+			chmodSync(quarantine, 0o700);
+			await workspace.write("recovered.txt", "ok");
+			expect(readFileSync(join(root, "recovered.txt"), "utf8")).toBe("ok");
+			expect(existsSync(join(root, ".git"))).toBe(false);
+			expect(existsSync(marker)).toBe(false);
+		} finally {
+			if (savedHome === undefined) delete process.env.EL_HOME;
+			else process.env.EL_HOME = savedHome;
+			rmSync(base, { recursive: true, force: true });
+		}
+	});
+
+	test.skipIf(process.platform !== "linux")("file writes refuse an unsafe quarantine without a journal or a prior command check", async () => {
+		const base = realpathSync(mkdtempSync(join(tmpdir(), "el-git-write-quarantine-")));
+		const root = join(base, "project");
+		const home = join(base, "state");
+		const savedHome = process.env.EL_HOME;
+		mkdirSync(root);
+		try {
+			process.env.EL_HOME = home;
+			const quarantine = gitQuarantineFolder(root, home);
+			const marker = gitQuarantineMarker(root, home);
+			const workspace = new LocalWorkspace(root);
+			chmodSync(quarantine, 0o777);
+			expect(existsSync(marker)).toBe(false);
+			await expect(workspace.write("blocked.txt", "blocked")).rejects.toThrow(/cleanup pending|could not verify its private \.git quarantine/);
+			expect(existsSync(join(root, "blocked.txt"))).toBe(false);
+			chmodSync(quarantine, 0o700);
+			await workspace.write("recovered.txt", "ok");
+			expect(readFileSync(join(root, "recovered.txt"), "utf8")).toBe("ok");
+		} finally {
+			if (savedHome === undefined) delete process.env.EL_HOME;
+			else process.env.EL_HOME = savedHome;
 			rmSync(base, { recursive: true, force: true });
 		}
 	});
@@ -872,7 +959,7 @@ describe("round 6: containment is the boundary", () => {
 			const held = holdGitEntries(root, 50_000, 64, undefined, quarantine);
 			const marker = gitQuarantineMarker(root, home);
 			mkdirSync(dirname(marker), { recursive: true });
-			writeFileSync(marker, JSON.stringify({ version: 1, project: root, baseline: held.baseline, quarantine, rootMode: held.rootMode }));
+			writeFileSync(marker, JSON.stringify({ version: 1, project: root, baseline: held.baseline, quarantine }));
 			held.release();
 			mkdirSync(join(root, "left", ".git"), { recursive: true });
 			writeFileSync(join(root, "left", ".git", "config"), "keep");
@@ -882,19 +969,8 @@ describe("round 6: containment is the boundary", () => {
 			expect(existsSync(join(root, "existing", ".git"))).toBe(true);
 			expect(readFileSync(join(recovered.moved[0]!.to, "config"), "utf8")).toBe("keep");
 
-			const displacedHeld = holdGitEntries(root, 50_000, 64, undefined, quarantine);
-			writeFileSync(marker, JSON.stringify({ version: 1, project: root, baseline: displacedHeld.baseline, quarantine, rootMode: displacedHeld.rootMode }));
-			displacedHeld.release();
-			mkdirSync(join(root, "late", ".git"), { recursive: true });
-			writeFileSync(join(root, "late", ".git", "config"), "late");
-			renameSync(root, join(quarantine, "project"));
-			const restored = recoverGitQuarantine(root, home);
-			expect(restored.restored).toEqual({ from: join(quarantine, "project"), to: root });
-			expect(restored.moved.map((entry) => entry.from)).toEqual(["late/.git"]);
-			expect(existsSync(root)).toBe(true);
-
 			const renamedHeld = holdGitEntries(root, 50_000, 64, undefined, quarantine);
-			writeFileSync(marker, JSON.stringify({ version: 1, project: root, baseline: renamedHeld.baseline, quarantine, rootMode: renamedHeld.rootMode }));
+			writeFileSync(marker, JSON.stringify({ version: 1, project: root, baseline: renamedHeld.baseline, quarantine }));
 			renamedHeld.release();
 			const renamed = join(base, "renamed-project");
 			renameSync(root, renamed);

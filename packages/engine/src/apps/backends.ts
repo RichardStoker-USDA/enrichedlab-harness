@@ -3,8 +3,8 @@
 // container). "serve" starts a web app on a free loopback port and the page is that address.
 //
 // Containment: bun and command backends run under the OS sandbox (writes only to the app's data folder, credential
-// folders hidden, no network unless the app was allowed origins). A serve backend may also listen on loopback. A
-// container is its own boundary: no network unless allowed, the app folder read-only, the data folder writable.
+// folders hidden, no network unless the app was allowed origins). A serve backend gets its separately named network
+// grant. A container is its own boundary: no network unless allowed, the app folder read-only, the data folder writable.
 //
 // In a session that works in a lab, the backend runs in that lab's sandbox instead (startInSandbox), so the lab's data
 // stays inside the lab: the app's folder is copied in once per version and the process is attached (sites/attach.ts).
@@ -73,6 +73,10 @@ export interface BackendContext {
 	toolsDir: string;
 	/** Allow network for the backend (the app was allowed origins). */
 	network: boolean;
+	/** The app consent named network access for a local container build. */
+	buildNetwork?: boolean;
+	/** The app consent named the listening network for a local served backend. */
+	serveNetwork?: boolean;
 	/** Recent stderr lines, for error messages. */
 	log: (line: string) => void;
 	/** The lab sandbox of the session's place, when the session works in a lab. */
@@ -88,6 +92,25 @@ export function containerRuntime(): string | undefined {
 		if (found.status === 0 && found.stdout.trim()) return found.stdout.trim().split(/\r?\n/)[0];
 	}
 	return undefined;
+}
+
+/** Container-build network arguments. The app host sets `allowed` only after the consent card names this access. */
+export function containerBuildNetworkArgs(allowed: boolean): string[] {
+	return ["--network", allowed ? "default" : "none"];
+}
+
+/** Keep a networkless container start from asking the runtime to pull a missing image. */
+export function containerPullArgs(allowed: boolean): string[] {
+	return allowed ? [] : ["--pull=never"];
+}
+
+/** Network available to a local served backend after its app grant has been checked. */
+export function servedBackendNetwork(declared: boolean, consented: boolean): NetworkAccess {
+	if (declared) return "all";
+	if (!consented) throw new Error(process.platform === "linux"
+		? "A served backend on Linux needs explicit consent for the whole network because bubblewrap cannot provide loopback by itself, so it didn't start."
+		: "A served backend needs explicit consent to listen on this computer's loopback, so it didn't start.");
+	return process.platform === "linux" ? "all" : "loopback";
 }
 
 function runnerPath(runDir: string): string {
@@ -312,7 +335,7 @@ export async function startBackend(manifest: AppManifest, ctx: BackendContext): 
 			if (backend.build !== undefined) {
 				const tag = `enrichedlab-app-${manifest.name}:${manifest.version.replace(/[^a-zA-Z0-9_.-]/g, "-")}`;
 				// Async, so a long build never stalls the engine; its output goes to the app's log.
-				const proc = spawn(runtime, ["build", "-q", "-t", tag, join(ctx.dir, backend.build)], { stdio: ["ignore", "pipe", "pipe"] });
+				const proc = spawn(runtime, ["build", "-q", ...containerBuildNetworkArgs(ctx.buildNetwork === true), "-t", tag, join(ctx.dir, backend.build)], { stdio: ["ignore", "pipe", "pipe"] });
 				let tail = "";
 				for (const stream of [proc.stdout, proc.stderr]) stream?.on("data", (chunk: Buffer) => ((tail = (tail + chunk.toString("utf8")).slice(-2_000)), ctx.log(chunk.toString("utf8").trim())));
 				const code = await new Promise<number | null>((done) => proc.on("close", done));
@@ -322,6 +345,7 @@ export async function startBackend(manifest: AppManifest, ctx: BackendContext): 
 			const name = `enrichedlab-app-${manifest.name}-${Date.now().toString(36)}`;
 			const args = [
 				"run", "-i", "--rm", "--name", name,
+				...containerPullArgs(ctx.network),
 				"--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--read-only", "--tmpfs", "/tmp",
 				"--pids-limit", "512", "--memory", "4g",
 				"--network", ctx.network ? "bridge" : "none",
@@ -344,7 +368,7 @@ export async function startBackend(manifest: AppManifest, ctx: BackendContext): 
 			const [program, ...args] = command;
 			// Writes go to the data folder (and the environment's own cache), so history files don't touch the app's
 			// folder and its reload.
-			const launch = contained(program!, args, { writable: [ctx.dataDir, join(ctx.dir, ".pixi")], readable: [ctx.dir, ctx.toolsDir], network: ctx.network ? "all" : "loopback", server: true, appData });
+			const launch = contained(program!, args, { writable: [ctx.dataDir, join(ctx.dir, ".pixi")], readable: [ctx.dir, ctx.toolsDir], network: servedBackendNetwork(ctx.network, ctx.serveNetwork === true), server: true, appData });
 			uncontainedOk(launch);
 			const proc = spawn(launch.file, launch.args, { cwd: ctx.dir, env: { ...env, PORT: String(port), HOST: "127.0.0.1" }, stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" });
 			for (const stream of [proc.stdout, proc.stderr]) stream?.on("data", (chunk: Buffer) => chunk.toString("utf8").split("\n").forEach((line) => line.trim() && ctx.log(line)));

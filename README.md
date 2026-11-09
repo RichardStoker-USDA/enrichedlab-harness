@@ -54,8 +54,9 @@ Updates are signed and install themselves the same way: the app offers them, `el
 - **Contained by default.** On macOS and Linux the agent's commands can write to the project and private temp folders.
   On Linux, existing regular `.git` files and directories stay read only, an existing `.git` symbolic link refuses
   the command, and normal completion moves new entries to an engine-owned quarantine outside the project after all
-  background children end. A failed final pass moves the project aside or makes it temporarily inaccessible without
-  deleting data; recovery finishes the quarantine and restores the project before another contained shell command.
+  background children end. The engine verifies that same-filesystem sibling quarantine by descriptor. A failed
+  bounded final pass leaves the project and its cleanup record in place; later contained commands and file-tool
+  writes refuse to run until recovery finishes the quarantine.
   Commands can't read your credential folders and have no network unless you allow it; anything that would run
   outside that asks first, unless its exact command is in `allowCommands` or you chose Allow Everything. An `allowCommands` entry
   is one literal POSIX argv run without a shell, selected from the person's launch `PATH` rather than the project's
