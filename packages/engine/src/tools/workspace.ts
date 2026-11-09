@@ -10,7 +10,7 @@ import { homedir, tmpdir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { labHome } from "../paths.ts";
 import { expandHome, withoutSecrets } from "../util.ts";
-import { holdFolder, holdGitEntries, mkdirPhysical, openPhysical, type GitEntryBaseline } from "./anchored.ts";
+import { holdFolder, holdGitEntries, mkdirPhysical, movePhysicalNoReplace, openPhysical, type GitEntryBaseline } from "./anchored.ts";
 import { systemCommand, systemPowerShell } from "./windows_contain.ts";
 
 export interface Entry {
@@ -275,16 +275,17 @@ export function sandboxer(): Facility | undefined {
 	return undefined;
 }
 
-/** Folders a contained command may never read: credentials, and the engine's keys, sessions, notes and its run
- * folder (which holds the engine's own key). Installed apps and the app runtime under ~/.el stay readable. */
+/** Folders a contained command may never read: credentials, and the engine's keys, sessions, notes, app data,
+ * quarantine and run folder (which holds the engine's own key). An app backend gets only its current app-data
+ * folder through the explicit grant below. Installed apps and the app runtime under ~/.el stay readable. */
 const PRIVATE_DIRS = [
 	".ssh", ".secrets", ".aws", ".gnupg", ".config/gcloud", ".kube", ".docker", ".netrc",
 	".npmrc", ".pypirc", ".git-credentials", ".cargo/credentials.toml", ".config/gh", ".claude", ".codex", ".cache/huggingface",
 	".zsh_history", ".bash_history", "Library/Keychains", "Library/Cookies",
 	"Library/Application Support/Google/Chrome", "Library/Application Support/Firefox", "Library/Application Support/com.apple.TCC",
-	".el/credentials", ".el/keys", ".el/sessions", ".el/run", ".el/memory", ".el/canvases", ".el/app-data",
+	".el/credentials", ".el/keys", ".el/sessions", ".el/run", ".el/memory", ".el/canvases", ".el/app-data", ".el/quarantine",
 ];
-const ENGINE_PRIVATE_DIRS = ["credentials", "keys", "sessions", "run", "memory", "canvases", "app-data"];
+const ENGINE_PRIVATE_DIRS = ["credentials", "keys", "sessions", "run", "memory", "canvases", "app-data", "quarantine"];
 
 const foldedPath = (path: string) => resolve(path).toLowerCase();
 const pathAtOrBelow = (path: string, root: string) => path === root || path.startsWith(`${root}${sep}`);
@@ -350,9 +351,9 @@ export function projectGitPattern(root: string): string {
 	return `^${escaped}/([^/]+/)*\\.[gG][iI][tT](/|$)`;
 }
 
-function seatbeltProfile(writable: string[], network: NetworkAccess, readable: string[] = [], protect: string[] = [], patterns: string[] = []): string {
+function seatbeltProfile(writable: string[], network: NetworkAccess, readable: string[] = [], protect: string[] = [], patterns: string[] = [], hiddenPaths: string[] = []): string {
 	const quote = (p: string) => JSON.stringify(p);
-	const hidden = privatePaths().map((path) => `(subpath ${quote(path)})`).join(" ");
+	const hidden = [...privatePaths(), ...hiddenPaths].map((path) => `(subpath ${quote(path)})`).join(" ");
 	const net =
 		network === "all"
 			? []
@@ -386,9 +387,15 @@ function seatbeltProfile(writable: string[], network: NetworkAccess, readable: s
  * once it has exited. `protect`: paths inside the writable ones that stay read only (a
  * repository's settings and hooks).
  */
-export function contained(file: string, args: string[], options: { writable: string[]; network: NetworkAccess; readable?: string[]; server?: boolean; temp?: boolean; exact?: boolean; protect?: string[]; protectPatterns?: string[]; waitForChildren?: boolean }): { file: string; args: string[]; facility?: Facility; pass?: number[]; release?: () => void; syncFd?: number } {
+export function contained(file: string, args: string[], options: { writable: string[]; network: NetworkAccess; readable?: string[]; server?: boolean; temp?: boolean; exact?: boolean; protect?: string[]; protectPatterns?: string[]; waitForChildren?: boolean; appData?: { root: string; current: string }; hidden?: string[] }): { file: string; args: string[]; facility?: Facility; pass?: number[]; release?: () => void; syncFd?: number } {
 	// Each path resolved once: the check and the grant are the same answer.
 	const resolved = options.writable.map(real);
+	let appData: string | undefined;
+	if (options.appData) {
+		const root = real(options.appData.root);
+		appData = real(options.appData.current);
+		if (basename(root) !== "app-data" || dirname(appData) !== root || !resolved.includes(appData)) throw new Error("An app backend may write only its own direct app-data folder.");
+	}
 	if (options.exact) resolved.forEach((p, i) => {
 		if (p !== options.writable[i]) throw new Error(`${options.writable[i]} now leads somewhere else (a link may have moved); nothing ran.`);
 	});
@@ -407,14 +414,15 @@ export function contained(file: string, args: string[], options: { writable: str
 	const writable = [...resolved, ...(options.temp === false ? [] : [safeTemp()])].filter((p, i, all) => existsSync(p) && all.indexOf(p) === i);
 	const readable = [...resolved, ...(options.readable ?? []).map(real)].filter((p) => existsSync(p));
 	const protect = [...new Set((options.protect ?? []).map(real))];
-	if (facility === "seatbelt") return { file: "/usr/bin/sandbox-exec", args: ["-p", seatbeltProfile(writable, options.network, readable, protect, options.protectPatterns), file, ...args], facility };
+	const extraHidden = (options.hidden ?? []).map(real).filter((p) => existsSync(p));
+	if (facility === "seatbelt") return { file: "/usr/bin/sandbox-exec", args: ["-p", seatbeltProfile(writable, options.network, readable, protect, options.protectPatterns, extraHidden), file, ...args], facility };
 	const bindTargets = [...writable, ...(options.readable ?? []).map(real), ...protect].filter((p) => existsSync(p));
-	const exposed = bindTargets.find((p) => privateBindPath(p));
+	const exposed = bindTargets.find((p) => privateBindPath(p) && p !== appData);
 	if (exposed) throw new Error(`${exposed} is inside a hidden credential or engine-data folder, so it cannot be bound into a contained command.`);
 	// Read-only root, the writable folders bound, a private /tmp, credential folders hidden, every namespace unshared
 	// (network, pids, IPC, user) so host sockets under /tmp and /run are out of reach. Loopback can't be split from
 	// the network in a namespace, so "loopback" shares the network here.
-	const hidden = privatePaths().filter((p) => existsSync(p)).map(real).filter((p, i, all) => all.indexOf(p) === i).flatMap((p) => statSync(p).isDirectory() ? ["--tmpfs", p] : ["--ro-bind", "/dev/null", p]);
+	const hidden = [...privatePaths(), ...extraHidden].filter((p) => existsSync(p)).map(real).filter((p, i, all) => all.indexOf(p) === i).flatMap((p) => statSync(p).isDirectory() ? ["--tmpfs", p] : ["--ro-bind", "/dev/null", p]);
 	const held: number[] = [];
 	// An exact folder is bound from a handle on the checked folder, passed to bubblewrap as an open file descriptor
 	// (--bind-fd), so it can't follow a link put in its place after the check.
@@ -424,13 +432,19 @@ export function contained(file: string, args: string[], options: { writable: str
 		return ["--bind-fd", String(2 + held.length), p];
 	};
 	let binds: string[];
+	let appDataBind: string[] = [];
 	try {
 		binds = [
-			...writable.filter((p) => p !== "/tmp" && p !== "/private/tmp").flatMap(bind),
-			...(options.readable ?? []).map(real).filter((p) => existsSync(p)).flatMap((p) => ["--ro-bind", p, p]),
+			...writable.filter((p) => p !== "/tmp" && p !== "/private/tmp" && p !== appData).flatMap(bind),
+			...(options.readable ?? []).map(real).filter((p) => existsSync(p) && p !== appData).flatMap((p) => ["--ro-bind", p, p]),
 			// Bound read only over the writable folder (only what exists: bubblewrap can't protect a missing path).
 			...protect.filter((p) => existsSync(p)).flatMap((p) => ["--ro-bind", p, p]),
 		];
+		if (appData) {
+			// By path, placed after the masks: the app-data root is the engine's, so nothing contained can put a link in
+			// its place, and the MCP client that starts a backend can't hand it extra file descriptors.
+			appDataBind = ["--dir", appData, "--bind", appData, appData];
+		}
 	} catch (error) {
 		for (const fd of held) closeSync(fd);
 		throw error;
@@ -444,7 +458,7 @@ export function contained(file: string, args: string[], options: { writable: str
 	return {
 		file: trustedBwrap() ?? "/usr/bin/bwrap",
 		// Credential masks are mounted after every project-derived bind, so no later bind can uncover them.
-		args: ["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--tmpfs", "/run", ...binds, ...hidden, ...sealed, "--unshare-all", ...net, "--die-with-parent", "--new-session", ...(syncFd === undefined ? [] : ["--sync-fd", String(syncFd)]), "--", file, ...args],
+		args: ["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--tmpfs", "/run", ...binds, ...hidden, ...appDataBind, ...sealed, "--unshare-all", ...net, "--die-with-parent", "--new-session", ...(syncFd === undefined ? [] : ["--sync-fd", String(syncFd)]), "--", file, ...args],
 		facility,
 		...(syncFd === undefined ? {} : { syncFd }),
 		...(held.length ? { pass: [...held], release: () => held.splice(0).forEach((fd) => closeSync(fd)) } : {}),
@@ -455,6 +469,8 @@ interface GitQuarantineRecord {
 	version: 1;
 	project: string;
 	baseline: GitEntryBaseline;
+	quarantine?: string;
+	rootMode?: number;
 }
 
 const activeGitQuarantines = new Set<string>();
@@ -466,7 +482,27 @@ export function gitQuarantineMarker(root: string, home = labHome()): string {
 	return join(home, "run", "git-quarantine", `${id}.json`);
 }
 
-function readGitQuarantineRecord(file: string, project: string): GitQuarantineRecord | undefined {
+/** An engine-owned folder outside the project, on the same filesystem so each quarantine move is atomic. */
+export function gitQuarantineFolder(root: string, home = labHome()): string {
+	const project = real(root);
+	if (dirname(project) === project) throw new Error("Linux commands cannot write a filesystem root because it cannot be moved aside after a failed .git cleanup.");
+	const id = createHash("sha256").update(project).digest("hex");
+	const candidates = [join(home, "quarantine", "git", id), join(dirname(project), ".enrichedlab-git-quarantine", id)];
+	const projectDevice = statSync(project, { bigint: true }).dev;
+	for (const candidate of candidates) {
+		try {
+			mkdirSync(candidate, { recursive: true, mode: 0o700 });
+			const folder = real(candidate);
+			if (pathAtOrBelow(folder, project) || statSync(folder, { bigint: true }).dev !== projectDevice) continue;
+			return folder;
+		} catch {
+			// Try the sibling folder, which is normally on the project's filesystem.
+		}
+	}
+	throw new Error("EnrichedLab could not make an engine-owned .git quarantine outside the project on the same filesystem, so no contained command ran.");
+}
+
+function readGitQuarantineRecord(file: string, project?: string): GitQuarantineRecord | undefined {
 	const entry = lstatSync(file, { throwIfNoEntry: false });
 	if (!entry) return undefined;
 	if (!entry.isFile() || entry.isSymbolicLink()) throw new Error("the cleanup journal is not a regular file");
@@ -487,10 +523,41 @@ function readGitQuarantineRecord(file: string, project: string): GitQuarantineRe
 		&& typeof item[1] === "string"
 		&& /^\d+:\d+$/.test(item[1])
 	);
-	if (record.version !== 1 || record.project !== project || typeof record.baseline?.root !== "string" || !/^\d+:\d+$/.test(record.baseline.root) || !validEntries) {
+	const validQuarantine = record.quarantine === undefined || (typeof record.quarantine === "string" && isAbsolute(record.quarantine) && typeof record.project === "string" && !pathAtOrBelow(record.quarantine, record.project));
+	const validMode = record.rootMode === undefined || (Number.isInteger(record.rootMode) && record.rootMode! >= 0 && record.rootMode! <= 0o7777);
+	if (record.version !== 1 || typeof record.project !== "string" || !isAbsolute(record.project) || (project !== undefined && record.project !== project) || typeof record.baseline?.root !== "string" || !/^\d+:\d+$/.test(record.baseline.root) || !validEntries || !validQuarantine || !validMode) {
 		throw new Error("the cleanup journal is invalid");
 	}
 	return record as GitQuarantineRecord;
+}
+
+function locateGitQuarantineRecord(project: string, home: string): { marker: string; record?: GitQuarantineRecord } {
+	const direct = gitQuarantineMarker(project, home);
+	if (existsSync(direct)) return { marker: direct, record: readGitQuarantineRecord(direct, project) };
+	const current = statSync(project, { bigint: true, throwIfNoEntry: false });
+	if (!current) return { marker: direct };
+	const identity = `${current.dev}:${current.ino}`;
+	const directory = dirname(direct);
+	let matched: { marker: string; record: GitQuarantineRecord } | undefined;
+	let names: string[];
+	try {
+		names = readdirSync(directory, { encoding: "utf8" });
+	} catch {
+		return { marker: direct };
+	}
+	for (const name of names.filter((name) => name.endsWith(".json"))) {
+		const marker = join(directory, name);
+		try {
+			const record = readGitQuarantineRecord(marker);
+			if (record?.baseline.root !== identity) continue;
+			if (matched) throw new Error("more than one cleanup journal names this project folder");
+			matched = { marker, record };
+		} catch (error) {
+			if ((error as Error).message.startsWith("more than one")) throw error;
+			// An invalid record for another project does not block this one. Its direct path still fails closed.
+		}
+	}
+	return matched ?? { marker: direct };
 }
 
 function removeGitQuarantineMarker(file: string): string | undefined {
@@ -502,26 +569,44 @@ function removeGitQuarantineMarker(file: string): string | undefined {
 	}
 }
 
+export interface GitRecovery {
+	moved: { from: string; to: string }[];
+	restored?: { from: string; to: string };
+}
+
 /** Finish a journal left by a crash or failed cleanup before another contained command can start. */
-export function recoverGitQuarantine(root: string, home = labHome()): { from: string; to: string }[] {
+export function recoverGitQuarantine(root: string, home = labHome()): GitRecovery {
 	const project = real(root);
-	const marker = gitQuarantineMarker(project, home);
-	if (activeGitQuarantines.has(marker)) throw new Error("another contained command in this project is still awaiting its final .git cleanup");
+	let marker = gitQuarantineMarker(project, home);
 	let record: GitQuarantineRecord | undefined;
 	try {
-		record = readGitQuarantineRecord(marker, project);
+		({ marker, record } = locateGitQuarantineRecord(project, home));
 	} catch (error) {
 		throw new Error(`A prior contained command left .git cleanup pending for this project, but ${String((error as Error).message)}. No contained command ran.`);
 	}
-	if (!record) return [];
+	if (activeGitQuarantines.has(marker)) throw new Error("another contained command in this project is still awaiting its final .git cleanup");
+	if (!record) return { moved: [] };
 	let held: ReturnType<typeof holdGitEntries> | undefined;
 	try {
-		held = holdGitEntries(project, GIT_SCAN_MAX, GIT_SCAN_DEPTH, record.baseline);
+		const quarantine = record.quarantine ?? gitQuarantineFolder(project, home);
+		const displaced = join(quarantine, "project");
+		const atProject = lstatSync(project, { throwIfNoEntry: false });
+		const atQuarantine = lstatSync(displaced, { throwIfNoEntry: false });
+		if (atProject && atQuarantine) throw new Error("both the original project path and its quarantined copy exist");
+		if (!atProject && !atQuarantine) throw new Error("neither the original project path nor its quarantined copy exists");
+		const scanRoot = atQuarantine ? displaced : project;
+		held = holdGitEntries(scanRoot, GIT_SCAN_MAX, GIT_SCAN_DEPTH, record.baseline, quarantine);
 		const result = held.quarantine(true);
 		if (result.error) throw new Error(result.error);
+		if (record.rootMode !== undefined) held.restoreRootMode(record.rootMode);
+		let restored: GitRecovery["restored"];
+		if (atQuarantine) {
+			movePhysicalNoReplace(displaced, project);
+			restored = { from: displaced, to: project };
+		}
 		const removeError = removeGitQuarantineMarker(marker);
 		if (removeError) throw new Error(removeError);
-		return result.moved;
+		return { moved: result.moved, ...(restored ? { restored } : {}) };
 	} catch (error) {
 		throw new Error(`A prior contained command left .git cleanup pending for this project. EnrichedLab retried the anchored quarantine before this launch, but it could not finish: ${(error as Error).message} No contained command ran.`);
 	} finally {
@@ -542,13 +627,15 @@ function writeGitQuarantineRecord(file: string, record: GitQuarantineRecord): vo
 	}
 }
 
-function guardedGitEntries(root: string, home = labHome()): ReturnType<typeof holdGitEntries> & { recovered: { from: string; to: string }[] } {
+function guardedGitEntries(root: string, home = labHome()): ReturnType<typeof holdGitEntries> & { recovered: GitRecovery } {
 	const project = real(root);
 	const marker = gitQuarantineMarker(project, home);
 	const recovered = recoverGitQuarantine(project, home);
-	const held = holdGitEntries(project, GIT_SCAN_MAX, GIT_SCAN_DEPTH);
+	const quarantine = gitQuarantineFolder(project, home);
+	if (existsSync(join(quarantine, "project"))) throw new Error("A quarantined project copy exists without a matching cleanup journal, so no contained command ran.");
+	const held = holdGitEntries(project, GIT_SCAN_MAX, GIT_SCAN_DEPTH, undefined, quarantine);
 	try {
-		writeGitQuarantineRecord(marker, { version: 1, project, baseline: held.baseline });
+		writeGitQuarantineRecord(marker, { version: 1, project, baseline: held.baseline, quarantine, rootMode: held.rootMode });
 		activeGitQuarantines.add(marker);
 	} catch (error) {
 		held.release();
@@ -688,31 +775,32 @@ export class LocalWorkspace implements Workspace {
 
 	/**
 	 * Agent commands write the project with existing regular .git entries protected. macOS also denies new .git
-	 * paths. Linux refuses existing .git links and moves new entries aside at command completion. Engine git has a
-	 * separate containment path.
+	 * paths. Linux refuses existing .git links and moves new entries to an external engine quarantine at command
+	 * completion. Engine git has a separate containment path.
 	 */
 	private writable(): { writable: string[]; protect: string[]; protectPatterns: string[] } {
 		return { writable: [this.root], protect: projectGitPaths(this.root), protectPatterns: [projectGitPattern(this.root)] };
 	}
 
 	/** The program and arguments that run `command`, contained when the workspace is sandboxed. */
-	private launch(command: string, contain: boolean, readOnly = false, argv?: string[]): ReturnType<typeof contained> & { quarantine?: ReturnType<typeof holdGitEntries>["quarantine"]; recovered?: { from: string; to: string }[] } {
+	private launch(command: string, contain: boolean, readOnly = false, argv?: string[]): ReturnType<typeof contained> & { quarantine?: ReturnType<typeof holdGitEntries>["quarantine"]; recovered?: GitRecovery } {
 		const plain = argv ? { file: argv[0]!, args: argv.slice(1) } : { file: this.shell.file, args: this.shell.args(command) };
 		if (!contain || !this.sandboxed) return plain;
 		if (this.sandboxed === "bubblewrap") {
 			const root = real(this.root);
 			if (readOnly) {
 				const recovered = recoverGitQuarantine(root);
-				return { ...contained(plain.file, plain.args, { writable: [], network: "none" }), recovered };
+				const quarantine = gitQuarantineFolder(root);
+				return { ...contained(plain.file, plain.args, { writable: [], network: "none", hidden: [dirname(quarantine)] }), recovered };
 			}
 			const entries = guardedGitEntries(root);
 			try {
-				const launch = contained(plain.file, plain.args, { writable: [root], protect: entries.paths, network: "none", exact: true, waitForChildren: true });
+				const launch = contained(plain.file, plain.args, { writable: [root], protect: entries.paths, network: "none", exact: true, waitForChildren: true, hidden: [dirname(entries.quarantinePath)] });
 				return { ...launch, quarantine: entries.quarantine, recovered: entries.recovered, release: () => { launch.release?.(); entries.release(); } };
 			} catch (error) {
 				const cleanup = entries.quarantine(true);
 				entries.release();
-				if (cleanup.error) throw new Error(`${(error as Error).message} The required .git cleanup also failed: ${cleanup.error}`);
+				if (cleanup.error) throw new Error(`${(error as Error).message} The required .git cleanup also failed: ${cleanup.error}${cleanup.displaced ? ` The project was moved from ${cleanup.displaced.from} to ${cleanup.displaced.to}.` : cleanup.sealed ? ` The project at ${cleanup.sealed} was made temporarily inaccessible.` : ""}`);
 				throw error;
 			}
 		}
@@ -924,7 +1012,7 @@ export class LocalWorkspace implements Workspace {
 			} catch (error) {
 				const cleanup = launch.quarantine?.(true);
 				launch.release?.();
-				if (cleanup?.error) throw new Error(`${(error as Error).message} The required .git cleanup also failed: ${cleanup.error}`);
+				if (cleanup?.error) throw new Error(`${(error as Error).message} The required .git cleanup also failed: ${cleanup.error}${cleanup.displaced ? ` The project was moved from ${cleanup.displaced.from} to ${cleanup.displaced.to}.` : cleanup.sealed ? ` The project at ${cleanup.sealed} was made temporarily inaccessible.` : ""}`);
 				throw error;
 			}
 			// Keep the start and the end of long output; the middle is what a person scrolls past anyway.
@@ -947,7 +1035,8 @@ export class LocalWorkspace implements Workspace {
 				}
 				options.onOutput?.(text);
 			};
-			for (const { from, to } of launch.recovered ?? []) take(Buffer.from(`EnrichedLab moved ${JSON.stringify(from)} to ${JSON.stringify(to)} while finishing .git cleanup left by an earlier command. Nothing was deleted.\n`));
+			for (const { from, to } of launch.recovered?.moved ?? []) take(Buffer.from(`EnrichedLab moved ${JSON.stringify(from)} to ${JSON.stringify(to)} while finishing .git cleanup left by an earlier command. Nothing was deleted.\n`));
+			if (launch.recovered?.restored) take(Buffer.from(`EnrichedLab restored the project from ${JSON.stringify(launch.recovered.restored.from)} to ${JSON.stringify(launch.recovered.restored.to)} after cleanup finished.\n`));
 			child.stdout!.on("data", take);
 			child.stderr!.on("data", take);
 			let cleanupFailed = false;
@@ -955,6 +1044,8 @@ export class LocalWorkspace implements Workspace {
 				const result = launch.quarantine?.(final);
 				if (!result) return;
 				for (const { from, to } of result.moved) take(Buffer.from(`\nEnrichedLab moved ${JSON.stringify(from)} to ${JSON.stringify(to)} because it was created during a contained command. Nothing was deleted.\n`));
+				if (result.displaced) take(Buffer.from(`\nEnrichedLab moved the project from ${JSON.stringify(result.displaced.from)} to ${JSON.stringify(result.displaced.to)} because the final .git cleanup could not finish. Nothing was deleted.\n`));
+				if (result.sealed) take(Buffer.from(`\nEnrichedLab made the project at ${JSON.stringify(result.sealed)} temporarily inaccessible because neither .git cleanup nor moving the project aside could finish. Nothing was deleted.\n`));
 				if (result.error && final) {
 					cleanupFailed = true;
 					take(Buffer.from(`\nEnrichedLab could not finish checking new .git entries: ${result.error}\n`));

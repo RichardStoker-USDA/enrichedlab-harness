@@ -126,25 +126,66 @@ export interface GitEntryBaseline {
 	entries: [relative: string, identity: string][];
 }
 
+export interface GitQuarantineResult {
+	moved: { from: string; to: string }[];
+	error?: string;
+	/** The whole project was moved out of its original path after a final scan failed. */
+	displaced?: { from: string; to: string };
+	/** Moving the project failed too, so its held root was made inaccessible instead. */
+	sealed?: string;
+}
+
 export interface HeldGitEntries {
 	paths: string[];
 	baseline: GitEntryBaseline;
-	quarantine(final?: boolean): { moved: { from: string; to: string }[]; error?: string };
+	quarantinePath: string;
+	rootMode: number;
+	quarantine(final?: boolean): GitQuarantineResult;
+	restoreRootMode(mode: number): void;
 	release(): void;
+}
+
+/** Move one physical Linux path without following links or replacing anything at the destination. */
+export function movePhysicalNoReplace(from: string, to: string): void {
+	if (process.platform !== "linux") throw new Error("Anchored moves are for Linux.");
+	const source = linuxParent(from);
+	const destination = linuxParent(to);
+	try {
+		const errno = new Int32Array(toArrayBuffer(lib().__errno_location(), 0, 4));
+		errno[0] = 0;
+		if (lib().renameat2(source.dir, c(source.name), destination.dir, c(destination.name), 1) !== 0) {
+			throw new Error(`Couldn't move ${from} to ${to} without replacing data (errno ${errno[0]}).`);
+		}
+	} finally {
+		lib().close(source.dir);
+		lib().close(destination.dir);
+	}
 }
 
 /**
  * Hold a Linux project through launch and cleanup. Every walk and rename is relative to held, no-follow folders.
  * A saved baseline is used only to finish a pass left pending by an earlier engine process.
  */
-export function holdGitEntries(path: string, maxEntries = 50_000, maxDepth = 64, saved?: GitEntryBaseline): HeldGitEntries {
+export function holdGitEntries(path: string, maxEntries = 50_000, maxDepth = 64, saved?: GitEntryBaseline, quarantinePath = join(dirname(path), ".enrichedlab-git-quarantine")): HeldGitEntries {
 	if (process.platform !== "linux") throw new Error("Git quarantine is for Linux.");
 	const root = holdFolder(path);
+	mkdirSync(quarantinePath, { recursive: true, mode: 0o700 });
+	const quarantineRoot = holdFolder(quarantinePath);
 	const rootStat = fstatSync(root, { bigint: true });
+	const quarantineStat = fstatSync(quarantineRoot, { bigint: true });
+	if (rootStat.dev !== quarantineStat.dev) {
+		lib().close(root);
+		lib().close(quarantineRoot);
+		throw new Error("The .git quarantine is on another filesystem, so the command did not run.");
+	}
 	const rootIdentity = `${rootStat.dev}:${rootStat.ino}`;
+	const rootMode = Number(rootStat.mode & 0o7777n);
 	let released = false;
 	const release = () => {
-		if (!released) lib().close(root);
+		if (!released) {
+			lib().close(root);
+			lib().close(quarantineRoot);
+		}
 		released = true;
 	};
 	const errno = new Int32Array(toArrayBuffer(lib().__errno_location(), 0, 4));
@@ -229,6 +270,12 @@ export function holdGitEntries(path: string, maxEntries = 50_000, maxDepth = 64,
 	return {
 		paths: [...initial.keys()].map((relative) => join(path, relative)),
 		baseline: { root: rootIdentity, entries: [...initial] },
+		quarantinePath,
+		rootMode,
+		restoreRootMode(mode: number) {
+			if (released) throw new Error("The project folder is no longer held.");
+			chmodSync(`/proc/self/fd/${root}`, mode & 0o7777);
+		},
 		release,
 		quarantine(final = true) {
 			const moved: { from: string; to: string }[] = [];
@@ -236,15 +283,31 @@ export function holdGitEntries(path: string, maxEntries = 50_000, maxDepth = 64,
 				walk((dir, name, relative) => {
 					// Moving an old metadata directory away and making a new one at its name is still a new entry.
 					if (initial.get(relative) === identity(dir, name).id) return;
-					const blocked = `.git.enrichedlab-blocked-${randomBytes(6).toString("hex")}`;
+					const blocked = `git-${randomBytes(12).toString("hex")}`;
 					// renameat2 never follows the final entry, even if it is a symlink. NOREPLACE prevents any loss of
-					// existing data at the destination. No pathname lookup can escape the held parent folder.
-					if (lib().renameat2(dir, c(name), dir, c(blocked), 1) !== 0) throw new Error(`Couldn't move aside ${relative} (errno ${errno[0]}).`);
-					moved.push({ from: relative, to: join(dirname(relative), blocked) });
+					// existing data at the destination. The destination is engine-owned and outside the project.
+					errno[0] = 0;
+					if (lib().renameat2(dir, c(name), quarantineRoot, c(blocked), 1) !== 0) throw new Error(`Couldn't move aside ${relative} (errno ${errno[0]}).`);
+					moved.push({ from: relative, to: join(quarantinePath, blocked) });
 				}, final);
 				return { moved };
 			} catch (error) {
-				return { moved, error: (error as Error).message };
+				if (!final) return { moved, error: (error as Error).message };
+				const reason = (error as Error).message;
+				const displaced = join(quarantinePath, "project");
+				try {
+					const current = lstatSync(path, { bigint: true, throwIfNoEntry: false });
+					if (!current || `${current.dev}:${current.ino}` !== rootIdentity) throw new Error("the original project path no longer names the held folder");
+					movePhysicalNoReplace(path, displaced);
+					return { moved, error: reason, displaced: { from: path, to: displaced } };
+				} catch (moveError) {
+					try {
+						chmodSync(`/proc/self/fd/${root}`, 0);
+						return { moved, error: `${reason} Moving the project aside also failed: ${(moveError as Error).message}`, sealed: path };
+					} catch (sealError) {
+						return { moved, error: `${reason} Moving the project aside also failed: ${(moveError as Error).message} Making the project inaccessible failed too: ${(sealError as Error).message}` };
+					}
+				}
 			}
 		},
 	};

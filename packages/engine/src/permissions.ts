@@ -220,6 +220,34 @@ const NON_RUNNING = new Set(["ls", "cat", "head", "tail", "wc", "echo", "printf"
 /** Programs that run the program named in their arguments: an expanded word there could be git. */
 const WRAPPERS = new Set(["command", "builtin", "exec", "env", "xargs", "nice", "nohup", "timeout", "sudo", "doas", "time", "stdbuf", "ionice", "chrt", "taskset", "setsid", "flock", "watch", "parallel", "script", "unbuffer", "caffeinate", "arch", "ssh", "su", "runuser", "find", "fd"]);
 
+/**
+ * PowerShell can hand text to interpreters whose quoting rules this reader does not implement. On Windows those
+ * handoffs always count as publishing, even when reached through another program, so Full mode still asks.
+ */
+export function windowsInterpreterHandoff(command: string): boolean {
+	const riskyAt = (words: readonly (string | undefined)[], i: number) => {
+		const word = words[i];
+		if (word === undefined) return false;
+		const program = word.replace(/^.*[\\/]/, "").toLowerCase();
+		const rest = words.slice(i + 1).filter((part): part is string => part !== undefined);
+		if (program === "iex" || program === "invoke-expression") return true;
+		if (/^(powershell|pwsh)(\.exe)?$/.test(program) || /^(wsl)(\.exe)?$/.test(program)) return true;
+		if (/^cmd(\.exe)?$/.test(program) && rest.some((part) => /^\/[ck]/i.test(part))) return true;
+		return /^(ba)?sh(\.exe)?$/.test(program) && rest.some((part) => /^-[a-z]*c[a-z]*$/i.test(part));
+	};
+	const parsed = everyPowerShellCommand(command);
+	const runners = new Set(["env", "start", "start-process", "timeout", "xargs"]);
+	if (parsed) return parsed.commands.some(({ words }) => {
+		if (riskyAt(words, 0)) return true;
+		const lead = words[0]?.replace(/^.*[\\/]/, "").toLowerCase();
+		return lead !== undefined && runners.has(lead) && words.some((_word, i) => i > 0 && riskyAt(words, i));
+	});
+	// When PowerShell syntax itself is outside the literal subset, retain enough token boundaries to fail closed on
+	// the same interpreter names and options. False positives ask; they never widen what may run.
+	const rough = command.match(/[^\s'"`;&|(),]+/g) ?? [];
+	return rough.some((_word, i) => riskyAt(rough, i));
+}
+
 /** A glob pattern as a regular expression for one name, as bash matches it. */
 function patternRegex(pattern: string): RegExp | undefined {
 	// These replacements are used only against the fixed ASCII publishing names below. Unsupported POSIX,
@@ -268,6 +296,7 @@ function patternRegex(pattern: string): RegExp | undefined {
  * expands or arrives on its input, or a line that doesn't parse.
  */
 function publishing(command: string, depth = 0): "push" | "hidden" | undefined {
+	if (process.platform === "win32" && windowsInterpreterHandoff(command)) return "push";
 	const line = process.platform === "win32" ? everyPowerShellCommand(command) : everyCommand(command);
 	if (!line || depth > 4) return /\bgit\b|\bpush\b|\bsend-pack\b/i.test(command) ? "push" : "hidden";
 	const name = (w: string) => {

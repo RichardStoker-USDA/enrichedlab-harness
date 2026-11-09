@@ -93,6 +93,10 @@ MCP `_meta["org.enrichedlab/project"]`, which a `bun` backend gets as `app.proje
 | `container` | an MCP server on stdio in an image, built from the folder when `build` is set (Docker, Podman or nerdctl) | the container: `--network none` unless allowed, app folder read-only |
 | `serve` | a web app on `$PORT` (R or Python Shiny, Streamlit, a dev server); the page is its address | OS sandbox with loopback only |
 
+On macOS and Linux, `bun`, `command` and `serve` backends receive one explicit write grant for the current app's
+folder under the engine home's `app-data` directory. That folder is exposed after the engine-data mask is applied;
+sibling apps' data and the rest of the engine's private folders stay hidden.
+
 ## What a page can call
 
 Pages import `/app-sdk/lab.js` (EnrichedLab's helpers on the official MCP Apps `App` class, also served raw at

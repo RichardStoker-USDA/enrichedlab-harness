@@ -233,7 +233,8 @@ describe.skipIf(process.platform === "win32")("app backends in a lab sandbox", (
 		writeFileSync(join(app, "backend.ts"), `export const tools = { ping: { description: "ping", async run() { return "pong"; } } };\n`);
 		const manifest = { name: "plain_app", version: "1.0.0", backend: { runtime: "bun", main: "backend.ts" } } as unknown as AppManifest;
 		const noAttach: SandboxApi = { ...sandbox, attach: undefined };
-		const ctx = { dir: app, dataDir: join(box, "plain_data"), runDir: join(box, "run"), toolsDir: join(box, "tools"), network: false, log: () => undefined, sandbox: noAttach };
+		// Laid out as the engine lays it out: <home>/app-data/<app>.
+		const ctx = { dir: app, dataDir: join(box, "app-data", "plain_app"), runDir: join(box, "run"), toolsDir: join(box, "tools"), network: false, log: () => undefined, sandbox: noAttach };
 		await expect(startBackend(manifest, { ...ctx, sandboxOnly: true })).rejects.toThrow("doesn't stream sandbox processes");
 		const local = await startBackend(manifest, ctx);
 		if (local.kind !== "mcp") throw new Error("expected an MCP backend");

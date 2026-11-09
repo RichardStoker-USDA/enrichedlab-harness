@@ -5,14 +5,14 @@ import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { chmodSync, closeSync, constants, existsSync, linkSync, lstatSync, mkdirSync, readdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import type { LabConfig } from "../packages/engine/src/config.ts";
-import { allowKeys, decide, HIDDEN_REASON, PUSH_REASON } from "../packages/engine/src/permissions.ts";
+import { allowKeys, decide, HIDDEN_REASON, PUSH_REASON, windowsInterpreterHandoff } from "../packages/engine/src/permissions.ts";
 import { restoreSnapshot, snapshot } from "../packages/engine/src/git.ts";
 import { holdGitEntries, mkdirPhysical, openPhysical, removeEmptyTreePhysical, unlinkPhysical } from "../packages/engine/src/tools/anchored.ts";
 import { allowedCommand, isReadOnlyCommand } from "../packages/engine/src/tools/shell.ts";
 import type { Tool } from "../packages/engine/src/tools/types.ts";
-import { contained, containedTempEnvironment, engineEnvironment, engineTemp, gitQuarantineMarker, LocalWorkspace, privateBindPath, projectGitPaths, projectGitPattern, recoverGitQuarantine, safeTemp, sandboxer, trustedGit } from "../packages/engine/src/tools/workspace.ts";
+import { contained, containedTempEnvironment, engineEnvironment, engineTemp, gitQuarantineFolder, gitQuarantineMarker, LocalWorkspace, privateBindPath, projectGitPaths, projectGitPattern, recoverGitQuarantine, safeTemp, sandboxer, trustedGit } from "../packages/engine/src/tools/workspace.ts";
 import { everyCommand, everyPowerShellCommand, plainCommands } from "../packages/engine/src/tools/shell_syntax.ts";
 import { FENCE_PY } from "../packages/engine/src/sites/sandbox_fence.ts";
 import { bashPattern, type SandboxApi, SandboxWorkspace } from "../packages/engine/src/sites/sandbox_workspace.ts";
@@ -37,6 +37,17 @@ describe("shell syntax", () => {
 		for (const command of ["<##> git push", '& "`u{0067}it" push', "& 'g'+'it' push", "powershell.exe -EncodedCommand Z2l0IHB1c2g="]) {
 			expect([command, everyPowerShellCommand(command)]).toEqual([command, undefined]);
 		}
+		for (const command of [
+			"cmd.exe /c powershell.exe -EncodedCommand ZwBpAHQAIABwAHUAcwBoAA==",
+			"env powershell.exe -ec ZwBpAHQAIABwAHUAcwBoAA==",
+			`iex '& ("g"+"it") ("p"+"ush") origin main'`,
+			"Invoke-Expression 'git push origin main'",
+			"cmd.exe /d /c g^it p^ush origin main",
+			"bash -lc 'git push origin main'",
+			"wsl git push origin main",
+			"pwsh -NoProfile -Command 'git push origin main'",
+		]) expect([command, windowsInterpreterHandoff(command)]).toEqual([command, true]);
+		for (const command of ["Write-Output safe", "Write-Output powershell", "git status", "git -e path", "cmd.exe /?", "sh script.sh"]) expect([command, windowsInterpreterHandoff(command)]).toEqual([command, false]);
 	});
 
 	test("anything more than text has no plain reading", () => {
@@ -465,8 +476,22 @@ describe("round 6: containment is the boundary", () => {
 				expect(decide(shell, { command }, workspace, full, new Set()).action).toBe("ask");
 			}
 			const encoded = "powershell.exe -EncodedCommand Z2l0IHB1c2g=";
-			expect(allowKeys(shell, { command: encoded }).keys[0]).toBe("shell!hidden");
+			expect(allowKeys(shell, { command: encoded }).keys[0]).toBe("shell!push");
 			expect(decide(shell, { command: encoded }, workspace, full, new Set()).action).toBe("ask");
+			for (const command of [
+				"cmd.exe /c powershell.exe -EncodedCommand ZwBpAHQAIABwAHUAcwBoAA==",
+				"env powershell.exe -enc ZwBpAHQAIABwAHUAcwBoAA==",
+				"powershell.exe -ec ZwBpAHQAIABwAHUAcwBoAA==",
+				`iex '& ("g"+"it") ("p"+"ush") origin main'`,
+				"Invoke-Expression 'git push origin main'",
+				"cmd.exe /d /c g^it p^ush origin main",
+				"bash -c 'git push origin main'",
+				"wsl git push origin main",
+				"pwsh -NoProfile -Command 'git push origin main'",
+			]) {
+				expect([command, allowKeys(shell, { command }).keys[0]]).toEqual([command, "shell!push"]);
+				expect(decide(shell, { command }, workspace, full, new Set()).action).toBe("ask");
+			}
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}
@@ -658,10 +683,11 @@ describe("round 6: containment is the boundary", () => {
 		const base = realpathSync(mkdtempSync(join(tmpdir(), "el-git-quarantine-")));
 		const root = join(base, "project");
 		const outside = join(base, "outside");
+		const quarantine = join(base, "quarantine");
 		mkdirSync(join(root, "existing", ".git"), { recursive: true });
 		mkdirSync(outside);
 		writeFileSync(join(outside, ".git"), "outside\n");
-		const held = holdGitEntries(root);
+		const held = holdGitEntries(root, 50_000, 64, undefined, quarantine);
 		try {
 			writeFileSync(join(root, ".git"), "gitdir: elsewhere\n");
 			mkdirSync(join(root, "nested", ".GiT"), { recursive: true });
@@ -677,10 +703,10 @@ describe("round 6: containment is the boundary", () => {
 			expect(result.moved.map((m) => m.from).sort()).toEqual([".git", "linked/.git", "nested/.GiT"]);
 			for (const { from, to } of result.moved) {
 				expect(existsSync(join(movedRoot, from))).toBe(false);
-				expect(to).toMatch(/\.git\.enrichedlab-blocked-[a-f0-9]{12}$/);
-				if (from === ".git") expect(readFileSync(join(movedRoot, to), "utf8")).toBe("gitdir: elsewhere\n");
-				else if (from === "nested/.GiT") expect(readFileSync(join(movedRoot, to, "config"), "utf8")).toBe("keep\n");
-				else expect(lstatSync(join(movedRoot, to)).isSymbolicLink()).toBe(true);
+				expect(to).toMatch(/\/quarantine\/git-[a-f0-9]{24}$/);
+				if (from === ".git") expect(readFileSync(to, "utf8")).toBe("gitdir: elsewhere\n");
+				else if (from === "nested/.GiT") expect(readFileSync(join(to, "config"), "utf8")).toBe("keep\n");
+				else expect(lstatSync(to).isSymbolicLink()).toBe(true);
 			}
 			expect(readFileSync(join(outside, ".git"), "utf8")).toBe("outside\n");
 			expect(existsSync(join(movedRoot, "existing", ".git"))).toBe(true);
@@ -690,9 +716,9 @@ describe("round 6: containment is the boundary", () => {
 			const replacement = held.quarantine();
 			expect(replacement.error).toBeUndefined();
 			expect(replacement.moved.map((m) => m.from)).toEqual(["existing/.git"]);
-			expect(readFileSync(join(movedRoot, replacement.moved[0]!.to), "utf8")).toBe("replacement\n");
-			expect(() => holdGitEntries(movedRoot, 1)).toThrow("couldn't be completed");
-			expect(() => holdGitEntries(movedRoot, 100, 0)).toThrow("deeper than");
+			expect(readFileSync(replacement.moved[0]!.to, "utf8")).toBe("replacement\n");
+			expect(() => holdGitEntries(movedRoot, 1, 64, undefined, quarantine)).toThrow("couldn't be completed");
+			expect(() => holdGitEntries(movedRoot, 100, 0, undefined, quarantine)).toThrow("deeper than");
 		} finally {
 			held.release();
 			rmSync(base, { recursive: true, force: true });
@@ -705,6 +731,7 @@ describe("round 6: containment is the boundary", () => {
 		const dangling = join(base, "dangling");
 		const target = join(base, "metadata");
 		const root = join(base, "project");
+		const quarantine = join(base, "quarantine");
 		mkdirSync(linked);
 		mkdirSync(dangling);
 		mkdirSync(target);
@@ -713,7 +740,7 @@ describe("round 6: containment is the boundary", () => {
 		symlinkSync(join(base, "missing"), join(dangling, ".GiT"));
 		expect(() => holdGitEntries(linked)).toThrow("symbolic link");
 		expect(() => holdGitEntries(dangling)).toThrow("symbolic link");
-		const held = holdGitEntries(root, 1, 0);
+		const held = holdGitEntries(root, 1, 0, undefined, quarantine);
 		try {
 			mkdirSync(join(root, "sealed", "deeper", ".git"), { recursive: true });
 			writeFileSync(join(root, "sealed", "deeper", ".git", "config"), "keep\n");
@@ -729,12 +756,41 @@ describe("round 6: containment is the boundary", () => {
 			chmodSync(root, 0o700);
 			chmodSync(join(root, "sealed"), 0o700);
 			const blocked = result.moved[0]!.to;
-			expect(readFileSync(join(root, blocked, "config"), "utf8")).toBe("keep\n");
+			expect(readFileSync(join(blocked, "config"), "utf8")).toBe("keep\n");
 		} finally {
 			held.release();
 			try {
 				chmodSync(root, 0o700);
 				chmodSync(join(root, "sealed"), 0o700);
+			} catch {
+				// The setup may have failed before changing modes.
+			}
+			rmSync(base, { recursive: true, force: true });
+		}
+	});
+
+	test.skipIf(process.platform !== "linux")("Linux makes the project inaccessible when neither metadata nor the project can move to quarantine", () => {
+		const base = realpathSync(mkdtempSync(join(tmpdir(), "el-git-fail-closed-")));
+		const root = join(base, "project");
+		const quarantine = join(base, "quarantine");
+		mkdirSync(root);
+		const held = holdGitEntries(root, 50_000, 64, undefined, quarantine);
+		try {
+			mkdirSync(join(root, ".git"));
+			writeFileSync(join(root, ".git", "config"), "keep\n");
+			// The held destination disappears, as it could after a host filesystem failure.
+			rmSync(quarantine, { recursive: true });
+			const result = held.quarantine(true);
+			expect(result.error).toContain("Moving the project aside also failed");
+			expect(result.sealed).toBe(root);
+			expect(lstatSync(root).mode & 0o777).toBe(0);
+			if (process.getuid?.() !== 0) expect(spawnSync("/bin/cat", [join(root, ".git", "config")]).status).not.toBe(0);
+			held.restoreRootMode(0o700);
+			expect(readFileSync(join(root, ".git", "config"), "utf8")).toBe("keep\n");
+		} finally {
+			held.release();
+			try {
+				chmodSync(root, 0o700);
 			} catch {
 				// The setup may have failed before changing modes.
 			}
@@ -778,6 +834,27 @@ describe("round 6: containment is the boundary", () => {
 			const mask = launch.args.findIndex((item) => item === credentials);
 			expect(bind).toBeGreaterThan(0);
 			expect(mask).toBeGreaterThan(bind);
+
+			const appRoot = join(state, "app-data");
+			const current = join(appRoot, "current");
+			const sibling = join(appRoot, "sibling");
+			mkdirSync(current, { recursive: true });
+			mkdirSync(sibling);
+			writeFileSync(join(sibling, "secret"), "sibling-secret");
+			const app = contained("/bin/bash", ["-c", 'printf ok > "$1/result"; cat "$2/secret" 2>/dev/null || true', "--", current, sibling], {
+				writable: [current],
+				network: "none",
+				appData: { root: appRoot, current },
+			});
+			try {
+				const ran = spawnSync(app.file, app.args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe", ...(app.pass ?? [])] });
+				expect(ran.status).toBe(0);
+				expect(ran.stdout).not.toContain("sibling-secret");
+				expect(readFileSync(join(current, "result"), "utf8")).toBe("ok");
+			} finally {
+				app.release?.();
+			}
+			expect(() => contained("/bin/true", [], { writable: [sibling], network: "none", appData: { root: appRoot, current } })).toThrow("only its own direct app-data folder");
 		} finally {
 			if (savedHome === undefined) delete process.env.EL_HOME;
 			else process.env.EL_HOME = savedHome;
@@ -789,20 +866,44 @@ describe("round 6: containment is the boundary", () => {
 		const base = realpathSync(mkdtempSync(join(tmpdir(), "el-git-recovery-")));
 		const root = join(base, "project");
 		const home = join(base, "state");
+		const quarantine = join(base, "quarantine");
 		mkdirSync(join(root, "existing", ".git"), { recursive: true });
 		try {
-			const held = holdGitEntries(root);
+			const held = holdGitEntries(root, 50_000, 64, undefined, quarantine);
 			const marker = gitQuarantineMarker(root, home);
 			mkdirSync(dirname(marker), { recursive: true });
-			writeFileSync(marker, JSON.stringify({ version: 1, project: root, baseline: held.baseline }));
+			writeFileSync(marker, JSON.stringify({ version: 1, project: root, baseline: held.baseline, quarantine, rootMode: held.rootMode }));
 			held.release();
 			mkdirSync(join(root, "left", ".git"), { recursive: true });
 			writeFileSync(join(root, "left", ".git", "config"), "keep");
-			const moved = recoverGitQuarantine(root, home);
-			expect(moved.map((entry) => entry.from)).toEqual(["left/.git"]);
+			const recovered = recoverGitQuarantine(root, home);
+			expect(recovered.moved.map((entry) => entry.from)).toEqual(["left/.git"]);
 			expect(existsSync(marker)).toBe(false);
 			expect(existsSync(join(root, "existing", ".git"))).toBe(true);
-			expect(readFileSync(join(root, moved[0]!.to, "config"), "utf8")).toBe("keep");
+			expect(readFileSync(join(recovered.moved[0]!.to, "config"), "utf8")).toBe("keep");
+
+			const displacedHeld = holdGitEntries(root, 50_000, 64, undefined, quarantine);
+			writeFileSync(marker, JSON.stringify({ version: 1, project: root, baseline: displacedHeld.baseline, quarantine, rootMode: displacedHeld.rootMode }));
+			displacedHeld.release();
+			mkdirSync(join(root, "late", ".git"), { recursive: true });
+			writeFileSync(join(root, "late", ".git", "config"), "late");
+			renameSync(root, join(quarantine, "project"));
+			const restored = recoverGitQuarantine(root, home);
+			expect(restored.restored).toEqual({ from: join(quarantine, "project"), to: root });
+			expect(restored.moved.map((entry) => entry.from)).toEqual(["late/.git"]);
+			expect(existsSync(root)).toBe(true);
+
+			const renamedHeld = holdGitEntries(root, 50_000, 64, undefined, quarantine);
+			writeFileSync(marker, JSON.stringify({ version: 1, project: root, baseline: renamedHeld.baseline, quarantine, rootMode: renamedHeld.rootMode }));
+			renamedHeld.release();
+			const renamed = join(base, "renamed-project");
+			renameSync(root, renamed);
+			mkdirSync(join(renamed, "alias", ".git"), { recursive: true });
+			writeFileSync(join(renamed, "alias", ".git", "config"), "alias");
+			const foundByIdentity = recoverGitQuarantine(renamed, home);
+			expect(foundByIdentity.moved.map((entry) => entry.from)).toEqual(["alias/.git"]);
+			expect(existsSync(join(renamed, "alias", ".git"))).toBe(false);
+			renameSync(renamed, root);
 			writeFileSync(marker, "not json");
 			expect(() => recoverGitQuarantine(root, home)).toThrow("No contained command ran");
 			expect(existsSync(marker)).toBe(true);
@@ -818,6 +919,7 @@ describe("round 6: containment is the boundary", () => {
 		mkdirSync(root);
 		process.env.EL_HOME = join(base, "state");
 		try {
+			const quarantine = gitQuarantineFolder(root, process.env.EL_HOME);
 			mkdirSync(join(root, ".git"));
 			writeFileSync(join(root, ".git", "config"), "existing\n");
 			mkdirSync(join(root, "pointer"));
@@ -838,11 +940,11 @@ describe("round 6: containment is the boundary", () => {
 			expect(background.exitCode).toBe(0);
 			for (const folder of ["made", "later"]) {
 				expect(existsSync(join(root, folder, ".git"))).toBe(false);
-				const blocked = readdirSync(join(root, folder)).find((name) => name.startsWith(".git.enrichedlab-blocked-"));
-				expect(blocked).toBeDefined();
-				expect(readFileSync(folder === "made" ? join(root, folder, blocked!, "config") : join(root, folder, blocked!), "utf8")).toBe(folder === "made" ? "keep" : "pointer");
 				expect((folder === "made" ? foreground : background).output).toContain(`EnrichedLab moved "${folder}/.git"`);
 			}
+			const quarantined = readdirSync(quarantine).map((name) => join(quarantine, name)).filter((path) => basename(path) !== "project");
+			expect(quarantined.some((path) => lstatSync(path).isDirectory() && readFileSync(join(path, "config"), "utf8") === "keep")).toBe(true);
+			expect(quarantined.some((path) => lstatSync(path).isFile() && readFileSync(path, "utf8") === "pointer")).toBe(true);
 			expect(output.join("")).toContain('EnrichedLab moved "later/.git"');
 			const hostile = await ws.exec("mkdir -p sealed/deeper/.git && printf keep > sealed/deeper/.git/config && chmod 000 sealed && chmod 500 .", options);
 			expect(hostile.exitCode).toBe(0);
@@ -850,9 +952,7 @@ describe("round 6: containment is the boundary", () => {
 			chmodSync(root, 0o700);
 			chmodSync(join(root, "sealed"), 0o700);
 			expect(existsSync(join(root, "sealed", "deeper", ".git"))).toBe(false);
-			const blocked = readdirSync(join(root, "sealed", "deeper")).find((name) => name.startsWith(".git.enrichedlab-blocked-"));
-			expect(blocked).toBeDefined();
-			expect(readFileSync(join(root, "sealed", "deeper", blocked!, "config"), "utf8")).toBe("keep");
+			expect(readdirSync(quarantine).map((name) => join(quarantine, name)).some((path) => lstatSync(path).isDirectory() && readFileSync(join(path, "config"), "utf8") === "keep")).toBe(true);
 		} finally {
 			try {
 				chmodSync(root, 0o700);

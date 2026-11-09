@@ -2,14 +2,15 @@
 
 import { afterAll, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { AppHost } from "../packages/engine/src/apps/host.ts";
+import { startBackend } from "../packages/engine/src/apps/backends.ts";
 import { readManifest } from "../packages/engine/src/apps/manifest.ts";
 import { installApp, packApp } from "../packages/engine/src/apps/package.ts";
 import { templateFiles } from "../packages/engine/src/apps/templates.ts";
 import { paths } from "../packages/engine/src/paths.ts";
-import { contained, LocalWorkspace } from "../packages/engine/src/tools/workspace.ts";
+import { contained, LocalWorkspace, sandboxer } from "../packages/engine/src/tools/workspace.ts";
 
 const made: string[] = [];
 function scratch(name: string): string {
@@ -59,6 +60,32 @@ describe("manifest", () => {
 });
 
 describe("app host", () => {
+	test.skipIf(process.platform !== "linux" || sandboxer() !== "bubblewrap")("the default Bun app backend starts with its private app-data grant under bubblewrap", async () => {
+		const home = scratch("linux-backend-home");
+		const app = join(home, "apps", "demo");
+		const dataDir = join(home, "app-data", "demo");
+		const savedHome = process.env.EL_HOME;
+		let backend: Awaited<ReturnType<typeof startBackend>> | undefined;
+		try {
+			process.env.EL_HOME = home;
+			writeApp(app, templateFiles("data", "demo", "Demo", ""));
+			backend = await startBackend(readManifest(app), {
+				dir: app,
+				dataDir,
+				runDir: join(home, "runtime"),
+				toolsDir: join(home, "tools"),
+				network: false,
+				log: () => undefined,
+			});
+			expect(backend.kind).toBe("mcp");
+			if (backend.kind === "mcp") expect((await backend.call("summarize", { values: [2, 4] })).structuredContent).toMatchObject({ mean: 3, n: 2 });
+		} finally {
+			await backend?.close();
+			if (savedHome === undefined) delete process.env.EL_HOME;
+			else process.env.EL_HOME = savedHome;
+		}
+	}, 60_000);
+
 	test("a data app: consent, serving with CSP, a real Bun backend, and lab_ tools within permissions", async () => {
 		const home = scratch("home");
 		const project = scratch("project");
@@ -94,9 +121,11 @@ describe("app host", () => {
 
 	test("contained programs can't read ~/.el, except paths passed as readable", () => {
 		if (process.platform !== "darwin") return;
-		const probe = join(homedir(), ".el", "run", "contained_probe_codetestfile.txt");
-		// The real folder: the sandbox rule names it. Anything this test makes there, it removes.
-		const made = mkdirSync(dirname(probe), { recursive: true });
+		const home = scratch("private-home");
+		const probe = join(home, "run", "contained_probe_codetestfile.txt");
+		const savedHome = process.env.EL_HOME;
+		process.env.EL_HOME = home;
+		mkdirSync(dirname(probe), { recursive: true });
 		writeFileSync(probe, "ok");
 		try {
 			const run = (readable: string[]) => {
@@ -106,7 +135,8 @@ describe("app host", () => {
 			expect(run([])).toBe("");
 			expect(run([probe])).toBe("ok");
 		} finally {
-			rmSync(made ?? probe, { recursive: true, force: true });
+			if (savedHome === undefined) delete process.env.EL_HOME;
+			else process.env.EL_HOME = savedHome;
 		}
 	});
 

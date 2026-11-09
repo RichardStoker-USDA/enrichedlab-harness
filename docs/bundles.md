@@ -16,9 +16,10 @@ How EnrichedLab handles git on a person's computer and in a lab sandbox, and how
 - **What asks.** In its own recorded worktree the agent edits files and uses the built-in `git_commit` tool without asking.
   File tools reject `.git` paths. With the local sandbox on, macOS shell commands also reject them. Linux shell
   commands can write the worktree. Existing regular `.git` entries are bound read only, existing `.git` symbolic
-  links refuse launch, and normal completion moves new entries aside after all background children end. A new
-  `.git` exists until cleanup. Before launch the engine records what existed, so a crash or failed cleanup leaves the
-  project blocked from contained shell commands until an anchored quarantine pass succeeds; see [security.md](security.md).
+  links refuse launch, and normal completion moves new entries to an engine-owned quarantine outside the project
+  after all background children end. A new `.git` exists until cleanup. Before launch the engine records what existed
+  and where the external quarantine is. A failed final pass moves the project there or removes its access bits; a
+  later anchored recovery restores the project before another contained shell command; see [security.md](security.md).
   `git_commit` stages all changes and commits
   through an isolated staging repository, then rechecks the recorded repository, worktree admin directory, branch
   and old commit before advancing only that branch. Its staging scratch is not in the temp folder agent commands can
