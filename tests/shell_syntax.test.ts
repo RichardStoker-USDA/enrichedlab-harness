@@ -894,29 +894,146 @@ describe("round 6: containment is the boundary", () => {
 		}
 	});
 
-	test.skipIf(process.platform !== "linux" || sandboxer() !== "bubblewrap")("Linux refuses a fallback across equal-device bind mounts when rename returns EXDEV", () => {
+	test.skipIf(process.platform !== "linux" || sandboxer() !== "bubblewrap")("Linux makes no advance probe and refuses a nested mount by held mount identity", () => {
 		const base = realpathSync(mkdtempSync(join(tmpdir(), "el-git-bind-fallback-")));
 		const projectSource = join(base, "project-source");
+		const nestedSource = join(base, "nested-source");
 		const stateSource = join(base, "state-source");
 		const project = join(base, "views", "project");
 		const state = join(base, "views", "state");
-		mkdirSync(projectSource);
+		mkdirSync(join(projectSource, "nested"), { recursive: true });
+		mkdirSync(nestedSource);
 		mkdirSync(stateSource);
 		mkdirSync(project, { recursive: true });
 		mkdirSync(state);
 		try {
 			const bwrap = ["/usr/bin/bwrap", "/bin/bwrap", "/usr/local/bin/bwrap"].find(existsSync)!;
-			const module = join(import.meta.dir, "../packages/engine/src/tools/workspace.ts");
-			const script = `import { gitQuarantineFolder } from ${JSON.stringify(module)};\ntry { gitQuarantineFolder(${JSON.stringify(project)}, ${JSON.stringify(state)}); process.exit(2); } catch (error) { const message = String(error?.message ?? error); process.stdout.write(message); if (!message.includes("EXDEV")) process.exit(3); }`;
+			const workspaceModule = join(import.meta.dir, "../packages/engine/src/tools/workspace.ts");
+			const anchoredModule = join(import.meta.dir, "../packages/engine/src/tools/anchored.ts");
+			const script = `import { gitQuarantineFolder } from ${JSON.stringify(workspaceModule)};\nimport { holdGitEntries } from ${JSON.stringify(anchoredModule)};\nconst quarantine = gitQuarantineFolder(${JSON.stringify(project)}, ${JSON.stringify(state)});\ntry { holdGitEntries(${JSON.stringify(project)}, 50_000, 64, undefined, quarantine); process.exit(2); } catch (error) { const message = String(error?.message ?? error); process.stdout.write(JSON.stringify({ quarantine, message })); if (!message.includes("mount boundary at nested") || !message.includes("mount ID")) process.exit(3); }`;
 			const ran = spawnSync(bwrap, [
 				"--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
-				"--bind", projectSource, project, "--bind", stateSource, state,
+				"--bind", projectSource, project, "--bind", nestedSource, join(project, "nested"), "--bind", stateSource, state,
 				"--unshare-all", "--die-with-parent", "--new-session", "--", process.execPath, "-e", script,
 			], { encoding: "utf8" });
 			expect(ran.status, ran.stderr).toBe(0);
-			expect(ran.stdout).toContain("rename probe could not move into the fallback quarantine: EXDEV");
-			expect(readdirSync(projectSource)).toEqual([]);
+			const result = JSON.parse(ran.stdout) as { quarantine: string; message: string };
+			expect(result.quarantine).toStartWith(join(state, "quarantine"));
+			expect(result.message).toContain("mount boundary at nested");
+			expect(readdirSync(projectSource)).toEqual(["nested"]);
 		} finally {
+			rmSync(base, { recursive: true, force: true });
+		}
+	});
+
+	test.skipIf(process.platform !== "linux" || sandboxer() !== "bubblewrap")("a mid-pass move stays journaled through a later EXDEV and keeps the project blocked", () => {
+		const base = realpathSync(mkdtempSync(join(tmpdir(), "el-git-mid-pass-mount-")));
+		const source = join(base, "source");
+		const projectSource = join(source, "project");
+		const nestedSource = join(base, "nested-source");
+		const stateSource = join(base, "state-source");
+		const views = join(base, "views");
+		const project = join(views, "project");
+		const state = join(base, "state");
+		const env = { ...process.env, HOME: state, EL_HOME: state, XDG_CONFIG_HOME: join(state, ".config"), GIT_CONFIG_GLOBAL: "/dev/null" };
+		mkdirSync(join(projectSource, "a"), { recursive: true });
+		mkdirSync(join(projectSource, "z-mount"));
+		mkdirSync(nestedSource);
+		mkdirSync(stateSource);
+		mkdirSync(views);
+		mkdirSync(state);
+		try {
+			const bwrap = ["/usr/bin/bwrap", "/bin/bwrap", "/usr/local/bin/bwrap"].find(existsSync)!;
+			const workspaceModule = join(import.meta.dir, "../packages/engine/src/tools/workspace.ts");
+			const script = `import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";\nimport { dirname, join } from "node:path";\nimport { gitQuarantineFolder, gitQuarantineMarker, LocalWorkspace, recoverGitQuarantine } from ${JSON.stringify(workspaceModule)};\nconst project = ${JSON.stringify(project)}; const state = ${JSON.stringify(state)}; const root = statSync(project, { bigint: true }); const baseline = { root: String(root.dev) + ":" + String(root.ino), entries: [] }; const quarantine = gitQuarantineFolder(project, state); const marker = gitQuarantineMarker(project, state); mkdirSync(dirname(marker), { recursive: true, mode: 0o700 }); writeFileSync(marker, JSON.stringify({ version: 1, project, baseline, quarantine, moved: [] })); mkdirSync(join(project, "a", ".git")); writeFileSync(join(project, "a", ".git", "config"), "moved"); let recovery = ""; try { recoverGitQuarantine(project, state); } catch (error) { recovery = String(error?.message ?? error); } const journal = JSON.parse(readFileSync(marker, "utf8")); const workspace = new LocalWorkspace(project); let write = ""; try { await workspace.write("blocked", "bad"); } catch (error) { write = String(error?.message ?? error); } process.stdout.write(JSON.stringify({ recovery, write, journal, target: journal.moved[0] && readFileSync(join(journal.moved[0].to, "config"), "utf8"), marker: existsSync(marker), git: existsSync(join(project, "a", ".git")), file: existsSync(join(project, "blocked")) }));`;
+			const ran = spawnSync(bwrap, [
+				"--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
+				"--bind", source, views, "--bind", nestedSource, join(project, "z-mount"), "--bind", stateSource, state,
+				"--unshare-all", "--die-with-parent", "--new-session", "--", process.execPath, "-e", script,
+			], { encoding: "utf8", env });
+			expect(ran.status, ran.stderr).toBe(0);
+			const result = JSON.parse(ran.stdout) as { recovery: string; write: string; journal: { moved: { from: string; to: string }[] }; target: string; marker: boolean; git: boolean; file: boolean };
+			expect(result.recovery).toContain("mount boundary at z-mount");
+			expect(result.write).toContain("cleanup pending");
+			expect(result.journal.moved.map((move) => move.from)).toEqual(["a/.git"]);
+			expect(result).toMatchObject({ target: "moved", marker: true, git: false, file: false });
+
+			const quarantine = dirname(result.journal.moved[0]!.to);
+			const quarantineSource = join(source, basename(quarantine));
+			mkdirSync(join(projectSource, "second", ".git"), { recursive: true });
+			writeFileSync(join(projectSource, "second", ".git", "config"), "keep");
+			mkdirSync(project, { recursive: true });
+			mkdirSync(quarantine);
+			// The outer user namespace leaves system-root ownership unmapped, so the inner launcher cannot discover
+			// trusted bubblewrap. Select its branch directly; journal lookup and the real kernel renames stay intact.
+			const retry = `import { existsSync, readFileSync } from "node:fs";\nimport { join } from "node:path";\nimport { gitQuarantineMarker, LocalWorkspace, recoverGitQuarantine } from ${JSON.stringify(workspaceModule)};\nconst project = ${JSON.stringify(project)}; const state = ${JSON.stringify(state)}; let recovery = ""; try { recoverGitQuarantine(project, state); } catch (error) { recovery = String(error?.message ?? error); } const workspace = new LocalWorkspace(project); Object.defineProperty(workspace, "sandboxed", { value: "bubblewrap" }); let write = ""; try { await workspace.write("blocked", "bad"); } catch (error) { write = String(error?.message ?? error); } const command = await workspace.exec("printf bad > command", { timeoutMs: 5_000, signal: AbortSignal.timeout(5_000) }); const marker = gitQuarantineMarker(project, state); const journal = JSON.parse(readFileSync(marker, "utf8")); process.stdout.write(JSON.stringify({ recovery, write, command, journal, marker: existsSync(marker), git: existsSync(join(project, "second", ".git")), file: existsSync(join(project, "blocked")), commandFile: existsSync(join(project, "command")) }));`;
+			const retried = spawnSync(bwrap, [
+				"--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
+				"--tmpfs", "/tmp",
+				"--bind", projectSource, project, "--bind", quarantineSource, quarantine, "--bind", stateSource, state,
+				"--unshare-all", "--die-with-parent", "--new-session", "--", process.execPath, "-e", retry,
+			], { encoding: "utf8", env });
+			expect(retried.status, retried.stderr).toBe(0);
+			const retriedResult = JSON.parse(retried.stdout) as { recovery: string; write: string; command: { exitCode: number; output: string }; journal: { moved: { from: string }[] }; marker: boolean; git: boolean; file: boolean; commandFile: boolean };
+			expect(retriedResult.recovery).toContain("EXDEV");
+			expect(retriedResult.write).toContain("cleanup pending");
+			expect(retriedResult.command.exitCode).toBe(125);
+			expect(retriedResult.command.output).toContain("cleanup pending");
+			expect(retriedResult.journal.moved.map((move) => move.from)).toEqual(["a/.git"]);
+			expect(retriedResult).toMatchObject({ marker: true, git: true, file: false, commandFile: false });
+		} finally {
+			rmSync(base, { recursive: true, force: true });
+		}
+	}, 15_000);
+
+	test.skipIf(process.platform !== "linux" || process.getuid?.() === 0 || sandboxer() !== "bubblewrap")("journal lookup errors block file writes and real contained commands after a failed pass", async () => {
+		const base = realpathSync(mkdtempSync(join(tmpdir(), "el-git-journal-lookup-")));
+		const home = join(base, "state");
+		const savedHome = process.env.EL_HOME;
+		let directory: string | undefined;
+		try {
+			process.env.EL_HOME = home;
+			for (const renamed of [false, true]) {
+				const original = join(base, renamed ? "identity-project" : "direct-project");
+				mkdirSync(original);
+				const quarantine = gitQuarantineFolder(original);
+				const held = holdGitEntries(original, 50_000, 64, undefined, quarantine);
+				const marker = gitQuarantineMarker(original);
+				directory = dirname(marker);
+				try {
+					mkdirSync(directory, { recursive: true, mode: 0o700 });
+					writeFileSync(marker, JSON.stringify({ version: 1, project: original, baseline: held.baseline, quarantine, moved: [] }));
+				} finally {
+					held.release();
+				}
+				mkdirSync(join(original, ".git"));
+				writeFileSync(join(original, ".git", "config"), "keep");
+				chmodSync(quarantine, 0o777);
+				expect(() => recoverGitQuarantine(original)).toThrow("cleanup pending");
+				chmodSync(quarantine, 0o700);
+				const root = renamed ? join(base, "renamed-project") : original;
+				if (renamed) renameSync(original, root);
+				const workspace = new LocalWorkspace(root, "workspace");
+				expect(workspace.sandboxed).toBe("bubblewrap");
+				// Search permission without enumeration tests the identity fallback; no search tests direct lookup.
+				chmodSync(directory, renamed ? 0o100 : 0);
+				await expect(workspace.write("blocked.txt", "bad")).rejects.toThrow("cleanup pending");
+				const command = await workspace.exec("printf bad > command.txt", { timeoutMs: 5_000, signal: AbortSignal.timeout(5_000) });
+				expect(command.exitCode).toBe(125);
+				expect(command.output).toContain("cleanup pending");
+				expect(existsSync(join(root, "blocked.txt"))).toBe(false);
+				expect(existsSync(join(root, "command.txt"))).toBe(false);
+				chmodSync(directory, 0o700);
+				expect(existsSync(marker)).toBe(true);
+				expect(readFileSync(join(root, ".git", "config"), "utf8")).toBe("keep");
+				// The same unchanged record can recover once journal access is restored.
+				await workspace.write("recovered.txt", "ok");
+				expect(existsSync(marker)).toBe(false);
+			}
+		} finally {
+			if (directory) chmodSync(directory, 0o700);
+			if (savedHome === undefined) delete process.env.EL_HOME;
+			else process.env.EL_HOME = savedHome;
 			rmSync(base, { recursive: true, force: true });
 		}
 	});
@@ -938,6 +1055,63 @@ describe("round 6: containment is the boundary", () => {
 			rmSync(project, { recursive: true, force: true });
 		}
 	});
+
+	test("home-project file writes refuse engine state and trusted Git configuration through direct and linked names", () => {
+		const base = realpathSync(mkdtempSync(join(tmpdir(), "el-home-file-tools-")));
+		const home = join(base, "home");
+		const engineHome = join(home, ".el");
+		const xdg = join(home, ".config");
+		mkdirSync(engineHome, { recursive: true });
+		mkdirSync(join(xdg, "git"), { recursive: true });
+		writeFileSync(join(engineHome, "config.json"), "engine\n");
+		writeFileSync(join(home, ".gitconfig"), "global\n");
+		writeFileSync(join(xdg, "git", "config"), "xdg\n");
+		writeFileSync(join(home, "custom-git-config"), "custom\n");
+		symlinkSync(engineHome, join(home, "engine-link"));
+		linkSync(join(engineHome, "config.json"), join(home, "engine-hard"));
+		try {
+			const module = join(import.meta.dir, "../packages/engine/src/tools/workspace.ts");
+			const script = `import { readFileSync } from "node:fs";\nimport { join } from "node:path";\nimport { LocalWorkspace } from ${JSON.stringify(module)};\nconst home = process.env.HOME; if (!home) process.exit(9); const workspace = new LocalWorkspace(home); const refused = []; for (const path of [".el/config.json", ".gitconfig", ".config/git/config", "custom-git-config", "engine-link/config.json", "engine-hard"]) { try { await workspace.write(path, "changed"); refused.push([path, "allowed"]); } catch (error) { refused.push([path, String(error?.message ?? error)]); } } await workspace.write("ordinary", "ok"); process.stdout.write(JSON.stringify({ refused, engine: readFileSync(join(home, ".el", "config.json"), "utf8"), global: readFileSync(join(home, ".gitconfig"), "utf8"), xdg: readFileSync(join(home, ".config", "git", "config"), "utf8"), custom: readFileSync(join(home, "custom-git-config"), "utf8"), ordinary: readFileSync(join(home, "ordinary"), "utf8") }));`;
+			const ran = spawnSync(process.execPath, ["-e", script], { encoding: "utf8", env: { ...process.env, HOME: home, EL_HOME: engineHome, XDG_CONFIG_HOME: xdg, GIT_CONFIG_GLOBAL: join(home, "custom-git-config") } });
+			expect(ran.status, ran.stderr).toBe(0);
+			const result = JSON.parse(ran.stdout) as { refused: [string, string][]; engine: string; global: string; xdg: string; custom: string; ordinary: string };
+			expect(result.refused.every(([, message]) => message !== "allowed" && /trusted engine or Git configuration|hard link/.test(message))).toBe(true);
+			expect(result).toMatchObject({ engine: "engine\n", global: "global\n", xdg: "xdg\n", custom: "custom\n", ordinary: "ok" });
+		} finally {
+			rmSync(base, { recursive: true, force: true });
+		}
+	});
+
+	test.skipIf(!["darwin", "linux"].includes(process.platform) || !["seatbelt", "bubblewrap"].includes(sandboxer() ?? ""))("home-project contained commands cannot write, rename, symlink or hard-link into trusted state", () => {
+		const base = realpathSync(mkdtempSync(join(tmpdir(), "el-home-trusted-")));
+		const home = join(base, "home");
+		const engineHome = join(home, ".el");
+		const xdg = join(home, ".config");
+		mkdirSync(join(engineHome, "app-data"), { recursive: true });
+		mkdirSync(join(xdg, "git"), { recursive: true });
+		writeFileSync(join(engineHome, "config.json"), "engine\n");
+		writeFileSync(join(home, ".gitconfig"), "global\n");
+		writeFileSync(join(xdg, "git", "config"), "xdg\n");
+		writeFileSync(join(home, "safe"), "safe\n");
+		symlinkSync(engineHome, join(home, "engine-link"));
+		linkSync(join(engineHome, "config.json"), join(home, "engine-hard"));
+		try {
+			const module = join(import.meta.dir, "../packages/engine/src/tools/workspace.ts");
+			const script = `import { existsSync, readFileSync } from "node:fs";\nimport { join } from "node:path";\nimport { LocalWorkspace } from ${JSON.stringify(module)};\nconst home = process.env.HOME; if (!home) process.exit(9); const workspace = new LocalWorkspace(home, "workspace");\nconst refused = []; for (const path of [".el/config.json", ".gitconfig", ".config/git/config", "engine-link/config.json", "engine-hard"]) { try { await workspace.write(path, "changed"); refused.push([path, "allowed"]); } catch (error) { refused.push([path, String(error?.message ?? error)]); } }\nawait workspace.write("ordinary-file", "ok");\nconst commands = ["printf bad > .el/config.json", "mv safe .el/config.json", "ln -s ../safe .el/new-link", "ln safe .el/new-hard", "printf bad > .gitconfig", "mv safe .gitconfig", "ln -s ../../safe .config/git/new-link", "ln safe .config/git/new-hard"]; const commandResults = []; for (const command of commands) commandResults.push(await workspace.exec(command, { timeoutMs: 5_000, signal: AbortSignal.timeout(5_000) }));\nconst ordinary = await workspace.exec("printf ok > ordinary-command", { timeoutMs: 5_000, signal: AbortSignal.timeout(5_000) });\nprocess.stdout.write(JSON.stringify({ refused, commandResults, ordinary, engine: readFileSync(join(home, ".el", "config.json"), "utf8"), global: readFileSync(join(home, ".gitconfig"), "utf8"), xdg: readFileSync(join(home, ".config", "git", "config"), "utf8"), safe: readFileSync(join(home, "safe"), "utf8"), made: [".el/new-link", ".el/new-hard", ".config/git/new-link", ".config/git/new-hard"].some((path) => existsSync(join(home, path))) }));`;
+			const ran = spawnSync(process.execPath, ["-e", script], {
+				encoding: "utf8",
+				env: { ...process.env, HOME: home, EL_HOME: engineHome, XDG_CONFIG_HOME: xdg, GIT_CONFIG_GLOBAL: "/dev/null" },
+			});
+			expect(ran.status, ran.stderr).toBe(0);
+			const result = JSON.parse(ran.stdout) as { refused: [string, string][]; commandResults: { exitCode: number }[]; ordinary: { exitCode: number; output: string }; engine: string; global: string; xdg: string; safe: string; made: boolean };
+			expect(result.refused.every(([, message]) => message !== "allowed" && /trusted engine or Git configuration|hard link/.test(message))).toBe(true);
+			expect(result.commandResults.every((command) => command.exitCode !== 0)).toBe(true);
+			expect(result.ordinary.exitCode, result.ordinary.output).toBe(0);
+			expect(result).toMatchObject({ engine: "engine\n", global: "global\n", xdg: "xdg\n", safe: "safe\n", made: false });
+		} finally {
+			rmSync(base, { recursive: true, force: true });
+		}
+	}, 30_000);
 
 	test.skipIf(process.platform !== "linux" || sandboxer() !== "bubblewrap")("a pending .git journal blocks contained commands and file writes until an anchored pass succeeds", async () => {
 		const base = realpathSync(mkdtempSync(join(tmpdir(), "el-git-write-gate-")));
@@ -1111,6 +1285,26 @@ describe("round 6: containment is the boundary", () => {
 				app.release?.();
 			}
 			expect(() => contained("/bin/true", [], { writable: [sibling], network: "none", appData: { root: appRoot, current } })).toThrow("only its own direct app-data folder");
+
+			const installed = join(state, "apps", "demo");
+			const cache = join(state, "tools", "pixi-cache");
+			mkdirSync(installed, { recursive: true });
+			mkdirSync(cache, { recursive: true });
+			writeFileSync(join(state, "config.json"), "trusted\n");
+			const installer = contained("/bin/bash", ["-c", 'printf app > "$1/result"; printf cache > "$2/result"; printf bad > "$3" 2>/dev/null || true', "--", installed, cache, join(state, "config.json")], {
+				writable: [installed, cache],
+				network: "none",
+				engineWrite: [installed, cache],
+			});
+			try {
+				const ran = spawnSync(installer.file, installer.args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe", ...(installer.pass ?? [])] });
+				expect(ran.status, ran.stderr).toBe(0);
+				expect(readFileSync(join(installed, "result"), "utf8")).toBe("app");
+				expect(readFileSync(join(cache, "result"), "utf8")).toBe("cache");
+				expect(readFileSync(join(state, "config.json"), "utf8")).toBe("trusted\n");
+			} finally {
+				installer.release?.();
+			}
 		} finally {
 			if (savedHome === undefined) delete process.env.EL_HOME;
 			else process.env.EL_HOME = savedHome;

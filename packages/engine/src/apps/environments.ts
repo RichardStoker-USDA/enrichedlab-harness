@@ -86,7 +86,7 @@ export async function inEnvironment(dir: string, command: string[], tools: strin
 	const inherited: Record<string, string> = { PIXI_NO_PATH_UPDATE: "1", PIXI_CACHE_DIR: caches, PIXI_HOME: caches };
 	for (const key of ["PATH", "HOME", "LANG", "LC_ALL", "SYSTEMROOT", "SSL_CERT_FILE", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY"]) if (process.env[key]) inherited[key] = process.env[key]!;
 	const env = containedTempEnvironment(inherited);
-	const launch = contained(program, ["install", "--manifest-path", manifest], { writable: [home, physical(caches)], readable: [program], network: "all", exact: true });
+	const launch = contained(program, ["install", "--manifest-path", manifest], { writable: [home, physical(caches)], readable: [program], network: "all", exact: true, engineWrite: [home, physical(caches)] });
 	// Build scripts never run uncontained: without a facility here, nothing is installed (the consent card says contained).
 	if (!launch.facility) throw new Error("This computer has no sandbox to contain the app's install (Seatbelt on macOS, bubblewrap on Linux), so nothing was installed.");
 	// From a scratch folder: some packages' install scripts write test files where they run, and the app's folder

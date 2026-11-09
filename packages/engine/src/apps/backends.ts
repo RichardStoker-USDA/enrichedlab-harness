@@ -324,7 +324,7 @@ export async function startBackend(manifest: AppManifest, ctx: BackendContext): 
 		case "command": {
 			const command = hasEnvironment(ctx.dir) ? await inEnvironment(ctx.dir, backend.command, ctx.toolsDir, ctx.log) : backend.command;
 			const [program, ...args] = command;
-			const launch = contained(program!, args, { writable: [ctx.dataDir, join(ctx.dir, ".pixi")], readable: [ctx.dir, ctx.toolsDir], network, server: true, appData });
+			const launch = contained(program!, args, { writable: [ctx.dataDir, join(ctx.dir, ".pixi")], readable: [ctx.dir, ctx.toolsDir], network, server: true, appData, engineWrite: [join(ctx.dir, ".pixi")] });
 			uncontainedOk(launch);
 			return connectStdio(launch.file, launch.args, env, ctx.dir, ctx);
 		}
@@ -368,7 +368,7 @@ export async function startBackend(manifest: AppManifest, ctx: BackendContext): 
 			const [program, ...args] = command;
 			// Writes go to the data folder (and the environment's own cache), so history files don't touch the app's
 			// folder and its reload.
-			const launch = contained(program!, args, { writable: [ctx.dataDir, join(ctx.dir, ".pixi")], readable: [ctx.dir, ctx.toolsDir], network: servedBackendNetwork(ctx.network, ctx.serveNetwork === true), server: true, appData });
+			const launch = contained(program!, args, { writable: [ctx.dataDir, join(ctx.dir, ".pixi")], readable: [ctx.dir, ctx.toolsDir], network: servedBackendNetwork(ctx.network, ctx.serveNetwork === true), server: true, appData, engineWrite: [join(ctx.dir, ".pixi")] });
 			uncontainedOk(launch);
 			const proc = spawn(launch.file, launch.args, { cwd: ctx.dir, env: { ...env, PORT: String(port), HOST: "127.0.0.1" }, stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" });
 			for (const stream of [proc.stdout, proc.stderr]) stream?.on("data", (chunk: Buffer) => chunk.toString("utf8").split("\n").forEach((line) => line.trim() && ctx.log(line)));

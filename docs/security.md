@@ -18,7 +18,7 @@ for each operating system.
 | | macOS | Linux | Windows |
 | --- | --- | --- | --- |
 | Facility | Seatbelt (`sandbox-exec`) | bubblewrap, when user namespaces work | a write-restricted copy of the person's token |
-| Writes | project and a private temp folder, except any `.git` component below the project root | project and a private temp folder; regular `.git` entries stay read only, `.git` links refuse launch, and new entries move to an engine-owned quarantine outside the project | project and temp folders |
+| Writes | project and a private temp folder, except any `.git` component below the project root, the engine home and trusted Git configuration | project and a private temp folder; the engine home and trusted Git configuration stay read only, regular `.git` entries stay read only, `.git` links refuse launch, and new entries move to an engine-owned quarantine outside the project | project and temp folders |
 | Credential folders (`~/.ssh`, `~/.aws`, key stores, browser profiles) | hidden | hidden | readable |
 | Network | off unless allowed | off unless allowed | open |
 | Commands inside the project | run | run | ask first |
@@ -44,10 +44,12 @@ Approvals and fences guard against untrusted project work, not against the perso
   project (including `.git/config`, `.gitattributes`, `.pixi`, scripts and data), packages from others, and whatever
   a contained process leaves behind.
 - Trusted: the person and the EnrichedLab engine. The person's environment as EnrichedLab starts in it (`PATH` and
-  loader variables, global and system git settings, Homebrew's folders) is part of that trust. A lab's image and the
-  environment its gate gives each command are trusted by that lab. This holds only while those paths lead to content
-  the person or lab controls. A `PATH` entry, `include.path` or loader library inside a project hands that trust to
-  untrusted project content, so do not configure one that way.
+  loader variables, global and system git settings, Homebrew's folders) is part of that trust. Project grants never
+  make the active engine home, `~/.gitconfig`, `$XDG_CONFIG_HOME/git` (or `~/.config/git` when XDG is unset), or an
+  absolute path named by `GIT_CONFIG_GLOBAL` writable. System Git configuration is outside the project grant. A
+  lab's image and the environment its gate gives each command are trusted by that lab. This holds only while those
+  paths lead to content the person or lab controls. A `PATH` entry, `include.path` or loader library inside a project
+  hands that trust to untrusted project content, so do not configure one that way.
 - What the person approves extends trust. An approved uncontained command or package install can change trusted
   places (Homebrew, global git settings, the package cache), and the result counts as the person's. EnrichedLab
   checks one of them itself: its own pixi, compared with the pinned SHA-256 before every use.
@@ -98,13 +100,18 @@ The engine's own work stays inside the same line:
   hooks, fsmonitor and signing off. A lab where the fence doesn't hold refuses it.
 - App backends (`bun`, `command`, `serve`) run contained or not at all. Their only grant inside the hidden
   `app-data` tree is the current app's own data folder, bound by its engine-owned path after the private-folder masks;
-  sibling app data stays hidden. On Windows, where servers run as the person, the consent card says so before
-  anything starts. A served backend needs a named network grant before it starts. Seatbelt limits that grant to
-  loopback unless the manifest asks for network. Bubblewrap cannot provide loopback without sharing the host network,
-  so the Linux card names that whole-network access.
-- Package installs and listings run contained with the pinned pixi, checked against its SHA-256 before each use. A
-  listing never downloads it and gets no network.
-- File tools reject a `.git` component before and after following links on every platform. On macOS, Seatbelt denies
+  sibling app data stays hidden. The engine home is otherwise read only. The current app-data folder and an installed
+  app's own `.pixi` folder are reopened only by their exact engine-owned grants after that mask. On Windows, where
+  servers run as the person, the consent card says so before anything starts. A served backend needs a named network
+  grant before it starts. Seatbelt limits that grant to loopback unless the manifest asks for network. Bubblewrap
+  cannot provide loopback without sharing the host network, so the Linux card names that whole-network access.
+- Package installs and listings run contained with the pinned pixi, checked against its SHA-256 before each use. An
+  installed app environment can write only its exact app and cache destinations below the engine home. A listing
+  never downloads pixi and gets no network.
+- File tools reject a `.git` component before and after following links on every platform. They also refuse every
+  write to the active engine home and the trusted Git configuration paths listed above, before creating or opening
+  the target and after resolving links. On macOS and Linux the final write uses the same anchored no-follow path
+  walk. An outside-path approval does not reopen them. On macOS, Seatbelt denies
   contained shell commands a write to any path below the project root with a case-insensitive `.git` component, including a `.git` file and a
   repository made during the command. The rule is anchored at the project root, so a worktree stored below its
   repository's `.git` is still writable while its own `.git` pointer is not.
@@ -116,9 +123,8 @@ The engine's own work stays inside the same line:
   filesystem. Only when the sibling does not exist and its parent is not writable does the engine try one per-user
   quarantine root under its home. It makes the chosen directory with mode 0700, then opens it without following any
   link and verifies from that descriptor that it is a directory owned by the person, still mode 0700 and on the
-  project's device. Equal device numbers are not enough for the fallback: the engine also makes an empty probe in
-  the project, uses anchored `renameat` calls to move it into the fallback and back, and removes it. Any failure,
-  including `EXDEV` between two bind mounts of one filesystem, refuses the command and names the failed step. An
+  project's device. It does not make an advance probe. Each real anchored rename is the proof for that item. Any
+  failure, including `EXDEV` between two bind mounts of one filesystem, stops the pass and names the failed item. An
   existing sibling that fails any check refuses the command instead of trying the fallback. The error names the
   failed check, or why both locations were unavailable.
   Contained commands cannot read the quarantine.
@@ -127,20 +133,30 @@ The engine's own work stays inside the same line:
   identities of existing `.git` entries in its own `run` folder. If that record cannot be written, the command does
   not start. When the foreground command exits, the engine makes a bounded cleanup pass without changing modes while
   background children may still run. After every child ends, the final anchored pass uses the same 50,000-entry and
-  64-level bounds. It temporarily adds owner access to a directory the command made inaccessible, moves each new or
-  replaced `.git` entry atomically into the held quarantine descriptor, then restores the directory's mode. It
+  64-level bounds. Every directory is compared with the held project root by both device and Linux mount ID. A
+  nested mount is refused instead of crossed, including a bind mount of the same filesystem. The pass temporarily
+  adds owner access to a directory the command made inaccessible, moves each new or replaced `.git` entry atomically
+  into the held quarantine descriptor, records that completed move in the engine-owned journal before trying the
+  next item, then restores the directory's mode. It
   reports the original path and exact quarantine path in command output. Nothing is deleted or overwritten, and
   cleanup never follows a link. A lifecycle pipe keeps final cleanup attached to background children even when they
   redirect output; the command result waits for them to end. A successful final pass removes the cleanup record.
 
   A final scan or move error returns exit 125 and leaves the project and cleanup record in place. It does not move
   the project, leave its access bits changed or delete data to enforce the rule. Before any later contained command
-  or local file-tool write in that project, the engine retries the anchored pass. An invalid record or another
-  failure refuses that command or write before it creates anything. Reads remain available so the person's data is
-  not hidden. Recovery also finds a pending record by folder identity after the project is renamed or reached through
-  another physical path. The pending pass uses the quarantine recorded in its journal, even if a new sibling becomes
-  available, and repeats the rename proof against that exact destination before recovery. With no cleanup record, an
+  or local file-tool write in that project, the engine retries the anchored pass. An invalid record, a journal lookup
+  or directory access error, or another failure refuses that command or write before it creates anything. Reads
+  remain available so the person's data is not hidden. Recovery also finds a pending record by folder identity after
+  the project is renamed or reached through another physical path. The pending pass uses the quarantine recorded in
+  its journal, even if a new sibling becomes available. It retries the real renames against that exact destination.
+  With no cleanup record, an
   ordinary file write verifies an existing sibling but does not create or check a hypothetical fallback.
+
+  The same write denylist applies when the project is the person's home directory. Seatbelt can deny a trusted path
+  before it exists. Bubblewrap masks existing trusted paths after the project bind. If `~/.gitconfig`, the XDG Git
+  directory or an absolute `GIT_CONFIG_GLOBAL` path is inside a Linux writable project but does not exist, the
+  contained command is refused because bubblewrap cannot safely reserve a missing name in a writable parent. The
+  engine never creates or deletes user data to make that mask possible.
 
   There is a remaining window while a command runs: new metadata exists at its project path and Git in that command,
   or a simultaneous process outside containment, can use it. An engine crash or failed bounded pass can leave that
@@ -202,7 +218,8 @@ Accepted residuals, each with its reason:
   change that file through it. Contained commands can't make new hard links to files outside (Seatbelt, Landlock and
   bubblewrap each refuse it, and the fence's probe checks that), and EnrichedLab's own file writes refuse a file
   with a second name. A folder mounted inside the project (an automount, a bind mount the person or the lab set up)
-  counts as part of the project for commands and file operations alike; the Linux walk crosses mount points.
+  is visible to ordinary file operations and to the contained command. The Linux `.git` baseline and cleanup walk
+  refuses to cross it, using both device and mount ID, so a writable command does not launch while one is present.
 - Races with an uncontained process. A second process running outside containment at the same moment (an approved
   background command) isn't defended against. File operations refuse links and hard links, not a real folder
   renamed into place. Engine git grants exact folders by a held handle on Linux or by real path on macOS. Local

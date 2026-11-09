@@ -4,13 +4,13 @@
 import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import type { Dirent } from "node:fs";
-import { accessSync, closeSync, constants, existsSync, fstatSync, ftruncateSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
+import { accessSync, closeSync, constants, existsSync, fstatSync, ftruncateSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import { readdir, readFile, stat } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { labHome } from "../paths.ts";
 import { expandHome, withoutSecrets } from "../util.ts";
-import { holdFolder, holdGitEntries, holdPrivateFolder, mkdirPhysical, openPhysical, proveGitQuarantineRename, type GitEntryBaseline } from "./anchored.ts";
+import { holdFolder, holdGitEntries, holdPrivateFolder, mkdirPhysical, openPhysical, type GitEntryBaseline, type GitQuarantineResult } from "./anchored.ts";
 import { systemCommand, systemPowerShell } from "./windows_contain.ts";
 
 export interface Entry {
@@ -301,6 +301,35 @@ export function privateBindPath(path: string, home = homedir()): boolean {
 	return privatePaths(home).some((hidden) => pathAtOrBelow(target, foldedPath(real(hidden))));
 }
 
+function namedTrustedGitWritePaths(): string[] {
+	const home = homedir();
+	const xdg = process.env.XDG_CONFIG_HOME && isAbsolute(expandHome(process.env.XDG_CONFIG_HOME)) ? expandHome(process.env.XDG_CONFIG_HOME) : join(home, ".config");
+	const configuredGit = process.env.GIT_CONFIG_GLOBAL && process.env.GIT_CONFIG_GLOBAL !== "/dev/null" && isAbsolute(expandHome(process.env.GIT_CONFIG_GLOBAL))
+		? [expandHome(process.env.GIT_CONFIG_GLOBAL)]
+		: [];
+	return [join(home, ".gitconfig"), join(xdg, "git"), ...configuredGit].map((path) => resolve(path));
+}
+
+function resolvedPaths(named: string[]): string[] {
+	const unique = new Map<string, string>();
+	for (const path of named.flatMap((path) => [path, physical(path)])) unique.set(foldedPath(path), path);
+	return [...unique.values()];
+}
+
+/** Trusted state that a project grant never makes writable. System Git config stays outside a project grant. */
+function trustedWritePaths(): string[] {
+	return resolvedPaths([resolve(labHome()), ...namedTrustedGitWritePaths()]);
+}
+
+function trustedGitWritePaths(): string[] {
+	return resolvedPaths(namedTrustedGitWritePaths());
+}
+
+function trustedWritePath(path: string): string | undefined {
+	const targets = [resolve(path), physical(path)].map(foldedPath);
+	return trustedWritePaths().find((blocked) => targets.some((target) => pathAtOrBelow(target, foldedPath(blocked))));
+}
+
 /** What a contained program may reach: nothing, this computer's own loopback (a local web app), or the network. */
 export type NetworkAccess = "none" | "loopback" | "all";
 
@@ -351,7 +380,7 @@ export function projectGitPattern(root: string): string {
 	return `^${escaped}/([^/]+/)*\\.[gG][iI][tT](/|$)`;
 }
 
-function seatbeltProfile(writable: string[], network: NetworkAccess, readable: string[] = [], protect: string[] = [], patterns: string[] = [], hiddenPaths: string[] = []): string {
+function seatbeltProfile(writable: string[], network: NetworkAccess, readable: string[] = [], protect: string[] = [], patterns: string[] = [], hiddenPaths: string[] = [], engineWrite: string[] = [], gitProtect: string[] = []): string {
 	const quote = (p: string) => JSON.stringify(p);
 	const hidden = [...privatePaths(), ...hiddenPaths].map((path) => `(subpath ${quote(path)})`).join(" ");
 	const net =
@@ -371,6 +400,10 @@ function seatbeltProfile(writable: string[], network: NetworkAccess, readable: s
 		`(deny file-read* ${hidden})`,
 		// Paths inside a hidden folder that this program needs (an app's runner and data); later rules win.
 		...(readable.length ? [`(allow file-read* ${readable.map((p) => `(subpath ${quote(p)})`).join(" ")})`] : []),
+		// Only an engine-owned app or installer grant can reopen its exact destination below the engine home.
+		...(engineWrite.length ? [`(allow file-write* ${engineWrite.map((p) => `(subpath ${quote(p)})`).join(" ")})`] : []),
+		// A Git configuration path is never reopened, even if the person configured it below an app destination.
+		...(gitProtect.length ? [`(deny file-write* ${gitProtect.map((p) => `(subpath ${quote(p)})`).join(" ")})`] : []),
 		...net,
 	].join("\n");
 }
@@ -385,9 +418,10 @@ function seatbeltProfile(writable: string[], network: NetworkAccess, readable: s
  * name, so a link swapped in afterwards grants nothing; Seatbelt judges the real path of every write). The caller
  * hands `pass` to the program as its file descriptors 3, 4, ... (after stdin, stdout, stderr) and calls `release`
  * once it has exited. `protect`: paths inside the writable ones that stay read only (a
- * repository's settings and hooks).
+ * repository's settings and hooks). `engineWrite` names narrow engine-owned app or installer destinations that may
+ * be reopened after the engine-home deny rule.
  */
-export function contained(file: string, args: string[], options: { writable: string[]; network: NetworkAccess; readable?: string[]; server?: boolean; temp?: boolean; exact?: boolean; protect?: string[]; protectPatterns?: string[]; waitForChildren?: boolean; appData?: { root: string; current: string }; hidden?: string[] }): { file: string; args: string[]; facility?: Facility; pass?: number[]; release?: () => void; syncFd?: number } {
+export function contained(file: string, args: string[], options: { writable: string[]; network: NetworkAccess; readable?: string[]; server?: boolean; temp?: boolean; exact?: boolean; protect?: string[]; protectPatterns?: string[]; waitForChildren?: boolean; appData?: { root: string; current: string }; engineWrite?: string[]; hidden?: string[] }): { file: string; args: string[]; facility?: Facility; pass?: number[]; release?: () => void; syncFd?: number } {
 	// Each path resolved once: the check and the grant are the same answer.
 	const resolved = options.writable.map(real);
 	let appData: string | undefined;
@@ -395,6 +429,23 @@ export function contained(file: string, args: string[], options: { writable: str
 		const root = real(options.appData.root);
 		appData = real(options.appData.current);
 		if (basename(root) !== "app-data" || dirname(appData) !== root || !resolved.includes(appData)) throw new Error("An app backend may write only its own direct app-data folder.");
+	}
+	const namedEngineHome = foldedPath(resolve(labHome()));
+	const engineHome = foldedPath(physical(labHome()));
+	const gitProtect = trustedGitWritePaths();
+	for (const path of options.engineWrite ?? []) {
+		if (pathAtOrBelow(foldedPath(resolve(path)), namedEngineHome) && !pathAtOrBelow(foldedPath(real(path)), engineHome)) {
+			throw new Error("An engine-owned write destination now leads outside the engine home, so nothing ran.");
+		}
+	}
+	const engineWrite = [...new Set([...(appData ? [appData] : []), ...(options.engineWrite ?? []).map(real)].filter((path) => existsSync(path) && pathAtOrBelow(foldedPath(path), engineHome)))];
+	for (const path of engineWrite) {
+		if (!resolved.includes(path) || !pathAtOrBelow(foldedPath(path), engineHome) || foldedPath(path) === engineHome) {
+			throw new Error("An engine-owned write grant must be an exact writable destination below the engine home.");
+		}
+		if (gitProtect.some((blocked) => pathAtOrBelow(foldedPath(path), foldedPath(blocked)) || pathAtOrBelow(foldedPath(blocked), foldedPath(path)))) {
+			throw new Error("An engine-owned write grant cannot include trusted Git configuration.");
+		}
 	}
 	if (options.exact) resolved.forEach((p, i) => {
 		if (p !== options.writable[i]) throw new Error(`${options.writable[i]} now leads somewhere else (a link may have moved); nothing ran.`);
@@ -413,9 +464,10 @@ export function contained(file: string, args: string[], options: { writable: str
 	}
 	const writable = [...resolved, ...(options.temp === false ? [] : [safeTemp()])].filter((p, i, all) => existsSync(p) && all.indexOf(p) === i);
 	const readable = [...resolved, ...(options.readable ?? []).map(real)].filter((p) => existsSync(p));
-	const protect = [...new Set((options.protect ?? []).map(real))];
+	const trustedProtect = trustedWritePaths();
+	const protect = [...new Set([...(options.protect ?? []).map(real), ...trustedProtect])];
 	const extraHidden = (options.hidden ?? []).map(real).filter((p) => existsSync(p));
-	if (facility === "seatbelt") return { file: "/usr/bin/sandbox-exec", args: ["-p", seatbeltProfile(writable, options.network, readable, protect, options.protectPatterns, extraHidden), file, ...args], facility };
+	if (facility === "seatbelt") return { file: "/usr/bin/sandbox-exec", args: ["-p", seatbeltProfile(writable, options.network, readable, protect, options.protectPatterns, extraHidden, engineWrite, gitProtect), file, ...args], facility };
 	const bindTargets = [...writable, ...(options.readable ?? []).map(real), ...protect].filter((p) => existsSync(p));
 	const exposed = bindTargets.find((p) => privateBindPath(p) && p !== appData);
 	if (exposed) throw new Error(`${exposed} is inside a hidden credential or engine-data folder, so it cannot be bound into a contained command.`);
@@ -423,6 +475,8 @@ export function contained(file: string, args: string[], options: { writable: str
 	// (network, pids, IPC, user) so host sockets under /tmp and /run are out of reach. Loopback can't be split from
 	// the network in a namespace, so "loopback" shares the network here.
 	const hidden = [...privatePaths(), ...extraHidden].filter((p) => existsSync(p)).map(real).filter((p, i, all) => all.indexOf(p) === i).flatMap((p) => statSync(p).isDirectory() ? ["--tmpfs", p] : ["--ro-bind", "/dev/null", p]);
+	const unprotectedMissing = namedTrustedGitWritePaths().find((path) => !existsSync(path) && resolved.some((writable) => pathAtOrBelow(foldedPath(path), foldedPath(writable))));
+	if (unprotectedMissing) throw new Error(`${unprotectedMissing} is trusted Git configuration but does not exist, so bubblewrap cannot mask it inside this writable project and nothing ran.`);
 	const held: number[] = [];
 	// An exact folder is bound from a handle on the checked folder, passed to bubblewrap as an open file descriptor
 	// (--bind-fd), so it can't follow a link put in its place after the check.
@@ -432,7 +486,7 @@ export function contained(file: string, args: string[], options: { writable: str
 		return ["--bind-fd", String(2 + held.length), p];
 	};
 	let binds: string[];
-	let appDataBind: string[] = [];
+	let engineWriteBinds: string[] = [];
 	try {
 		binds = [
 			...writable.filter((p) => p !== "/tmp" && p !== "/private/tmp" && p !== appData).flatMap(bind),
@@ -440,11 +494,9 @@ export function contained(file: string, args: string[], options: { writable: str
 			// Bound read only over the writable folder (only what exists: bubblewrap can't protect a missing path).
 			...protect.filter((p) => existsSync(p)).flatMap((p) => ["--ro-bind", p, p]),
 		];
-		if (appData) {
-			// By path, placed after the masks: the app-data root is the engine's, so nothing contained can put a link in
-			// its place, and the MCP client that starts a backend can't hand it extra file descriptors.
-			appDataBind = ["--dir", appData, "--bind", appData, appData];
-		}
+		// By engine-owned paths, placed after every mask. The untrusted process cannot replace these names, and app
+		// backends cannot hand the launcher extra file descriptors.
+		engineWriteBinds = engineWrite.flatMap((path) => ["--dir", path, "--bind", path, path]);
 	} catch (error) {
 		for (const fd of held) closeSync(fd);
 		throw error;
@@ -458,7 +510,7 @@ export function contained(file: string, args: string[], options: { writable: str
 	return {
 		file: trustedBwrap() ?? "/usr/bin/bwrap",
 		// Credential masks are mounted after every project-derived bind, so no later bind can uncover them.
-		args: ["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--tmpfs", "/run", ...binds, ...hidden, ...appDataBind, ...sealed, "--unshare-all", ...net, "--die-with-parent", "--new-session", ...(syncFd === undefined ? [] : ["--sync-fd", String(syncFd)]), "--", file, ...args],
+		args: ["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--tmpfs", "/run", ...binds, ...trustedProtect.filter((path) => existsSync(path)).flatMap((path) => ["--ro-bind", path, path]), ...hidden, ...engineWriteBinds, ...gitProtect.filter((path) => existsSync(path)).flatMap((path) => ["--ro-bind", path, path]), ...sealed, "--unshare-all", ...net, "--die-with-parent", "--new-session", ...(syncFd === undefined ? [] : ["--sync-fd", String(syncFd)]), "--", file, ...args],
 		facility,
 		...(syncFd === undefined ? {} : { syncFd }),
 		...(held.length ? { pass: [...held], release: () => held.splice(0).forEach((fd) => closeSync(fd)) } : {}),
@@ -470,6 +522,7 @@ interface GitQuarantineRecord {
 	project: string;
 	baseline: GitEntryBaseline;
 	quarantine: string;
+	moved?: GitQuarantineResult["moved"];
 }
 
 const activeGitQuarantines = new Set<string>();
@@ -486,10 +539,9 @@ export function gitQuarantineFolder(root: string, home = labHome()): string {
 	return checkedGitQuarantineFolder(root, true, home)!;
 }
 
-function verifyGitQuarantineFolder(project: string, path: string, device: bigint, proveRename: boolean): string {
+function verifyGitQuarantineFolder(path: string, device: bigint): string {
 	const held = holdPrivateFolder(path, device);
 	closeSync(held);
-	if (proveRename) proveGitQuarantineRename(project, path);
 	return path;
 }
 
@@ -504,7 +556,7 @@ function checkedGitQuarantineFolder(root: string, create: boolean, home = labHom
 	try {
 		if (!sibling) throw new Error("the project is a filesystem root");
 		// An existing entry is never a reason to fall back, including a dangling link or an unsafe directory.
-		if (lstatSync(sibling, { throwIfNoEntry: false })) return verifyGitQuarantineFolder(project, sibling, projectStat.dev, false);
+		if (lstatSync(sibling, { throwIfNoEntry: false })) return verifyGitQuarantineFolder(sibling, projectStat.dev);
 		if (create) {
 			let made = false;
 			try {
@@ -512,11 +564,11 @@ function checkedGitQuarantineFolder(root: string, create: boolean, home = labHom
 				made = true;
 			} catch (error) {
 				const code = (error as NodeJS.ErrnoException).code;
-				if (code === "EEXIST") return verifyGitQuarantineFolder(project, sibling, projectStat.dev, false);
+				if (code === "EEXIST") return verifyGitQuarantineFolder(sibling, projectStat.dev);
 				if (!["EACCES", "EPERM", "EROFS"].includes(code ?? "") || lstatSync(sibling, { throwIfNoEntry: false })) throw error;
 				siblingReason = (error as Error).message;
 			}
-			if (made) return verifyGitQuarantineFolder(project, sibling, projectStat.dev, false);
+			if (made) return verifyGitQuarantineFolder(sibling, projectStat.dev);
 		}
 	} catch (error) {
 		throw new Error(`EnrichedLab could not verify its private .git quarantine, so no contained command ran. same-filesystem sibling: ${(error as Error).message}`);
@@ -531,9 +583,7 @@ function checkedGitQuarantineFolder(root: string, create: boolean, home = labHom
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
 		}
-		// Equal device numbers do not prove that rename works across two bind mounts. Exercise the exact direction
-		// cleanup will use, then move the empty probe back before accepting this fallback.
-		return verifyGitQuarantineFolder(project, fallback, projectStat.dev, true);
+		return verifyGitQuarantineFolder(fallback, projectStat.dev);
 	} catch (error) {
 		throw new Error(`EnrichedLab could not verify its private .git quarantine, so no contained command ran. same-filesystem sibling: ${siblingReason}; per-user fallback: ${(error as Error).message}`);
 	}
@@ -551,17 +601,20 @@ function readGitQuarantineRecord(file: string, project?: string): GitQuarantineR
 	}
 	const record = value as Partial<GitQuarantineRecord>;
 	const entries = record.baseline?.entries;
+	const validRelative = (path: unknown): path is string => typeof path === "string" && path.split("/").every((part) => part && part !== "." && part !== "..");
 	const validEntries = Array.isArray(entries) && entries.every((item) =>
 		Array.isArray(item)
 		&& item.length === 2
-		&& typeof item[0] === "string"
-		&& item[0].split("/").every((part) => part && part !== "." && part !== "..")
+		&& validRelative(item[0])
 		&& item[0].split("/").at(-1)?.toLowerCase() === ".git"
 		&& typeof item[1] === "string"
 		&& /^\d+:\d+$/.test(item[1])
 	);
 	const validQuarantine = typeof record.quarantine === "string" && isAbsolute(record.quarantine) && typeof record.project === "string" && !pathAtOrBelow(record.quarantine, record.project);
-	if (record.version !== 1 || typeof record.project !== "string" || !isAbsolute(record.project) || (project !== undefined && record.project !== project) || typeof record.baseline?.root !== "string" || !/^\d+:\d+$/.test(record.baseline.root) || !validEntries || !validQuarantine) {
+	const validMoved = record.moved === undefined || (Array.isArray(record.moved) && record.moved.every((move) =>
+		move && validRelative(move.from) && move.from.split("/").at(-1)?.toLowerCase() === ".git" && typeof move.to === "string" && dirname(move.to) === record.quarantine && /^git-[a-f0-9]{24}$/.test(basename(move.to))
+	));
+	if (record.version !== 1 || typeof record.project !== "string" || !isAbsolute(record.project) || (project !== undefined && record.project !== project) || typeof record.baseline?.root !== "string" || !/^\d+:\d+$/.test(record.baseline.root) || !validEntries || !validQuarantine || !validMoved) {
 		throw new Error("the cleanup journal is invalid");
 	}
 	return record as GitQuarantineRecord;
@@ -569,7 +622,8 @@ function readGitQuarantineRecord(file: string, project?: string): GitQuarantineR
 
 function locateGitQuarantineRecord(project: string, home: string): { marker: string; record?: GitQuarantineRecord } {
 	const direct = gitQuarantineMarker(project, home);
-	if (existsSync(direct)) return { marker: direct, record: readGitQuarantineRecord(direct, project) };
+	// existsSync hides access and lookup errors as absence. Only ENOENT may mean there is no pending journal.
+	if (lstatSync(direct, { throwIfNoEntry: false })) return { marker: direct, record: readGitQuarantineRecord(direct, project) };
 	const current = statSync(project, { bigint: true, throwIfNoEntry: false });
 	if (!current) return { marker: direct };
 	const identity = `${current.dev}:${current.ino}`;
@@ -578,7 +632,8 @@ function locateGitQuarantineRecord(project: string, home: string): { marker: str
 	let names: string[];
 	try {
 		names = readdirSync(directory, { encoding: "utf8" });
-	} catch {
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 		return { marker: direct };
 	}
 	for (const name of names.filter((name) => name.endsWith(".json"))) {
@@ -628,15 +683,15 @@ export function recoverGitQuarantine(root: string, home = labHome()): GitRecover
 	try {
 		if (pathAtOrBelow(record.quarantine, project)) throw new Error("the recorded quarantine is now inside the project");
 		const projectStat = statSync(project, { bigint: true });
-		// A pending pass stays bound to the journaled destination and proves that destination again before touching
-		// attacker-written metadata. Mount topology may have changed since the command started.
-		const quarantine = verifyGitQuarantineFolder(project, record.quarantine, projectStat.dev, true);
+		// A pending pass stays bound to the journaled destination. Every real rename is the cross-mount proof.
+		const quarantine = verifyGitQuarantineFolder(record.quarantine, projectStat.dev);
 		held = holdGitEntries(project, GIT_SCAN_MAX, GIT_SCAN_DEPTH, record.baseline, quarantine);
-		const result = held.quarantine(true);
+		const prior = [...(record.moved ?? [])];
+		const result = held.quarantine(true, (move) => appendGitQuarantineMove(marker, record, move));
 		if (result.error) throw new Error(result.error);
 		const removeError = removeGitQuarantineMarker(marker);
 		if (removeError) throw new Error(removeError);
-		return { moved: result.moved };
+		return { moved: [...prior, ...result.moved] };
 	} catch (error) {
 		throw new Error(`A prior contained command left .git cleanup pending for this project. EnrichedLab retried the anchored quarantine before this launch, but it could not finish: ${(error as Error).message} No contained command ran.`);
 	} finally {
@@ -657,14 +712,28 @@ function writeGitQuarantineRecord(file: string, record: GitQuarantineRecord): vo
 	}
 }
 
+/** Persist every completed move before the pass attempts another item. */
+function appendGitQuarantineMove(file: string, record: GitQuarantineRecord, move: GitQuarantineResult["moved"][number]): void {
+	record.moved = [...(record.moved ?? []), move];
+	const directory = dirname(file);
+	const temporary = join(directory, `.${basename(file)}.${process.pid}-${randomBytes(6).toString("hex")}.tmp`);
+	try {
+		writeFileSync(temporary, `${JSON.stringify(record)}\n`, { encoding: "utf8", flag: "wx", mode: 0o600 });
+		renameSync(temporary, file);
+	} finally {
+		rmSync(temporary, { force: true });
+	}
+}
+
 function guardedGitEntries(root: string, home = labHome()): ReturnType<typeof holdGitEntries> & { recovered: GitRecovery } {
 	const project = real(root);
 	const marker = gitQuarantineMarker(project, home);
 	const recovered = recoverGitQuarantine(project, home);
 	const quarantine = gitQuarantineFolder(project, home);
 	const held = holdGitEntries(project, GIT_SCAN_MAX, GIT_SCAN_DEPTH, undefined, quarantine);
+	const record: GitQuarantineRecord = { version: 1, project, baseline: held.baseline, quarantine, moved: [] };
 	try {
-		writeGitQuarantineRecord(marker, { version: 1, project, baseline: held.baseline, quarantine });
+		writeGitQuarantineRecord(marker, record);
 		activeGitQuarantines.add(marker);
 	} catch (error) {
 		held.release();
@@ -675,7 +744,7 @@ function guardedGitEntries(root: string, home = labHome()): ReturnType<typeof ho
 		...held,
 		recovered,
 		quarantine(isFinal = true) {
-			const result = held.quarantine(isFinal);
+			const result = held.quarantine(isFinal, (move) => appendGitQuarantineMove(marker, record, move));
 			if (!isFinal || final) return result;
 			final = true;
 			activeGitQuarantines.delete(marker);
@@ -938,12 +1007,15 @@ export class LocalWorkspace implements Workspace {
 	}
 
 	async write(path: string, data: string | Buffer, options: { outside?: boolean } = {}): Promise<void> {
-		if (process.platform === "linux") recoverGitQuarantine(this.root);
-		if (this.gitPath(this.lexical(path))) throw new Error(`${this.display(path)} has a .git path component; EnrichedLab doesn't edit repository metadata.`);
+		const lexical = this.lexical(path);
+		if (this.gitPath(lexical)) throw new Error(`${this.display(path)} has a .git path component; EnrichedLab doesn't edit repository metadata.`);
+		if (trustedWritePath(lexical)) throw new Error(`${this.display(path)} is trusted engine or Git configuration; EnrichedLab never changes it through a project file write.`);
 		const full = this.open(path);
 		// Where it leads now, links followed once, judged before anything is made: a link changed since the decision
 		// isn't followed out of the project.
 		const real = physical(full);
+		if (trustedWritePath(real)) throw new Error(`${this.display(full)} is trusted engine or Git configuration; EnrichedLab never changes it through a project file write.`);
+		if (process.platform === "linux") recoverGitQuarantine(this.root);
 		const home = physical(this.root);
 		const rest = relative(home, real);
 		if (!options.outside && (rest.startsWith("..") || isAbsolute(rest))) throw new Error(`${this.display(full)} now leads outside the project (a link may have moved); nothing was written.`);

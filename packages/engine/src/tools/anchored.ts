@@ -6,7 +6,7 @@
 
 import { CString, dlopen, FFIType, toArrayBuffer, type Pointer } from "bun:ffi";
 import { randomBytes } from "node:crypto";
-import { chmodSync, closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, rmdirSync, rmSync } from "node:fs";
+import { chmodSync, closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, rmdirSync, rmSync } from "node:fs";
 import { dirname, isAbsolute, join, sep } from "node:path";
 import { getSystemErrorName } from "node:util";
 
@@ -138,7 +138,7 @@ export interface HeldGitEntries {
 	paths: string[];
 	baseline: GitEntryBaseline;
 	quarantinePath: string;
-	quarantine(final?: boolean): GitQuarantineResult;
+	quarantine(final?: boolean, onMove?: (move: GitQuarantineResult["moved"][number]) => void): GitQuarantineResult;
 	release(): void;
 }
 
@@ -157,75 +157,6 @@ export function holdPrivateFolder(path: string, device?: bigint): number {
 		lib().close(held);
 		throw error;
 	}
-}
-
-/** Prove that a later anchored move from this project into a fallback quarantine can cross the same mount boundary. */
-export function proveGitQuarantineRename(project: string, quarantinePath: string): void {
-	if (process.platform !== "linux") throw new Error("Git quarantine rename probes are for Linux.");
-	const projectRoot = holdFolder(project);
-	const projectStat = fstatSync(projectRoot, { bigint: true });
-	const originalMode = Number(projectStat.mode & 0o7777n);
-	const changedMode = (originalMode & 0o700) !== 0o700;
-	let quarantineRoot: number;
-	try {
-		quarantineRoot = holdPrivateFolder(quarantinePath, projectStat.dev);
-	} catch (error) {
-		lib().close(projectRoot);
-		throw error;
-	}
-	const errno = new Int32Array(toArrayBuffer(lib().__errno_location(), 0, 4));
-	const reason = () => {
-		const code = errno[0];
-		try {
-			return `${getSystemErrorName(-code)} (errno ${code})`;
-		} catch {
-			return `errno ${code}`;
-		}
-	};
-	let probe = "";
-	let heldBy: number | undefined;
-	let failure: Error | undefined;
-	try {
-		// Recovery must still be possible when the contained command removed owner access from the project root.
-		if (changedMode) chmodSync(`/proc/self/fd/${projectRoot}`, originalMode | 0o700);
-		for (let attempt = 0; attempt < 8; attempt++) {
-			probe = `.enrichedlab-rename-probe-${randomBytes(12).toString("hex")}`;
-			errno[0] = 0;
-			if (lib().mkdirat(projectRoot, c(probe), 0o700) === 0) {
-				heldBy = projectRoot;
-				break;
-			}
-			if (errno[0] !== 17) throw new Error(`the rename probe could not be created in the project: ${reason()}`);
-		}
-		if (heldBy === undefined) throw new Error("the rename probe could not choose an unused name in the project");
-		errno[0] = 0;
-		if (lib().renameat(projectRoot, c(probe), quarantineRoot, c(probe)) !== 0) throw new Error(`the rename probe could not move into the fallback quarantine: ${reason()}`);
-		heldBy = quarantineRoot;
-		errno[0] = 0;
-		if (lib().renameat(quarantineRoot, c(probe), projectRoot, c(probe)) !== 0) throw new Error(`the rename probe could not move back into the project: ${reason()}`);
-		heldBy = projectRoot;
-	} catch (error) {
-		failure = error as Error;
-	} finally {
-		if (heldBy !== undefined) {
-			errno[0] = 0;
-			if (lib().unlinkat(heldBy, c(probe), AT_REMOVEDIR) !== 0) {
-				const cleanup = `the rename probe could not be removed: ${reason()}`;
-				failure = new Error(failure ? `${failure.message}; ${cleanup}` : cleanup);
-			}
-		}
-		if (changedMode) {
-			try {
-				chmodSync(`/proc/self/fd/${projectRoot}`, originalMode);
-			} catch (error) {
-				const restore = `the rename probe could not restore the project's mode: ${(error as Error).message}`;
-				failure = new Error(failure ? `${failure.message}; ${restore}` : restore);
-			}
-		}
-		lib().close(projectRoot);
-		lib().close(quarantineRoot);
-	}
-	if (failure) throw failure;
 }
 
 /**
@@ -258,6 +189,24 @@ export function holdGitEntries(path: string, maxEntries = 50_000, maxDepth = 64,
 		released = true;
 	};
 	const errno = new Int32Array(toArrayBuffer(lib().__errno_location(), 0, 4));
+	const mountId = (fd: number, relative: string): string => {
+		let info: string;
+		try {
+			info = readFileSync(`/proc/self/fdinfo/${fd}`, "utf8");
+		} catch (error) {
+			throw new Error(`Couldn't read the mount identity of ${relative || "."} during the .git scan: ${(error as Error).message}`);
+		}
+		const id = /^mnt_id:\s*(\d+)$/m.exec(info)?.[1];
+		if (!id) throw new Error(`Couldn't read the mount identity of ${relative || "."} during the .git scan.`);
+		return id;
+	};
+	let rootMount: string;
+	try {
+		rootMount = mountId(root, "");
+	} catch (error) {
+		release();
+		throw error;
+	}
 	const walk = (visit: (dir: number, name: string, relative: string) => void, final = false) => {
 		if (released) throw new Error("The project folder is no longer held.");
 		let seen = 0;
@@ -296,7 +245,12 @@ export function holdGitEntries(path: string, maxEntries = 50_000, maxDepth = 64,
 					const child = lib().openat(dir, c(name), LINUX_O_PATH | constants.O_NOFOLLOW | LINUX_O_CLOEXEC, 0);
 					if (child < 0) throw new Error(`Couldn't check ${next} during the .git scan.`);
 					try {
-						if (fstatSync(child).isDirectory()) {
+						const childStat = fstatSync(child, { bigint: true });
+						if (childStat.isDirectory()) {
+							const childMount = mountId(child, next);
+							if (childStat.dev !== rootStat.dev || childMount !== rootMount) {
+								throw new Error(`The .git scan refused to cross the mount boundary at ${next}: its device or mount ID differs from the project root.`);
+							}
 							if (depth >= maxDepth) throw new Error(`The project is deeper than ${maxDepth} folders; .git protection couldn't be completed.`);
 							descend(child, next, depth + 1);
 						}
@@ -341,7 +295,7 @@ export function holdGitEntries(path: string, maxEntries = 50_000, maxDepth = 64,
 		baseline: { root: rootIdentity, entries: [...initial] },
 		quarantinePath,
 		release,
-		quarantine(final = true) {
+		quarantine(final = true, onMove) {
 			const moved: { from: string; to: string }[] = [];
 			try {
 				walk((dir, name, relative) => {
@@ -351,8 +305,19 @@ export function holdGitEntries(path: string, maxEntries = 50_000, maxDepth = 64,
 					// renameat2 never follows the final entry, even if it is a symlink. NOREPLACE prevents any loss of
 					// existing data at the destination. The destination is engine-owned and outside the project.
 					errno[0] = 0;
-					if (lib().renameat2(dir, c(name), quarantineRoot, c(blocked), 1) !== 0) throw new Error(`Couldn't move aside ${relative} (errno ${errno[0]}).`);
-					moved.push({ from: relative, to: join(quarantinePath, blocked) });
+					if (lib().renameat2(dir, c(name), quarantineRoot, c(blocked), 1) !== 0) {
+						const code = errno[0];
+						let name = `errno ${code}`;
+						try {
+							name = `${getSystemErrorName(-code)} (errno ${code})`;
+						} catch {
+							// Keep the numeric errno when this runtime doesn't know its name.
+						}
+						throw new Error(`Couldn't move aside ${relative}: ${name}.`);
+					}
+					const move = { from: relative, to: join(quarantinePath, blocked) };
+					moved.push(move);
+					onMove?.(move);
 				}, final);
 				return { moved };
 			} catch (error) {
