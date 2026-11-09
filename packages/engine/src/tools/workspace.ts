@@ -833,8 +833,9 @@ export function recoverGitQuarantine(root: string, home = labHome()): GitRecover
 		const pending = new Set(pendingGitQuarantineIntents(record).map(quarantineMoveKey));
 		for (const move of record.intents) {
 			// Done records are checked too. Recovery never reports a mapping without reconciling its held identities.
-			held.recover(move);
-			if (pending.has(quarantineMoveKey(move))) appendGitQuarantineEvent(marker, record, { event: "done", ...move });
+			const needsDone = pending.has(quarantineMoveKey(move));
+			held.recover(move, !needsDone);
+			if (needsDone) appendGitQuarantineEvent(marker, record, { event: "done", ...move });
 		}
 		const journal = gitQuarantineJournal(marker, record);
 		const result = held.quarantine(true, journal);

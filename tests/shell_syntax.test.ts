@@ -3,7 +3,7 @@
 
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { chmodSync, chownSync, closeSync, constants, existsSync, fsyncSync, linkSync, lstatSync, mkdirSync, readdirSync, mkdtempSync, openSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync, writeSync } from "node:fs";
+import { chmodSync, chownSync, closeSync, constants, existsSync, fsyncSync, linkSync, lstatSync, mkdirSync, readdirSync, mkdtempSync, openSync, readFileSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, symlinkSync, writeFileSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import type { LabConfig } from "../packages/engine/src/config.ts";
@@ -858,6 +858,111 @@ describe("round 6: containment is the boundary", () => {
 			expect(existsSync(marker)).toBe(false);
 		} finally {
 			held?.release();
+			rmSync(base, { recursive: true, force: true });
+		}
+	});
+
+	test.skipIf(process.platform !== "linux")("recovery accepts a durable done move after its empty source parent was removed", async () => {
+		const base = realpathSync(mkdtempSync(join(tmpdir(), "el-git-done-missing-parent-")));
+		const project = join(base, "project");
+		const home = join(base, "state");
+		const savedHome = process.env.EL_HOME;
+		mkdirSync(project);
+		let held: ReturnType<typeof holdGitEntries> | undefined;
+		try {
+			process.env.EL_HOME = home;
+			const quarantine = gitQuarantineFolder(project, home);
+			held = holdGitEntries(project, 50_000, 64, undefined, quarantine);
+			const marker = gitQuarantineMarker(project, home);
+			mkdirSync(dirname(marker), { recursive: true, mode: 0o700 });
+			writeFileSync(marker, `${JSON.stringify({ version: 2, project, baseline: held.baseline, quarantine })}\n`, { mode: 0o600 });
+			mkdirSync(join(project, "work", ".git"), { recursive: true });
+			writeFileSync(join(project, "work", ".git", "config"), "survives\n");
+			const append = (event: Record<string, unknown>) => {
+				const fd = openSync(marker, constants.O_WRONLY | constants.O_APPEND);
+				try {
+					writeSync(fd, `${JSON.stringify(event)}\n`);
+					fsyncSync(fd);
+				} finally {
+					closeSync(fd);
+				}
+			};
+			let move: { item: string; from: string; to: string } | undefined;
+			const result = held.quarantine(true, {
+				intent: (intent) => append({ event: "intent", ...intent }),
+				done: (done) => {
+					move = done;
+					append({ event: "done", ...done });
+					throw new Error("simulated crash after done fsync");
+				},
+			});
+			expect(result.error).toContain("simulated crash");
+			if (!move) throw new Error("the quarantine did not move the nested .git entry");
+			rmdirSync(join(project, "work"));
+			expect(existsSync(join(project, "work"))).toBe(false);
+			held.release();
+			held = undefined;
+
+			const recovered = recoverGitQuarantine(project, home);
+			expect(recovered.moved).toEqual([{ from: "work/.git", to: move.to }]);
+			expect(readFileSync(join(move.to, "config"), "utf8")).toBe("survives\n");
+			expect(existsSync(marker)).toBe(false);
+			await new LocalWorkspace(project).write("unblocked.txt", "ok");
+			expect(readFileSync(join(project, "unblocked.txt"), "utf8")).toBe("ok");
+		} finally {
+			held?.release();
+			if (savedHome === undefined) delete process.env.EL_HOME;
+			else process.env.EL_HOME = savedHome;
+			rmSync(base, { recursive: true, force: true });
+		}
+	});
+
+	test.skipIf(process.platform !== "linux")("recovery refuses an unfinished move after its empty source parent was removed", async () => {
+		const base = realpathSync(mkdtempSync(join(tmpdir(), "el-git-intent-missing-parent-")));
+		const project = join(base, "project");
+		const home = join(base, "state");
+		const savedHome = process.env.EL_HOME;
+		mkdirSync(project);
+		let held: ReturnType<typeof holdGitEntries> | undefined;
+		try {
+			process.env.EL_HOME = home;
+			const quarantine = gitQuarantineFolder(project, home);
+			held = holdGitEntries(project, 50_000, 64, undefined, quarantine);
+			const marker = gitQuarantineMarker(project, home);
+			mkdirSync(dirname(marker), { recursive: true, mode: 0o700 });
+			writeFileSync(marker, `${JSON.stringify({ version: 2, project, baseline: held.baseline, quarantine })}\n`, { mode: 0o600 });
+			mkdirSync(join(project, "work", ".git"), { recursive: true });
+			writeFileSync(join(project, "work", ".git", "config"), "survives\n");
+			let move: { item: string; from: string; to: string } | undefined;
+			const result = held.quarantine(true, {
+				intent: (intent) => {
+					move = intent;
+					const fd = openSync(marker, constants.O_WRONLY | constants.O_APPEND);
+					try {
+						writeSync(fd, `${JSON.stringify({ event: "intent", ...intent })}\n`);
+						fsyncSync(fd);
+					} finally {
+						closeSync(fd);
+					}
+				},
+				done: () => { throw new Error("simulated crash before done append"); },
+			});
+			expect(result.error).toContain("simulated crash");
+			if (!move) throw new Error("the quarantine did not move the nested .git entry");
+			rmdirSync(join(project, "work"));
+			expect(existsSync(join(project, "work"))).toBe(false);
+			held.release();
+			held = undefined;
+
+			expect(() => recoverGitQuarantine(project, home)).toThrow("source directory");
+			expect(existsSync(marker)).toBe(true);
+			await expect(new LocalWorkspace(project).write("blocked.txt", "bad")).rejects.toThrow("cleanup pending");
+			expect(existsSync(join(project, "blocked.txt"))).toBe(false);
+			expect(readFileSync(join(move.to, "config"), "utf8")).toBe("survives\n");
+		} finally {
+			held?.release();
+			if (savedHome === undefined) delete process.env.EL_HOME;
+			else process.env.EL_HOME = savedHome;
 			rmSync(base, { recursive: true, force: true });
 		}
 	});

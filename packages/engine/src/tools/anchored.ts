@@ -155,8 +155,8 @@ export interface HeldGitEntries {
 	paths: string[];
 	baseline: GitEntryBaseline;
 	quarantinePath: string;
-	/** Reconcile a durable intent left without its durable done record. */
-	recover(move: GitQuarantineIntent): { moved: boolean };
+	/** Reconcile a durable intent; durableDone confirms its post-move fsyncs and done append completed. */
+	recover(move: GitQuarantineIntent, durableDone?: boolean): { moved: boolean };
 	quarantine(final?: boolean, journal?: GitQuarantineJournal): GitQuarantineResult;
 	release(): void;
 }
@@ -356,7 +356,7 @@ export function holdGitEntries(path: string, maxEntries = 50_000, maxDepth = 64,
 		syncDirectory(source, "source", move);
 		syncDirectory(quarantineRoot, "quarantine", move);
 	};
-	const recover = (move: GitQuarantineIntent): { moved: boolean } => {
+	const recover = (move: GitQuarantineIntent, durableDone = false): { moved: boolean } => {
 		if (dirname(move.to) !== quarantinePath || !/^git-[a-f0-9]{24}$/.test(move.to.split(sep).at(-1) ?? "")) throw new Error(`The recorded quarantine destination ${move.to} is invalid.`);
 		const source = sourceParent(move.from);
 		let sourceIdentity: string | undefined;
@@ -366,7 +366,9 @@ export function holdGitEntries(path: string, maxEntries = 50_000, maxDepth = 64,
 			const targetIdentity = identityIfPresent(quarantineRoot, targetName, move.to)?.id;
 			if (targetIdentity === move.item) {
 				if (sourceIdentity === move.item) throw new Error(`Both ${move.from} and ${move.to} name the recorded item; cleanup cannot choose between them.`);
-				syncMove(source.dir, move);
+				// Done followed both directory fsyncs. If the source ancestry is now absent, only the held destination remains to sync.
+				if (source.dir === undefined && durableDone) syncDirectory(quarantineRoot, "quarantine", move);
+				else syncMove(source.dir, move);
 				return { moved: false };
 			}
 			if (targetIdentity !== undefined) throw new Error(`${move.to} exists with a different identity.`);
