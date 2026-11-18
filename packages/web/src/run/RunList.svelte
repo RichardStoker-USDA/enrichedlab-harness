@@ -1,7 +1,6 @@
 <script lang="ts">
 	import { onMount } from "svelte";
-	import { z } from "zod";
-	import { runSchema, type Run } from "./contract.ts";
+	import { runPage, type Run } from "./contract.ts";
 	let runs = $state<Run[]>([]), after = $state<string | null>(null), error = $state(""), loading = $state(true);
 	const request = new AbortController();
 	async function more() {
@@ -10,7 +9,7 @@
 			const qs = new URLSearchParams({ limit:"50" }); if (after) qs.set("after", after);
 			const response = await fetch("/v1/runs?"+qs, { signal:request.signal, credentials:"same-origin", redirect:"error", cache:"no-store" });
 			if (!response.ok) throw Error();
-			const page = z.object({runs:z.array(runSchema), next:z.string().nullable()}).parse(await response.json());
+			const page = runPage.parse(await response.json());
 			const seen = new Set(runs.map(r => r.id));
 			runs = [...runs, ...page.runs.filter(r => !seen.has(r.id))]; after = page.next;
 		} catch { if (!request.signal.aborted) error = "This lab could not return your runs."; }

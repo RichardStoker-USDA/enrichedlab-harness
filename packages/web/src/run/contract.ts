@@ -14,6 +14,29 @@ export const runSchema = z.object({
 	}).optional(),
 });
 export type Run = z.infer<typeof runSchema>;
+const listedRuns = z.array(runSchema).max(100);
+const cursor = z.string().max(100).nullable();
+export const runPage = z.union([
+	z.object({ runs: listedRuns, next: cursor }),
+	z.object({ data: listedRuns, next: cursor.optional() }).transform(page => ({ runs: page.data, next: page.next ?? null })),
+]);
+
+type ReadRequest = (url: string, options: RequestInit) => Promise<Response>;
+export async function readRunLog(base: string, options: RequestInit, read: ReadRequest = fetch) {
+	const response = await read(base + "/log", options);
+	if (!response.ok) throw Error("The lab could not open this run for your account.");
+	return z.array(eventSchema).max(20000).parse(await response.json());
+}
+
+export async function readRunSnapshot(id: string, options: RequestInit, read: ReadRequest = fetch) {
+	const base = runPath(id);
+	const response = await read(base, options);
+	if (!response.ok) throw Error("The lab could not open this run for your account.");
+	const summary = runSchema.parse(await response.json());
+	if (summary.id !== id) throw Error("The lab returned another run.");
+	// A terminal summary includes all prior deliveries. Read its log afterwards.
+	return { summary, entries: await readRunLog(base, options, read) };
+}
 export const artifactSchema = z.object({
 	name: label, uri: z.string(), sha256: digest, mime: z.string(), bytes: z.number().int().nonnegative(),
 });

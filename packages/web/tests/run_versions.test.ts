@@ -1,10 +1,34 @@
 import { expect, test } from "bun:test";
-import { budgetPath, eventSchema, project, runSchema } from "../src/run/contract.ts";
+import { budgetPath, eventSchema, project, readRunSnapshot, runPage, runSchema } from "../src/run/contract.ts";
 const run = runSchema.parse({id:"test",session:"test",status:"running",title:"Fixture"});
 const event = (seq: number, type: string, more: object={}) => eventSchema.parse({
 	v:1,seq,time:"2026-11-18T08:00:00Z",kind:"x-campaign-event",data:{type,...more},
 });
 const delivered = {milestone:"Manifest",receipt:"a".repeat(64),artifacts:[]};
+test("a terminal summary is followed by a fresh log with its last delivery", async () => {
+	const requested: string[] = [];
+	let finish!: () => void;
+	const committed = new Promise<void>(resolve => { finish = resolve; });
+	const log: ReturnType<typeof event>[] = [];
+	const read = async (path: string) => {
+		requested.push(path);
+		if (path.endsWith("/log")) return Response.json(log);
+		await committed;
+		return Response.json({...run, status:"finished"});
+	};
+	const pending = readRunSnapshot(run.id, {}, read);
+	expect(requested).toEqual(["/v1/runs/test"]);
+	log.push(event(1, "delivery.published", {...delivered,n:1}));
+	finish();
+	const snapshot = await pending;
+	expect(project(snapshot.summary, snapshot.entries).versions.map(v => v.n)).toEqual([1]);
+	expect(requested).toEqual(["/v1/runs/test","/v1/runs/test/log"]);
+});
+test("the site and broker run lists keep the returned cursor", () => {
+	expect(runPage.parse({ data:[run] })).toEqual({ runs:[run],next:null });
+	expect(runPage.parse({ runs:[run],next:"after" })).toEqual({ runs:[run],next:"after" });
+	expect(runPage.safeParse({ data:[{id:"missing"}] }).success).toBe(false);
+});
 test("ordered versions and person steering are reconstructed from the log", () => {
 	const actual=project(run,[event(1,"delivery.published",{...delivered,n:1}),event(2,"delivery.published",{...delivered,n:2}),
 		event(3,"feedback.received",{text:"Check the manifest"}),event(4,"budget.changed",{minutes:30}),event(5,"stop.requested")]);

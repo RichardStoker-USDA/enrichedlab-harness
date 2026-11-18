@@ -2,7 +2,7 @@
 	import { onMount } from "svelte";
 	import { z } from "zod";
 	import Artifact from "./Artifact.svelte";
-	import { budgetPath, eventSchema, project, runPath, runSchema, type Run, type RunEvent, type View } from "./contract.ts";
+	import { budgetPath, eventSchema, project, readRunLog, readRunSnapshot, runPath, runSchema, type Run, type RunEvent, type View } from "./contract.ts";
 	let { id }: { id: string } = $props();
 	let run = $state<Run>(), view = $state<View>(), error = $state(""), connection = $state("");
 	let action = $state<"messages" | "budget" | "stop" | undefined>(), text = $state(""), minutes = $state<number>();
@@ -28,15 +28,12 @@
 			try {
 				const base = runPath(id);
 				const options: RequestInit = { signal:request.signal, credentials:"same-origin", cache:"no-store", redirect:"error" };
-				const [summary, log] = await Promise.all([fetch(base, options), fetch(base+"/log", options)]);
-				if (!summary.ok || !log.ok) throw Error("The lab could not open this run for your account.");
-				const current = runSchema.parse(await summary.json());
-				if (current.id !== id) throw Error("The lab returned another run.");
-				entries = z.array(eventSchema).max(20000).parse(await log.json());
+				const snapshot = await readRunSnapshot(id, options);
+				const current = snapshot.summary;
+				entries = snapshot.entries;
 				const initial = project(current, entries);
 				if (request.signal.aborted) return;
 				run = current; view = initial;
-				if (["finished","failed","stopped"].includes(current.status)) return;
 				const refresh = async () => {
 					if (refreshing || request.signal.aborted) return;
 					refreshing = true;
@@ -48,13 +45,24 @@
 						}
 						if (!reply.ok) return;
 						const latest = runSchema.parse(await reply.json());
-						if (request.signal.aborted || latest.id !== id) return;
+						if (request.signal.aborted) return;
+						if (latest.id !== id) {
+							stream?.close(); clearInterval(refreshTimer); entries=[]; run=undefined; view=undefined;
+							error="The lab returned another run."; return;
+						}
+						if (["finished","failed","stopped"].includes(latest.status) && !terminal) {
+							const finalEntries = await readRunLog(base, options);
+							if (request.signal.aborted) return;
+							entries = finalEntries;
+							stream?.close(); connection = "";
+						}
 						run = latest; view = project(latest, entries);
 						if (["finished","failed","stopped"].includes(latest.status)) action = undefined;
 					} catch { /* The event stream still retries on a temporary network failure. */ }
 					finally { refreshing = false; }
 				};
 				refreshTimer = setInterval(() => void refresh(), 30000);
+				if (["finished","failed","stopped"].includes(current.status)) return;
 				stream = new EventSource(base+"/events");
 				stream.onopen = () => { connection = ""; void refresh(); };
 				stream.onerror = () => { connection = "Reconnecting to the run…"; };
