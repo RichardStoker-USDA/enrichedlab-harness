@@ -172,6 +172,7 @@
 {/if}
 <nav class="rail" class:open class:hidden={!lab.sidebar} aria-label="Places and sessions" inert={narrow && !open}>
 	<div class="toolbar">
+		{#if !window.labDesktop}<a class="runs-link" href="/runs">Research runs</a>{/if}
 		<span class="spacer"></span>
 		<button class="icon-btn wide-only" onclick={() => (lab.sidebar = false)} title={`Hide the sidebar (${mac ? "⌃⌘S" : "Ctrl+Shift+S"})`} aria-label="Hide the sidebar">
 			<svg viewBox="0 0 16 16"><rect x="2" y="2.5" width="12" height="11" rx="2" /><path d="M6 2.5v11" /></svg>
@@ -301,6 +302,7 @@
 </nav>
 
 <style>
+	.runs-link { display:inline-flex; align-items:center; min-height:44px; color:var(--link); font-weight:550; }
 	.rail {
 		display: flex;
 		flex-direction: column;
