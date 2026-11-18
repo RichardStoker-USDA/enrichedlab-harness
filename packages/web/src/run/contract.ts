@@ -28,6 +28,11 @@ export async function readRunLog(base: string, options: RequestInit, read: ReadR
 	return z.array(eventSchema).max(20000).parse(await response.json());
 }
 
+export async function readDeliveryView(summary: Run, options: RequestInit, read: ReadRequest = fetch) {
+	const entries = await readRunLog(runPath(summary.id), options, read);
+	return { entries, view: project(summary, entries) };
+}
+
 export async function readRunSnapshot(id: string, options: RequestInit, read: ReadRequest = fetch) {
 	const base = runPath(id);
 	const response = await read(base, options);
@@ -35,7 +40,7 @@ export async function readRunSnapshot(id: string, options: RequestInit, read: Re
 	const summary = runSchema.parse(await response.json());
 	if (summary.id !== id) throw Error("The lab returned another run.");
 	// A terminal summary includes all prior deliveries. Read its log afterwards.
-	return { summary, entries: await readRunLog(base, options, read) };
+	return { summary, ...await readDeliveryView(summary, options, read) };
 }
 export const artifactSchema = z.object({
 	name: label, uri: z.string(), sha256: digest, mime: z.string(), bytes: z.number().int().nonnegative(),

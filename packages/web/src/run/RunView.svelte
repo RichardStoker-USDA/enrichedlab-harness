@@ -2,7 +2,7 @@
 	import { onMount } from "svelte";
 	import { z } from "zod";
 	import Artifact from "./Artifact.svelte";
-	import { budgetPath, eventSchema, project, readRunLog, readRunSnapshot, runPath, runSchema, type Run, type RunEvent, type View } from "./contract.ts";
+	import { budgetPath, eventSchema, project, readDeliveryView, readRunSnapshot, runPath, runSchema, type Run, type RunEvent, type View } from "./contract.ts";
 	let { id }: { id: string } = $props();
 	let run = $state<Run>(), view = $state<View>(), error = $state(""), connection = $state("");
 	let action = $state<"messages" | "budget" | "stop" | undefined>(), text = $state(""), minutes = $state<number>();
@@ -31,9 +31,8 @@
 				const snapshot = await readRunSnapshot(id, options);
 				const current = snapshot.summary;
 				entries = snapshot.entries;
-				const initial = project(current, entries);
 				if (request.signal.aborted) return;
-				run = current; view = initial;
+				run = current; view = snapshot.view;
 				const refresh = async () => {
 					if (refreshing || request.signal.aborted) return;
 					refreshing = true;
@@ -51,10 +50,18 @@
 							error="The lab returned another run."; return;
 						}
 						if (["finished","failed","stopped"].includes(latest.status) && !terminal) {
-							const finalEntries = await readRunLog(base, options);
-							if (request.signal.aborted) return;
-							entries = finalEntries;
-							stream?.close(); connection = "";
+							try {
+								const completed = await readDeliveryView(latest, options);
+								if (request.signal.aborted) return;
+								entries = completed.entries; run = latest; view = completed.view;
+								stream?.close(); connection = ""; action = undefined;
+							} catch {
+								if (request.signal.aborted) return;
+								stream?.close(); clearInterval(refreshTimer);
+								entries = []; run = undefined; view = undefined; action = undefined;
+								error = "The final delivery log could not be verified. Reload the run to check again.";
+							}
+							return;
 						}
 						run = latest; view = project(latest, entries);
 						if (["finished","failed","stopped"].includes(latest.status)) action = undefined;

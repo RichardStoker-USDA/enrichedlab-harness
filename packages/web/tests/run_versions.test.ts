@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { budgetPath, eventSchema, project, readRunSnapshot, runPage, runSchema } from "../src/run/contract.ts";
+import { budgetPath, eventSchema, project, readDeliveryView, readRunSnapshot, runPage, runSchema } from "../src/run/contract.ts";
 const run = runSchema.parse({id:"test",session:"test",status:"running",title:"Fixture"});
 const event = (seq: number, type: string, more: object={}) => eventSchema.parse({
 	v:1,seq,time:"2026-11-18T08:00:00Z",kind:"x-campaign-event",data:{type,...more},
@@ -28,6 +28,13 @@ test("the site and broker run lists keep the returned cursor", () => {
 	expect(runPage.parse({ data:[run] })).toEqual({ runs:[run],next:null });
 	expect(runPage.parse({ runs:[run],next:"after" })).toEqual({ runs:[run],next:"after" });
 	expect(runPage.safeParse({ data:[{id:"missing"}] }).success).toBe(false);
+});
+test("an invalid final delivery never produces a terminal view", async () => {
+	const corrupt = [event(1,"delivery.published",{...delivered,n:1}),event(2,"delivery.published",{...delivered,n:1})];
+	const summary = runSchema.parse({...run,status:"finished"});
+	await expect(readDeliveryView(summary, {}, async () => Response.json(corrupt))).rejects.toThrow("Two publications");
+	const fixed = await readDeliveryView(summary, {}, async () => Response.json(corrupt.slice(0,1)));
+	expect(fixed.view.versions.map(v => v.n)).toEqual([1]);
 });
 test("ordered versions and person steering are reconstructed from the log", () => {
 	const actual=project(run,[event(1,"delivery.published",{...delivered,n:1}),event(2,"delivery.published",{...delivered,n:2}),
