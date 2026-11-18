@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onMount } from "svelte";
+	import { onMount, tick } from "svelte";
 	import { z } from "zod";
 	import Artifact from "./Artifact.svelte";
 	import { budgetPath, eventSchema, project, readDeliveryView, readRunSnapshot, runPath, runSchema, type Run, type RunEvent, type View } from "./contract.ts";
@@ -8,6 +8,8 @@
 	let action = $state<"messages" | "budget" | "stop" | undefined>(), text = $state(""), minutes = $state<number>();
 	let sending = $state(false), notice = $state(""), theme = $state("system");
 	let opened = $state<number>(), loading = $state(true);
+	let steeringForm = $state<HTMLFormElement>(), statusNotice = $state<HTMLParagraphElement>();
+	let steeringTrigger: HTMLButtonElement | undefined;
 	const terminal = $derived(!!run && ["finished", "failed", "stopped"].includes(run.status));
 	const time = (s: string) => new Intl.DateTimeFormat(undefined, { dateStyle:"medium", timeStyle:"short" }).format(new Date(s));
 	function applyTheme(value: string) {
@@ -90,10 +92,35 @@
 		void load();
 		return () => { request.abort(); clearInterval(refreshTimer); stream?.close(); };
 	});
-	function select(next: typeof action) {
-		action = action === next ? undefined : next;
+	function closeSteering() {
+		const trigger = steeringTrigger;
+		steeringTrigger = undefined;
+		action = undefined;
+		void tick().then(() => {
+			if (action) return;
+			if (trigger?.isConnected && !trigger.disabled) trigger.focus();
+			else statusNotice?.focus();
+		});
+	}
+	async function select(next: NonNullable<typeof action>, trigger: HTMLButtonElement) {
+		if (sending) return;
+		if (action === next) { closeSteering(); return; }
+		steeringTrigger = trigger;
+		action = next;
 		notice = "";
 		if (action === "budget") minutes = view?.minutes;
+		await tick();
+		if (action === next) {
+			const first = next === "stop" ? 'button[type="button"]' : "textarea, input";
+			steeringForm?.querySelector<HTMLElement>(first)?.focus();
+		}
+	}
+	function handleEscape(event: KeyboardEvent) {
+		if (event.key === "Escape" && action && !sending && !event.defaultPrevented &&
+			(event.target === steeringTrigger || (event.target instanceof Node && steeringForm?.contains(event.target)))) {
+			event.preventDefault();
+			closeSteering();
+		}
 	}
 	async function submit(event: SubmitEvent) {
 		event.preventDefault();
@@ -112,11 +139,13 @@
 				headers:{"Content-Type":"application/json"}, body:JSON.stringify(body) });
 			if (!response.ok) throw Error();
 			notice = "Request received. The run log records the change.";
-			action = undefined; text = "";
+			text = "";
+			closeSteering();
 		} catch { notice = "The change could not be confirmed. Check the event history before retrying."; }
 		finally { sending = false; }
 	}
 </script>
+<svelte:window onkeydown={handleEscape} />
 <svelte:head><title>{run?.title ?? "Research run"} · EnrichedLab</title></svelte:head>
 <main class="run-page">
 	<header><a href="/runs">Research runs</a><label>Appearance <select value={theme} onchange={e => chooseTheme(e.currentTarget.value)}>
@@ -130,19 +159,19 @@
 		{#if view.step}<section class="open-step"><h2>Open step</h2><p>{view.step}</p></section>{/if}
 		{#if !terminal}
 			<div class="controls" aria-label="Run controls">
-				{#if run["x-steering"]?.messages}<button disabled={view.stopping} aria-expanded={action==="messages"} onclick={() => select("messages")}>Add direction</button>{/if}
-				{#if budgetPath(run)}<button disabled={view.stopping} aria-expanded={action==="budget"} onclick={() => select("budget")}>Change budget{view.minutes ? " · "+view.minutes+" min" : ""}</button>{/if}
-				{#if run["x-steering"]?.stop}<button disabled={view.stopping} aria-expanded={action==="stop"} onclick={() => select("stop")}>Stop run</button>{/if}
+				{#if run["x-steering"]?.messages}<button disabled={view.stopping || sending} aria-expanded={action==="messages"} onclick={e => select("messages", e.currentTarget)}>Add direction</button>{/if}
+				{#if budgetPath(run)}<button disabled={view.stopping || sending} aria-expanded={action==="budget"} onclick={e => select("budget", e.currentTarget)}>Change budget{view.minutes ? " · "+view.minutes+" min" : ""}</button>{/if}
+				{#if run["x-steering"]?.stop}<button disabled={view.stopping || sending} aria-expanded={action==="stop"} onclick={e => select("stop", e.currentTarget)}>Stop run</button>{/if}
 			</div>
-			{#if action}<form onsubmit={submit}>
+			{#if action}<form bind:this={steeringForm} onsubmit={submit}>
 				{#if action==="messages"}<label>Direction for the next step<textarea bind:value={text} required maxlength="2000" rows="3"></textarea></label>
 				{:else if action==="budget"}<label>Run budget in minutes<input bind:value={minutes} type="number" min="1" step="1" required /></label>
 				{:else}<p>Request a stop at the next safe boundary? Delivered versions will remain available.</p>{/if}
 				<div class="controls"><button class="primary" disabled={sending}>{action==="messages"?"Send direction": action==="budget"?"Save budget":"Request stop"}</button>
-				<button type="button" disabled={sending} onclick={() => { action=undefined; }}>Cancel</button></div>
+				<button type="button" disabled={sending} onclick={closeSteering}>Cancel</button></div>
 			</form>{/if}
 		{/if}
-		<p class="notice" role="status">{notice || connection}</p>
+		<p class="notice" role="status" tabindex="-1" bind:this={statusNotice}>{notice || connection}</p>
 		<section class="versions"><h2>Delivered versions</h2>
 		{#if !view.versions.length}<p>The first version is still pending.</p>{/if}
 		{#each view.versions as version (version.n)}
