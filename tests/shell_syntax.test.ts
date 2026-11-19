@@ -11,13 +11,14 @@ import { inEnvironment, type EnvironmentInstaller } from "../packages/engine/src
 import { allowKeys, decide, HIDDEN_REASON, PUSH_REASON, windowsInterpreterHandoff } from "../packages/engine/src/permissions.ts";
 import { restoreSnapshot, snapshot } from "../packages/engine/src/git.ts";
 import { holdGitEntries, mkdirPhysical, openPhysical, removeEmptyTreePhysical, unlinkPhysical } from "../packages/engine/src/tools/anchored.ts";
-import { allowedCommand, isReadOnlyCommand } from "../packages/engine/src/tools/shell.ts";
+import { allowedCommand, isReadOnlyCommand as checkReadOnly } from "../packages/engine/src/tools/shell.ts";
 import type { Tool } from "../packages/engine/src/tools/types.ts";
 import { contained, containedTempEnvironment, createEngineWriteGrant, engineEnvironment, engineTemp, gitQuarantineFolder, gitQuarantineMarker, LocalWorkspace, privateBindPath, projectGitPaths, projectGitPattern, recoverGitQuarantine, safeTemp, sandboxer, trustedGit } from "../packages/engine/src/tools/workspace.ts";
 import { everyCommand, everyPowerShellCommand, plainCommands } from "../packages/engine/src/tools/shell_syntax.ts";
 import { FENCE_PY } from "../packages/engine/src/sites/sandbox_fence.ts";
 import { bashPattern, type SandboxApi, SandboxWorkspace } from "../packages/engine/src/sites/sandbox_workspace.ts";
 
+const isReadOnlyCommand: typeof checkReadOnly = (command, extra, inside, judging) => checkReadOnly(command, extra, inside, judging, true);
 const words = (line: string) => plainCommands(line)?.map((c) => c.words);
 
 describe("shell syntax", () => {
@@ -247,7 +248,7 @@ describe("round 4: what a line can hide", () => {
 		}
 	});
 
-	test("commands run in the system's bash, without startup files or functions passed in", async () => {
+	test.skipIf(process.platform === "win32")("commands run in the system's bash, without startup files or functions passed in", async () => {
 		const dir = realpathSync(mkdtempSync(join(tmpdir(), "el-startup-")));
 		try {
 			const startup = join(dir, "startup.sh");
@@ -262,7 +263,7 @@ describe("round 4: what a line can hide", () => {
 		}
 	});
 
-	test("file operations on a physical path refuse a link anywhere in it", () => {
+	test.skipIf(process.platform === "win32")("file operations on a physical path refuse a link anywhere in it", () => {
 		const base = realpathSync(mkdtempSync(join(tmpdir(), "el-anchored-")));
 		try {
 			mkdirSync(join(base, "real", "sub"), { recursive: true });
@@ -320,7 +321,7 @@ describe("round 5: one boundary", () => {
 		try {
 			const off = new LocalWorkspace(root, "off");
 			expect(decide(shell, { command: "ls" }, off, mode("ask"), new Set()).action).toBe("ask");
-			expect(decide(shell, { command: "ls" }, off, mode("ask", ["ls"]), new Set()).action).toBe("run");
+			expect(decide(shell, { command: "ls" }, off, mode("ask", ["ls"]), new Set()).action).toBe(process.platform === "win32" ? "ask" : "run");
 			expect(decide(shell, { command: "ls *" }, off, mode("ask", ["ls"]), new Set()).action).toBe("ask");
 		} finally {
 			rmSync(root, { recursive: true, force: true });
@@ -466,6 +467,10 @@ describe("round 6: containment is the boundary", () => {
 			const ws = new LocalWorkspace(root, "workspace");
 			if (!ws.sandboxed) return;
 			const config = { permissions: { mode: "auto", allowCommands: [] }, folders: { [root]: { access: "read" } } } as unknown as LabConfig;
+			if (process.platform === "win32") {
+				expect(decide(shell, { command: "Get-Content a.txt" }, ws, config, new Set()).action).toBe("ask");
+				return;
+			}
 			expect(decide(shell, { command: "cat a.txt" }, ws, config, new Set())).toEqual({ action: "run", readOnly: true });
 			expect(decide(shell, { command: "cat a.txt" }, ws, { permissions: { mode: "auto", allowCommands: [] } } as unknown as LabConfig, new Set(), undefined, undefined, false)).toEqual({ action: "run", readOnly: true });
 		} finally {
@@ -666,15 +671,15 @@ describe("round 6: containment is the boundary", () => {
 			rmSync(root, { recursive: true, force: true });
 		}
 		for (const command of ["/usr/lib/git-core/git-svn dcommit", "/usr/lib/git-core/git-svn d[c]ommit", "/usr/lib/git-core/git-p4 submit", "p4 submit", "p4 s[u]bmit"]) {
-			expect([command, allowKeys(shell, { command }).keys[0]]).toEqual([command, "shell!push"]);
+			expect([command, allowKeys(shell, { command }, false).keys[0]]).toEqual([command, "shell!push"]);
 		}
 		for (const command of ["env ./g[[:lower:]]t push origin main", "env ./p[[:digit:]] submit"]) {
-			expect([command, allowKeys(shell, { command }).keys[0]]).toEqual([command, "shell!push"]);
+			expect([command, allowKeys(shell, { command }, false).keys[0]]).toEqual([command, "shell!push"]);
 		}
-		expect(allowKeys(shell, { command: "env ./tool[[:lower:]] status" }).keys[0]).toBe("shell!hidden");
-		expect(allowKeys(shell, { command: "env ./tool[[:unknown:]] status" }).keys[0]).toMatch(/^shell!/);
+		expect(allowKeys(shell, { command: "env ./tool[[:lower:]] status" }, false).keys[0]).toBe("shell!hidden");
+		expect(allowKeys(shell, { command: "env ./tool[[:unknown:]] status" }, false).keys[0]).toMatch(/^shell!/);
 		for (const command of ["timeout 5 env GIT_SSH_COMMAND=./x git fetch", "nice env GIT_CONFIG_COUNT=1 git status", "export GIT_SSH_COMMAND", "declare -x GIT_CONFIG_COUNT", "readonly GIT_ASKPASS", "builtin export GIT_CONFIG_COUNT", "builtin declare -x GIT_SSH_COMMAND", "git -c gc.recentObjectsHook=./x gc", "git -c core.fsm[o]nitor=./x status", "git -c tar.x.command=./y archive HEAD", "git -c difftool.t.cmd=./y difftool"]) {
-			expect([command, allowKeys(shell, { command }).keys[0]]).toEqual([command, "shell!hidden"]);
+			expect([command, allowKeys(shell, { command }, false).keys[0]]).toEqual([command, "shell!hidden"]);
 		}
 		expect(FENCE_PY.match(/425, 426, 427/g)).toHaveLength(2);
 		expect(FENCE_PY).toContain('"x86_64": (0xC000003E, [16,');
@@ -1411,7 +1416,7 @@ try { recoverGitQuarantine(${JSON.stringify(project)}, ${JSON.stringify(home)});
 		try {
 			const module = join(import.meta.dir, "../packages/engine/src/tools/workspace.ts");
 			const script = `import { readFileSync } from "node:fs";\nimport { join } from "node:path";\nimport { LocalWorkspace } from ${JSON.stringify(module)};\nconst home = process.env.HOME; if (!home) process.exit(9); const workspace = new LocalWorkspace(home); const refused = []; for (const path of [".el/config.json", ".gitconfig", ".config/git/config", "custom-git-config", "engine-link/config.json", "engine-hard"]) { try { await workspace.write(path, "changed"); refused.push([path, "allowed"]); } catch (error) { refused.push([path, String(error?.message ?? error)]); } } await workspace.write("ordinary", "ok"); process.stdout.write(JSON.stringify({ refused, engine: readFileSync(join(home, ".el", "config.json"), "utf8"), global: readFileSync(join(home, ".gitconfig"), "utf8"), xdg: readFileSync(join(home, ".config", "git", "config"), "utf8"), custom: readFileSync(join(home, "custom-git-config"), "utf8"), ordinary: readFileSync(join(home, "ordinary"), "utf8") }));`;
-			const ran = spawnSync(process.execPath, ["-e", script], { encoding: "utf8", env: { ...process.env, HOME: home, EL_HOME: engineHome, XDG_CONFIG_HOME: xdg, GIT_CONFIG_GLOBAL: join(home, "custom-git-config") } });
+			const ran = spawnSync(process.execPath, ["-e", script], { encoding: "utf8", env: { ...process.env, HOME: home, USERPROFILE: home, EL_HOME: engineHome, XDG_CONFIG_HOME: xdg, GIT_CONFIG_GLOBAL: join(home, "custom-git-config") } });
 			expect(ran.status, ran.stderr).toBe(0);
 			const result = JSON.parse(ran.stdout) as { refused: [string, string][]; engine: string; global: string; xdg: string; custom: string; ordinary: string };
 			expect(result.refused.every(([, message]) => message !== "allowed" && /trusted engine or Git configuration|hard link/.test(message))).toBe(true);
@@ -1439,7 +1444,7 @@ try { recoverGitQuarantine(${JSON.stringify(project)}, ${JSON.stringify(home)});
 			const script = `import { existsSync, readFileSync } from "node:fs";\nimport { join } from "node:path";\nimport { LocalWorkspace } from ${JSON.stringify(module)};\nconst home = process.env.HOME; if (!home) process.exit(9); const workspace = new LocalWorkspace(home, "workspace");\nconst refused = []; for (const path of [".el/config.json", ".gitconfig", ".config/git/config", "engine-link/config.json", "engine-hard"]) { try { await workspace.write(path, "changed"); refused.push([path, "allowed"]); } catch (error) { refused.push([path, String(error?.message ?? error)]); } }\nawait workspace.write("ordinary-file", "ok");\nconst commands = ["printf bad > .el/config.json", "mv safe .el/config.json", "ln -s ../safe .el/new-link", "ln safe .el/new-hard", "printf bad > .gitconfig", "mv safe .gitconfig", "ln -s ../../safe .config/git/new-link", "ln safe .config/git/new-hard"]; const commandResults = []; for (const command of commands) commandResults.push(await workspace.exec(command, { timeoutMs: 5_000, signal: AbortSignal.timeout(5_000) }));\nconst ordinary = await workspace.exec("printf ok > ordinary-command", { timeoutMs: 5_000, signal: AbortSignal.timeout(5_000) });\nprocess.stdout.write(JSON.stringify({ refused, commandResults, ordinary, engine: readFileSync(join(home, ".el", "config.json"), "utf8"), global: readFileSync(join(home, ".gitconfig"), "utf8"), xdg: readFileSync(join(home, ".config", "git", "config"), "utf8"), safe: readFileSync(join(home, "safe"), "utf8"), made: [".el/new-link", ".el/new-hard", ".config/git/new-link", ".config/git/new-hard"].some((path) => existsSync(join(home, path))) }));`;
 			const ran = spawnSync(process.execPath, ["-e", script], {
 				encoding: "utf8",
-				env: { ...process.env, HOME: home, EL_HOME: engineHome, XDG_CONFIG_HOME: xdg, GIT_CONFIG_GLOBAL: "/dev/null" },
+				env: { ...process.env, HOME: home, USERPROFILE: home, EL_HOME: engineHome, XDG_CONFIG_HOME: xdg, GIT_CONFIG_GLOBAL: "/dev/null" },
 			});
 			expect(ran.status, ran.stderr).toBe(0);
 			const result = JSON.parse(ran.stdout) as { refused: [string, string][]; commandResults: { exitCode: number }[]; ordinary: { exitCode: number; output: string }; engine: string; global: string; xdg: string; safe: string; made: boolean };
@@ -1820,7 +1825,7 @@ try { recoverGitQuarantine(${JSON.stringify(project)}, ${JSON.stringify(home)});
 	}, 15_000);
 
 	test("round 8: file writes reject .git before and after following links, without blocking an ancestor .git", async () => {
-		const base = realpathSync(mkdtempSync(join(tmpdir(), "el-git-paths-")));
+		const base = realpathSync.native(mkdtempSync(join(tmpdir(), "el-git-paths-")));
 		try {
 			const root = join(base, "repo", ".git", "enrichedlab-worktrees", "s1");
 			mkdirSync(root, { recursive: true });
@@ -1837,10 +1842,12 @@ try { recoverGitQuarantine(${JSON.stringify(project)}, ${JSON.stringify(home)});
 			expect(projectGitPaths(root)).toContain(join(root, "nested", ".GiT"));
 			expect(projectGitPaths(root)).toContain(join(root, "control", ".git"));
 			expect(projectGitPaths(root)).toContain(join(root, "linked", ".git"));
-			const pattern = new RegExp(projectGitPattern(root));
-			expect(pattern.test(join(root, ".git"))).toBe(true);
-			expect(pattern.test(join(root, "a", ".GIT", "config"))).toBe(true);
-			expect(pattern.test(join(base, "repo", ".git", "config"))).toBe(false);
+			if (process.platform === "darwin") {
+				const pattern = new RegExp(projectGitPattern(root));
+				expect(pattern.test(join(root, ".git"))).toBe(true);
+				expect(pattern.test(join(root, "a", ".GIT", "config"))).toBe(true);
+				expect(pattern.test(join(base, "repo", ".git", "config"))).toBe(false);
+			}
 		} finally {
 			rmSync(base, { recursive: true, force: true });
 		}

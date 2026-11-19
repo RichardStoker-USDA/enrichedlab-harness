@@ -18,7 +18,7 @@ import { writeTool } from "../packages/engine/src/tools/files.ts";
 import { shellTool } from "../packages/engine/src/tools/shell.ts";
 import { LocalWorkspace } from "../packages/engine/src/tools/workspace.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "el-approvals-"));
+const dir = realpathSync.native(mkdtempSync(join(tmpdir(), "el-approvals-")));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
 
 /** A model that runs the tool call the person's message names ("shell: <command>" or "write: <path>"), then says Done. */
@@ -129,7 +129,7 @@ describe("approvals", () => {
 		expect(session.asked[0]!.folder).toBe(root);
 		expect(granted).toEqual([root]);
 		// The engine saves the grant to config (folder.access); then the next change runs without asking.
-		config = { ...config, folders: { [realpathSync(root)]: { access: "change", at: new Date().toISOString(), id: identity(realpathSync(root)) } } };
+		config = { ...config, folders: { [realpathSync.native(root)]: { access: "change", at: new Date().toISOString(), id: identity(realpathSync.native(root)) } } };
 		await turn(session.runtime, "write: more.txt");
 		expect(session.asked).toHaveLength(1);
 		// A session's own "ask" mode still asks there.
@@ -216,32 +216,36 @@ describe("approvals", () => {
 		const named = (refs: unknown) => (refs as { "@id": string }[]).map((r) => graph.find((e) => e["@id"] === r["@id"])?.name);
 		expect(named(call.object)).toEqual(["notes.txt"]);
 		expect(named(call.result)).toEqual(["copy.txt"]);
-		const again = await reproduceStep(out, call["@id"] as string);
-		expect(again).toMatchObject({ same: ["copy.txt"], differ: [], extra: [], exitCode: 0 });
-		// Replay runs in its own scratch folder with a few plain variables: nothing inherited, no system temp folder.
-		// The variable's name is one no secret filter would drop, so only the allowlist keeps it out.
-		process.env.EL_REPLAY_INHERIT_PROBE = "inherited";
-		try {
-			const probe = { ...call, "@id": "#call-probe", "https://enrichedlab.org/contract/2026-11/terms#command": "if echo x > /tmp/el-replay-escape-codetest 2>/dev/null; then exit 9; fi; test -z \"$EL_REPLAY_INHERIT_PROBE\" || exit 7" };
-			const meta = join(out, "ro-crate-metadata.json");
-			const original = readFileSync(meta, "utf8");
-			writeFileSync(meta, JSON.stringify({ ...JSON.parse(original), "@graph": [...graph, probe] }));
-			const replay = await reproduceStep(out, "#call-probe");
-			expect(replay.exitCode).toBe(0);
-			expect(existsSync("/tmp/el-replay-escape-codetest")).toBe(false);
-			// A malformed content id isn't counted as checked, and an id must name the kind of object it says.
-			writeFileSync(meta, JSON.stringify({ ...JSON.parse(original), "@graph": [...graph, { "@id": "#bad", "@type": "File", identifier: "git-blob:not-a-hash" }] }));
-			expect(verifyPackage(out).find((row) => row.check === "content ids")).toMatchObject({ ok: false });
-			const blob = (graph.find((e) => typeof e.identifier === "string" && (e.identifier as string).startsWith("git-blob:"))!.identifier as string).slice(9);
-			writeFileSync(meta, JSON.stringify({ ...JSON.parse(original), "@graph": [...graph, { "@id": "#kind", "https://enrichedlab.org/contract/2026-11/terms#historyBefore": blob }] }));
-			expect(verifyPackage(out).find((row) => row.check === "content ids")).toMatchObject({ ok: false });
-			writeFileSync(meta, original);
-		} finally {
-			delete process.env.EL_REPLAY_INHERIT_PROBE;
-			rmSync("/tmp/el-replay-escape-codetest", { force: true });
+		if (process.platform === "win32") {
+			await expect(reproduceStep(out, call["@id"] as string)).rejects.toThrow("can't contain the rerun");
+		} else {
+			const again = await reproduceStep(out, call["@id"] as string);
+			expect(again).toMatchObject({ same: ["copy.txt"], differ: [], extra: [], exitCode: 0 });
+			// Replay runs in its own scratch folder with a few plain variables: nothing inherited, no system temp folder.
+			// The variable's name is one no secret filter would drop, so only the allowlist keeps it out.
+			process.env.EL_REPLAY_INHERIT_PROBE = "inherited";
+			try {
+				const probe = { ...call, "@id": "#call-probe", "https://enrichedlab.org/contract/2026-11/terms#command": "if echo x > /tmp/el-replay-escape-codetest 2>/dev/null; then exit 9; fi; test -z \"$EL_REPLAY_INHERIT_PROBE\" || exit 7" };
+				const meta = join(out, "ro-crate-metadata.json");
+				const original = readFileSync(meta, "utf8");
+				writeFileSync(meta, JSON.stringify({ ...JSON.parse(original), "@graph": [...graph, probe] }));
+				const replay = await reproduceStep(out, "#call-probe");
+				expect(replay.exitCode).toBe(0);
+				expect(existsSync("/tmp/el-replay-escape-codetest")).toBe(false);
+				// A malformed content id isn't counted as checked, and an id must name the kind of object it says.
+				writeFileSync(meta, JSON.stringify({ ...JSON.parse(original), "@graph": [...graph, { "@id": "#bad", "@type": "File", identifier: "git-blob:not-a-hash" }] }));
+				expect(verifyPackage(out).find((row) => row.check === "content ids")).toMatchObject({ ok: false });
+				const blob = (graph.find((e) => typeof e.identifier === "string" && (e.identifier as string).startsWith("git-blob:"))!.identifier as string).slice(9);
+				writeFileSync(meta, JSON.stringify({ ...JSON.parse(original), "@graph": [...graph, { "@id": "#kind", "https://enrichedlab.org/contract/2026-11/terms#historyBefore": blob }] }));
+				expect(verifyPackage(out).find((row) => row.check === "content ids")).toMatchObject({ ok: false });
+				writeFileSync(meta, original);
+			} finally {
+				delete process.env.EL_REPLAY_INHERIT_PROBE;
+				rmSync("/tmp/el-replay-escape-codetest", { force: true });
+			}
 		}
 		// A file changed after packaging fails its checksum.
 		writeFileSync(join(out, "files", "copy.txt"), "changed\n");
 		expect(verifyPackage(out).find((row) => row.check === "files")?.ok).toBe(false);
-	});
+	}, 60_000);
 });

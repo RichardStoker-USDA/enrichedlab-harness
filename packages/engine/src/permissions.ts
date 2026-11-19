@@ -75,10 +75,12 @@ function within(path: string, folder: string): boolean {
 }
 
 /** What the person let EnrichedLab do at `path`: the nearest folder they answered for decides. */
-/** A folder's identity on disk (device and inode), so a grant can tell its folder from another one put in its place. */
+/** Include creation time on Linux, where a newly created directory can reuse the previous one's inode. */
 export function identity(path: string): string | undefined {
 	const s = statSync(path, { bigint: true, throwIfNoEntry: false });
-	return s ? `${s.dev}:${s.ino}` : undefined;
+	if (!s?.isDirectory()) return undefined;
+	if (process.platform === "linux") return `${s.dev}:${s.ino}:${s.birthtimeNs || s.ctimeNs}`;
+	return `${s.dev}:${s.ino}`;
 }
 
 /**
@@ -90,8 +92,10 @@ function grantFolders(saved: string, grant: { access: FolderAccess; id?: string 
 	const now = canonical(saved);
 	if (grant.access === "read") return now === saved ? [saved] : [saved, now];
 	// A grant saved before identities (0.2.30) asks once more and is saved again with one.
-	if (now !== saved || !grant.id || identity(saved) !== grant.id) return [];
-	return [saved];
+	if (!grant.id || identity(now) !== grant.id) return [];
+	// Even a spelling that resolves to the same object cannot carry a grant through a replacement link.
+	if (now !== saved && (process.platform !== "win32" || physical(saved).toLowerCase() !== resolve(saved).toLowerCase())) return [];
+	return [now];
 }
 
 export function folderAccess(config: LabConfig, path: string): FolderAccess | undefined {
@@ -592,10 +596,10 @@ function list(items: string[]): string {
 }
 
 /** What an "allow for this session" answer remembers for this call, and what that covers in words. */
-export function allowKeys(tool: Tool, args: Record<string, unknown>): { keys: string[]; scope: string } {
+export function allowKeys(tool: Tool, args: Record<string, unknown>, windows = process.platform === "win32"): { keys: string[]; scope: string } {
 	if (tool.kind === "sandbox" && typeof args.command === "string") {
 		// The same publishing gate as a shell command: a push, or a line that could push unseen, asks every time.
-		const publishes = publishing(args.command.trim());
+		const publishes = publishing(args.command.trim(), 0, false);
 		if (publishes === "push") return { keys: ["sandbox!push"], scope: "pushing" };
 		if (publishes === "hidden") return { keys: ["sandbox!hidden"], scope: "this command, every time" };
 		// Remembered per program like a shell command, apart from this computer's answers.
@@ -607,7 +611,7 @@ export function allowKeys(tool: Tool, args: Record<string, unknown>): { keys: st
 		const command = String(args.command ?? "").trim();
 		// Pushing publishes work: it asks every time, whatever was allowed before. Judged on the words as the shell reads
 		// them, so git 'push', g\it push and $'\x67it' push are pushes too.
-		const publishes = publishing(command);
+		const publishes = publishing(command, 0, windows);
 		if (publishes === "push") return { keys: ["shell!push"], scope: "pushing" };
 		// What it runs depends on more than the line shows: never remembered, so a changed file or variable can't ride
 		// on an earlier yes.
@@ -713,7 +717,7 @@ export function decide(tool: Tool, args: Record<string, unknown>, workspace: Wor
 	// auto rests on history: without it (the store failed), it asks as ask does.
 	const mode = chosen === "auto" && !recoverable ? "ask" : chosen;
 	const extra = tool.ask?.(args, { workspace });
-	const { keys, scope } = allowKeys(tool, args);
+	const { keys, scope } = allowKeys(tool, args, workspace.kind === "local" && process.platform === "win32");
 	const ask = (reason: string, folder?: string, commit?: CommitTarget, askKeys = keys, askScope = scope): Verdict => ({ action: "ask", reason, keys: askKeys, scope: askScope, ...(folder ? { folder } : {}), ...(commit ? { commit } : {}) });
 	const remembered = (list: string[]) => list.every((key) => !key.includes("!") && allowed.has(key));
 	// Pushing publishes work, and an unreviewed lab tool hasn't been checked by anyone: both ask in every mode, every time.
@@ -804,7 +808,7 @@ export function decide(tool: Tool, args: Record<string, unknown>, workspace: Wor
 			// program does can't be read from its words, so nothing runs uncontained without a yes, except what the
 			// person listed in allowCommands.
 			const runsContained = fenced || Boolean(local && workspace.sandboxed && FULL_CONTAINMENT.has(workspace.sandboxed) && args.unsandboxed !== true);
-			if (runsContained && isReadOnlyCommand(command, [], inside, judging)) {
+			if (runsContained && isReadOnlyCommand(command, [], inside, judging, lab || process.platform !== "win32")) {
 				// In a folder set to read only, or without history to take a change back, the OS keeps it from writing:
 				// what a program does isn't decided by its words.
 				const sealed = !recoverable || (local && readOnlyWithin(config, workspace.root));
@@ -812,7 +816,7 @@ export function decide(tool: Tool, args: Record<string, unknown>, workspace: Wor
 			}
 			// In a lab's sandbox whose whole disk is checkpointed, any command can be taken back.
 			if (mode === "auto" && workspace.kind === "sandbox" && workspace.checkpointed === "filesystem" && args.unsandboxed !== true) return { action: "run" };
-			const reads = isReadOnlyCommand(command, [], () => true);
+			const reads = isReadOnlyCommand(command, [], () => true, {}, lab || process.platform !== "win32");
 			if (reads) return ask("It reads outside the project folder.");
 			return ask(contained || workspace.kind === "sandbox" ? "It runs a command that changes things outside the project folder." : "It runs a command on this computer outside the sandbox, where it can change anything you can.");
 		}

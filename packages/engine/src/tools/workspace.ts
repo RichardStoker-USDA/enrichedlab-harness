@@ -7,11 +7,11 @@ import type { Dirent } from "node:fs";
 import { accessSync, closeSync, constants, existsSync, fstatSync, fsyncSync, ftruncateSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeSync } from "node:fs";
 import { readdir, readFile, stat } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 import { labHome } from "../paths.ts";
 import { expandHome, withoutSecrets } from "../util.ts";
 import { holdFolder, holdGitEntries, holdPrivateFolder, mkdirPhysical, openPhysical, type GitEntryBaseline, type GitQuarantineIntent, type GitQuarantineJournal, type GitQuarantineResult } from "./anchored.ts";
-import { systemCommand, systemPowerShell } from "./windows_contain.ts";
+import { systemCommand, systemGit, systemPowerShell } from "./windows_contain.ts";
 
 export interface Entry {
 	name: string;
@@ -101,7 +101,11 @@ const MAX_EXEC_OUTPUT = 4 * 1024 * 1024;
 function pickShell(project: string): { file: string; args: (command: string) => string[]; name: string } {
 	if (process.platform === "win32") {
 		const shell = systemPowerShell(project);
-		return { file: shell?.file ?? "", args: (c) => ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", c], name: shell?.name ?? "PowerShell unavailable" };
+		return {
+			file: shell?.file ?? "",
+			args: (command) => ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(command, "utf16le").toString("base64")],
+			name: shell?.name ?? "PowerShell unavailable",
+		};
 	}
 	// Always the system's bash, the language the approvals parse (shell_syntax.ts), never a shell named by $SHELL.
 	const file = existsSync("/bin/bash") ? "/bin/bash" : "/bin/sh";
@@ -210,6 +214,7 @@ const GIT_HOMES = ["/usr/bin/", "/bin/", "/usr/libexec/", "/Library/Developer/Co
  * must also be there, owned by root or the person and writable by no one else: a link into a project isn't git.
  */
 export function trustedGit(): string | undefined {
+	if (process.platform === "win32") return systemGit();
 	// macOS's /usr/bin/git is a stub that asks to install the developer tools when they're missing.
 	const tools = process.platform !== "darwin" || existsSync("/Library/Developer/CommandLineTools/usr/bin/git") || existsSync("/Applications/Xcode.app");
 	const uid = process.getuid?.() ?? 0;
@@ -1194,7 +1199,8 @@ export class LocalWorkspace implements Workspace {
 		if (/^~[^/\\]/.test(path)) return false;
 		this.realRoot ??= real(this.root);
 		const expanded = path === "~" ? homedir() : path.startsWith("~/") ? join(homedir(), path.slice(2)) : path;
-		const rel = relative(this.realRoot, physical(isAbsolute(expanded) ? expanded : `${this.root}${sep}${expanded}`));
+		const pathOnDisk = physical(isAbsolute(expanded) ? expanded : `${this.root}${sep}${expanded}`);
+		const rel = relative(this.realRoot, process.platform === "win32" ? real(pathOnDisk) : pathOnDisk);
 		return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
 	}
 	private realRoot?: string;
@@ -1356,10 +1362,12 @@ export class LocalWorkspace implements Workspace {
 					// Inside the project's own package environment when it has one (tools/environment.ts), for contained
 					// commands only: its programs are the project's, so they never run uncontained in place of the system's.
 					env: childEnv,
-					stdio: ["ignore", "pipe", "pipe", ...(launch.pass ?? []), ...(launch.syncFd === undefined ? [] : ["pipe" as const])],
+					stdio: [launch.facility === "restricted-token" ? "pipe" : "ignore", "pipe", "pipe", ...(launch.pass ?? []), ...(launch.syncFd === undefined ? [] : ["pipe" as const])],
 					windowsHide: true,
 					detached: process.platform !== "win32",
 				});
+				// Windows passes the handle through its restricted-process helper. Close the writing end to send EOF.
+				child.stdin?.end();
 			} catch (error) {
 				const cleanup = launch.quarantine?.(true);
 				launch.release?.();
@@ -1478,8 +1486,9 @@ export class LocalWorkspace implements Workspace {
  */
 export function physical(path: string, depth = 0): string {
 	// A backslash separates folders on Windows only; elsewhere it's part of a name.
-	const parts = path.split(process.platform === "win32" ? /[/\\]+/ : /\/+/).filter((p) => p && p !== ".");
-	let at = isAbsolute(path) ? (path.match(/^[A-Za-z]:/)?.[0] ?? "") + sep : process.cwd();
+	const root = isAbsolute(path) ? parse(path).root : "";
+	const parts = path.slice(root.length).split(process.platform === "win32" ? /[/\\]+/ : /\/+/).filter((p) => p && p !== ".");
+	let at = root || process.cwd();
 	for (let i = 0; i < parts.length; i++) {
 		const part = parts[i]!;
 		if (part === "..") {

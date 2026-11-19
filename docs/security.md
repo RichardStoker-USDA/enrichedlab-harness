@@ -93,7 +93,8 @@ The engine's own work stays inside the same line:
   own folder work (making the worktrees folder and removing files on undo) never follows a link. The expected scratch
   path is checked without resolving it away first; agent commands have no write grant to that folder.
 - Step history has its own bare git store, separate from the project's repository. It uses a trusted system git by
-  absolute path with hooks, fsmonitor, filters and line conversion off, and an explicit minimal environment. Caller
+  absolute path with hooks, fsmonitor, filters and line conversion off, and an explicit minimal environment. On
+  Windows it uses the Git for Windows installation under Program Files. Caller
   Git and loader variables are not inherited. Local file and empty-directory removal stays relative to held folder
   descriptors. In a lab, removal runs only under the fence; without the fence it leaves the path in place.
 - Bringing work back from a lab (committing what's left, then bundling) runs only under the lab's fence, with
@@ -320,7 +321,8 @@ followed one part at a time, so `link/..` is where the system takes it; a backsl
 Windows; and the disk's own letter case), so a read-only folder inside one that may change stays read only. An
 answer to allow changes is saved with the folder's identity on disk. If a part of its path later becomes a link, or
 another folder takes its place, the answer no longer applies there and the question comes back; answers saved
-before identities (0.2.30) ask once more. Every call is decided again just before it runs, and a file write lands
+before identities (0.2.30) ask once more. Older Linux answers also ask once more because Linux identities now
+include directory creation time to account for reused inode numbers. Every call is decided again just before it runs, and a file write lands
 on the real path it was judged for: its folders are made and the file opened without following a link anywhere on
 the way (`tools/anchored.ts`: `O_NOFOLLOW_ANY` on macOS, a folder-by-folder `openat` walk on Linux), so a folder
 swapped for a link after the check makes the write fail instead of landing elsewhere. A path holding a NUL is

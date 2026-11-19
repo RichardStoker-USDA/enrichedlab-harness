@@ -4,9 +4,9 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import type { SessionEvent } from "../packages/protocol/src/index.ts";
 import { budget, cutPoint, derive, elisionCandidates, SUMMARY_PREFIX } from "../packages/engine/src/session/context.ts";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import type { LabConfig } from "../packages/engine/src/config.ts";
 import { allowKey, allowKeys, canonical, decide, folderAccess, HIDDEN_REASON, identity, pushes } from "../packages/engine/src/permissions.ts";
 import { manifest } from "../packages/engine/src/tools/environment.ts";
@@ -163,7 +163,7 @@ describe("shell", () => {
 describe("permissions", () => {
 	const ws = new LocalWorkspace(scratch("perm"));
 	// Grants are saved by real path (folder.access), as the engine saves them.
-	const home = realpathSync(ws.root);
+	const home = realpathSync.native(ws.root);
 	/** Change grants carry the folder's identity, as folder.access saves them. */
 	const ided = (folders?: Record<string, { access: string; at: string }>) => folders && Object.fromEntries(Object.entries(folders).map(([path, g]) => [path, g.access === "change" ? { ...g, id: identity(path) } : g]));
 	const config = { permissions: { mode: "ask", allowCommands: [] } } as unknown as LabConfig;
@@ -267,11 +267,13 @@ describe("permissions", () => {
 		expect(manifest("field", { pypi: "https://pypi.lab.example/simple" })).toContain('index-url = "https://pypi.lab.example/simple"');
 		expect(manifest("field")).toContain('channels = ["conda-forge"]');
 		// Commands run inside the project's environment once it's built.
-		const project = realpathSync(scratch("env"));
+		const project = realpathSync.native(scratch("env"));
 		expect(activated(project, { PATH: "/usr/bin" }).PATH).toBe("/usr/bin");
 		writeFileSync(join(project, "pixi.toml"), manifest("p"));
 		mkdirSync(join(project, ".pixi", "envs", "default", "conda-meta"), { recursive: true });
-		expect(activated(project, { PATH: "/usr/bin" })).toMatchObject({ PATH: `${join(project, ".pixi", "envs", "default", "bin")}:/usr/bin`, CONDA_PREFIX: join(project, ".pixi", "envs", "default") });
+		const prefix = join(project, ".pixi", "envs", "default");
+		const bins = posix ? [join(prefix, "bin")] : [prefix, join(prefix, "Library", "bin"), join(prefix, "Scripts")];
+		expect(activated(project, { PATH: "/usr/bin" })).toMatchObject({ PATH: [...bins, "/usr/bin"].join(delimiter), CONDA_PREFIX: prefix });
 	});
 
 	test("in a lab's sandbox, commands run under the file fence where it holds; where it doesn't, they ask", async () => {
@@ -298,15 +300,15 @@ describe("permissions", () => {
 	});
 
 	test("a grant to change holds only while its path leads to the folder answered for", () => {
-		const parent = realpathSync(scratch("grant"));
+		const parent = realpathSync.native(scratch("grant"));
 		const sub = join(parent, "sub");
 		mkdirSync(sub);
-		const elsewhere = realpathSync(scratch("elsewhere"));
+		const elsewhere = realpathSync.native(scratch("elsewhere"));
 		const granted = { permissions: { mode: "auto", allowCommands: [] }, folders: { [sub]: { access: "change", at: "", id: identity(sub) } } } as unknown as LabConfig;
 		expect(folderAccess(granted, join(sub, "a.txt"))).toBe("change");
 		// sub replaced by a link to "/": the grant doesn't follow it anywhere.
-		rmSync(sub, { recursive: true });
-		symlinkSync("/", sub);
+		renameSync(sub, join(parent, "original"));
+		symlinkSync(elsewhere, sub, "dir");
 		expect(folderAccess(granted, join(elsewhere, "a.txt"))).toBeUndefined();
 		expect(folderAccess(granted, join(sub, "a.txt"))).toBeUndefined();
 		// Another folder moved into its place isn't the one answered for either.
@@ -317,9 +319,10 @@ describe("permissions", () => {
 
 	test("review round 2: backslashes, lab command tools, plain lab lines, loader variables, no history, grants without identity", async () => {
 		// B1: a backslash is part of a name here, not a separator.
-		const root = realpathSync(scratch("slash"));
-		const q = realpathSync(scratch("slash-q"));
-		symlinkSync(q, join(root, "jump\\part"));
+		const root = realpathSync.native(scratch("slash"));
+		const q = realpathSync.native(scratch("slash-q"));
+		if (!posix) mkdirSync(join(root, "jump"));
+		symlinkSync(q, join(root, "jump\\part"), "dir");
 		expect(new LocalWorkspace(root).inside("jump\\part/marker.txt")).toBe(false);
 		// B2: a lab tool that runs commands follows command rules, remembered per program apart from this computer's.
 		const api = { title: "Field Lab", run: async () => ({ exitCode: 0, stdout: "", stderr: "" }) } as unknown as SandboxApi;
@@ -343,13 +346,13 @@ describe("permissions", () => {
 		expect(decide(shell, { command: "rm notes.txt" }, await fencedLab(), askMode, new Set())).toEqual({ action: "run", fence: true });
 		// B6: a variable naming a config, startup or library place is remembered exactly; data variables aren't.
 		for (const command of ["PHP_INI_SCAN_DIR=./ini php a.php", "PHPRC=. php a.php", "DATA_DIR=out python3 a.py", "R_PROFILE_USER=./x Rscript a.R", "RUBYOPT=-r./x ruby a.rb"]) {
-			expect([command, allowKeys(shell, { command }).scope]).toEqual([command, "this exact command"]);
+			expect([command, allowKeys(shell, { command }, false).scope]).toEqual([command, "this exact command"]);
 		}
-		expect(allowKeys(shell, { command: "SEED=1 N_ITER=20 LOG_LEVEL=debug python3 run.py" }).keys).toEqual(["shell:python3"]);
+		expect(allowKeys(shell, { command: "SEED=1 N_ITER=20 LOG_LEVEL=debug python3 run.py" }, false).keys).toEqual(["shell:python3"]);
 		// B8: without history, a contained change asks.
 		const sealed = Object.assign(Object.create(ws), { sandboxed: "seatbelt" });
 		const granted = { permissions: { mode: "auto", allowCommands: [] }, folders: ided({ [home]: { access: "change", at: "" } }) } as unknown as LabConfig;
-		expect(decide(shell, { command: "rm notes.md" }, sealed, granted, new Set()).action).toBe("run");
+		expect(decide(shell, { command: "rm notes.md" }, sealed, granted, new Set()).action).toBe(posix ? "run" : "ask");
 		expect(decide(shell, { command: "rm notes.md" }, sealed, granted, new Set(), undefined, undefined, false).action).toBe("ask");
 		// B9: a grant to change saved without the folder's identity asks again.
 		expect(folderAccess({ folders: { [home]: { access: "change", at: "" } } } as unknown as LabConfig, join(home, "a.txt"))).toBeUndefined();
@@ -357,15 +360,25 @@ describe("permissions", () => {
 
 	test("review round 5: contained-only environments, writes that moved outside, quoted interpreter flags, fenced words, quoted $", async () => {
 		// The project's own programs come first only for contained commands.
-		const project = realpathSync(scratch("env-contained"));
+		const project = realpathSync.native(scratch("env-contained"));
 		writeFileSync(join(project, "pixi.toml"), manifest("p"));
 		mkdirSync(join(project, ".pixi", "envs", "default", "conda-meta"), { recursive: true });
 		const contained = new LocalWorkspace(project, "workspace");
-		const said = async (unsandboxed: boolean) => (await contained.exec("printf %s \"$CONDA_PREFIX\"", { timeoutMs: 20_000, signal: AbortSignal.timeout(20_000), unsandboxed })).output;
-		expect(await said(false)).toBe(join(project, ".pixi", "envs", "default"));
-		expect(await said(true)).toBe("");
+		const prefix = join(project, ".pixi", "envs", "default");
+		const options = { timeoutMs: 20_000, signal: AbortSignal.timeout(20_000) };
+		if (posix) {
+			const read = (unsandboxed: boolean) => contained.exec("printf %s \"$CONDA_PREFIX\"", { ...options, unsandboxed });
+			expect(await read(false)).toMatchObject({ exitCode: 0, output: prefix });
+			expect(await read(true)).toMatchObject({ exitCode: 0, output: "" });
+		} else {
+			const expected = prefix.replaceAll("'", "''");
+			const active = await contained.exec(`if ($env:CONDA_PREFIX -ceq '${expected}') { exit 0 } else { exit 19 }`, options);
+			expect(active, `Windows containment facility: ${contained.sandboxed}`).toMatchObject({ exitCode: 0 });
+			const inactive = await contained.exec("if ($env:CONDA_PREFIX) { exit 19 } else { exit 0 }", { ...options, unsandboxed: true });
+			expect(inactive).toMatchObject({ exitCode: 0 });
+		}
 		// A write whose path now leads outside (a link moved) is refused unless the outside path was approved.
-		const outsideDir = realpathSync(scratch("env-outside"));
+		const outsideDir = realpathSync.native(scratch("env-outside"));
 		symlinkSync(outsideDir, join(project, "moved"));
 		await expect(contained.write("moved/x.txt", "x")).rejects.toThrow("leads outside the project");
 		expect(existsSync(join(outsideDir, "x.txt"))).toBe(false);
@@ -376,15 +389,15 @@ describe("permissions", () => {
 		// A $ inside single quotes isn't expansion: a git read stays a git read.
 		expect(pushes("git log --format='$%s'")).toBe(false);
 		// A program the project holds isn't read-only because it was asked its version.
-		expect(isReadOnlyCommand("python3 --version")).toBe(true);
+		expect(isReadOnlyCommand("python3 --version", [], undefined, {}, true)).toBe(true);
 		expect(isReadOnlyCommand("/sandbox/work/P/payload --version")).toBe(false);
 		expect(isReadOnlyCommand("./payload --version")).toBe(false);
-		expect(pushes("git $'push' origin HEAD")).toBe(true);
+		expect(allowKeys(shell, { command: "git $'push' origin HEAD" }, false).keys).toEqual(["shell!push"]);
 	});
 
 	test("a path through a link and then .. is judged where the system takes it", () => {
-		const root = realpathSync(scratch("walk"));
-		const deep = join(realpathSync(scratch("deep")), "one", "two");
+		const root = realpathSync.native(scratch("walk"));
+		const deep = join(realpathSync.native(scratch("deep")), "one", "two");
 		mkdirSync(deep, { recursive: true });
 		symlinkSync(deep, join(root, "link"));
 		const local = new LocalWorkspace(root);
@@ -448,7 +461,7 @@ describe("permissions", () => {
 		expect(decide(write, { path: "/Users/someone/.zshrc" }, ws, config, allowed).action).toBe("ask");
 	});
 
-	test("an answer for the session covers each program a command runs, and says so", () => {
+	test.if(posix)("an answer for the session covers each program a command runs, and says so", () => {
 		expect(allowKeys(shell, { command: "python3 run.py" })).toEqual({ keys: ["shell:python3"], scope: "“python3” commands" });
 		expect(allowKey(shell, { command: "git commit -m x" })).toBe("shell:git commit");
 		expect(allowKey(shell, { command: "pytest -q" })).toBe("shell:pytest");
@@ -683,6 +696,12 @@ describe("git", () => {
 		run("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "start");
 		writeFileSync(join(root, "a.txt"), "one");
 		run("add", "a.txt");
+		if (!posix) {
+			expect(() => snapshot(root, "s1", "turn 1")).toThrow("no sandbox for the engine's git work");
+			expect(() => createWorktree(root, "s1", "Test")).toThrow("no sandbox for the engine's git work");
+			expect(run("diff", "--cached", "--name-only")).toBe("a.txt");
+			return;
+		}
 		const before = snapshot(root, "s1", "turn 1");
 		writeFileSync(join(root, "a.txt"), "two");
 		writeFileSync(join(root, "new.txt"), "made by a shell command");
@@ -732,10 +751,10 @@ describe("own-branch commits", () => {
 		writeFileSync(join(otherAdmin, "gitdir"), `${join(repo, "person", ".git")}\n`);
 		const record = { path, repo, branch: "enrichedlab/test-s1" };
 		const valid = new LocalWorkspace(path, "off", record);
-		expect(valid.worktree).toEqual({ path: realpathSync(path), gitDir: realpathSync(gitDir) });
+		expect(valid.worktree).toEqual({ path: realpathSync.native(path), gitDir: realpathSync.native(gitDir) });
 		const allowed = decide(gitCommitTool, { message: "Test" }, valid, { permissions: { mode: "ask", allowCommands: [] } } as unknown as LabConfig, new Set());
 		expect(allowed.action).toBe("run");
-		if (allowed.action === "run") expect(allowed.commit).toMatchObject({ repo: realpathSync(repo), branch: record.branch, recorded: true });
+		if (allowed.action === "run") expect(allowed.commit).toMatchObject({ repo: realpathSync.native(repo), branch: record.branch, recorded: true });
 		const target = valid.commitTarget()!;
 		writeFileSync(join(ownAdmin, "HEAD"), "ref: refs/heads/main\n");
 		expect(valid.verifyCommitTarget(target)).toBe(false);
@@ -746,7 +765,7 @@ describe("own-branch commits", () => {
 		mkdirSync(sub);
 		writeFileSync(join(sub, ".git"), `gitdir: ${gitDir}\n`);
 		const nested = new LocalWorkspace(sub, "off", record);
-		expect(nested.commitTarget()).toMatchObject({ repo: realpathSync(repo), branch: record.branch, adminDir: realpathSync(ownAdmin) });
+		expect(nested.commitTarget()).toMatchObject({ repo: realpathSync.native(repo), branch: record.branch, adminDir: realpathSync.native(ownAdmin) });
 		await expect(valid.write(".git", `gitdir: ${otherAdmin}\n`)).rejects.toThrow(".git path");
 		writeFileSync(join(path, ".git"), `gitdir: ${otherAdmin}\n`);
 		const redirected = new LocalWorkspace(path, "off", record);
@@ -777,7 +796,7 @@ describe("own-branch commits", () => {
 		}
 		expect(verdict.action).toBe("ask");
 		if (verdict.action !== "ask") return;
-		expect(verdict.commit).toMatchObject({ repo: realpathSync(repo), branch: "main", recorded: false });
+		expect(verdict.commit).toMatchObject({ repo: realpathSync.native(repo), branch: "main", recorded: false });
 		execFileSync("git", ["switch", "-qc", "other"], { cwd: repo });
 		expect(ws.verifyCommitTarget(verdict.commit!)).toBe(false);
 		const remembered = new Set(verdict.keys);
@@ -793,7 +812,7 @@ describe("own-branch commits", () => {
 		const config = { permissions: { mode: "ask", allowCommands: [] } } as unknown as LabConfig;
 		const shell = { name: "shell", kind: "exec" } as unknown as Tool;
 		// Outside the temp folders, which contained commands may always write.
-		const repo = realpathSync(mkdtempSync(join(homedir(), ".enrichedlab-commit-test-")));
+		const repo = realpathSync.native(mkdtempSync(join(homedir(), ".enrichedlab-commit-test-")));
 		try {
 			const git = (...a: string[]) => execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", ...a], { cwd: repo, encoding: "utf8" });
 			git("init", "-q", "-b", "main");
@@ -860,6 +879,11 @@ describe("repository handoff", () => {
 			writeFileSync(join(repo, "a.txt"), "two\n");
 			writeFileSync(join(repo, ".env"), "TOKEN=x\n");
 			const bundle = join(scratch("bundle"), "r.bundle");
+			if (!posix) {
+				expect(() => packForSend(repo, bundle)).toThrow("no sandbox for the engine's git work");
+				expect(existsSync(bundle)).toBe(false);
+				return;
+			}
 			const sent = packForSend(repo, bundle);
 			expect(sent.skipped).toEqual([".env"]);
 			const far = scratch("far");
@@ -976,7 +1000,7 @@ describe("lab invites", () => {
 });
 
 describe("repository handoff with secret-looking files in the history", () => {
-	test("only the current files go; returned work comes home on the person's history with their tracked files", async () => {
+	test.if(posix)("only the current files go; returned work comes home on the person's history with their tracked files", async () => {
 		const { execFileSync } = await import("node:child_process");
 		const { packForSend, fetchBundle } = await import("../packages/engine/src/git.ts");
 		const git = (cwd: string, ...a: string[]) => execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", ...a], { cwd, encoding: "utf8" }).trim();

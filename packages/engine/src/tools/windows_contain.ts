@@ -62,6 +62,14 @@ export function systemCommand(env: NodeJS.ProcessEnv = process.env): string | un
 	return systemRoot ? installedProgram(join(systemRoot, "System32", "cmd.exe"), systemRoot) : undefined;
 }
 
+/** Git for Windows from its system install, independently of the project and its PATH. */
+export function systemGit(env: NodeJS.ProcessEnv = process.env): string | undefined {
+	const programFiles = env.ProgramW6432 ?? env.ProgramFiles;
+	if (!programFiles) return;
+	const path = installedProgram(join(programFiles, "Git", "cmd", "git.exe"), programFiles);
+	return path && atOrBelow(path, join(realpathSync.native(programFiles), "Git")) ? path : undefined;
+}
+
 /** Quote one argument for a Windows command line (the rules CommandLineToArgvW reads back). */
 export function quoteArg(arg: string): string {
 	if (arg && !/[\s"]/.test(arg)) return arg;
@@ -103,9 +111,10 @@ export function grantWrites(home: string, sid: string, folders: string[]): void 
 	if (!todo.length) return;
 	const quote = (text: string) => `'${text.replaceAll("'", "''")}'`;
 	const script = [
+		"$ErrorActionPreference = 'Stop'",
 		`$sid = New-Object System.Security.Principal.SecurityIdentifier(${quote(sid)})`,
 		"$rule = New-Object System.Security.AccessControl.FileSystemAccessRule($sid, 'Modify', 'ContainerInherit,ObjectInherit', 'None', 'Allow')",
-		`foreach ($p in @(${todo.map(quote).join(",")})) { $d = Get-Item -LiteralPath $p; $acl = $d.GetAccessControl('Access'); $acl.AddAccessRule($rule); $d.SetAccessControl($acl) }`,
+		`foreach ($p in @(${todo.map(quote).join(",")})) { $acl = Get-Acl -LiteralPath $p; $acl.AddAccessRule($rule); Set-Acl -LiteralPath $p -AclObject $acl }`,
 	].join("; ");
 	const powershell = systemPowerShell(folders);
 	if (!powershell) throw new Error("Couldn't find PowerShell in an OS installation folder, so sandbox write access was not changed.");
@@ -167,7 +176,9 @@ export async function runContained(home: string, writable: string[], argv: strin
 	let logonSid = 0;
 	for (let i = 0, count = view.getUint32(0, true); i < count; i++) {
 		const at = 8 + i * 16;
-		if ((view.getUint32(at + 8, true) & SE_GROUP_LOGON_ID) === SE_GROUP_LOGON_ID) logonSid = Number(view.getBigUint64(at, true));
+		const attributes = view.getUint32(at + 8, true);
+		// Both logon flags are high bits. JavaScript bitwise operators return a signed 32-bit result.
+		if (((attributes & SE_GROUP_LOGON_ID) >>> 0) === SE_GROUP_LOGON_ID) logonSid = Number(view.getBigUint64(at, true));
 	}
 	const sidPointer = (text: string) => {
 		const out = new BigUint64Array(1);
@@ -211,7 +222,9 @@ export async function runContained(home: string, writable: string[], argv: strin
 	// Wait off the main thread's event loop in short steps, so a kill of this helper is noticed promptly.
 	while (k32.WaitForSingleObject(process_, 200) === 0x102) await Bun.sleep(0);
 	const code = new Uint32Array(1);
-	k32.GetExitCodeProcess(process_, ptr(code));
+	if (!k32.GetExitCodeProcess(process_, ptr(code))) fail("GetExitCodeProcess");
 	k32.CloseHandle(process_);
+	// The CLI exit status only preserves one byte. Report a native startup error before that truncation.
+	if (code[0]! >= 0x80000000) throw new Error(`The Windows command exited with status 0x${code[0]!.toString(16)}.`);
 	return code[0]!;
 }

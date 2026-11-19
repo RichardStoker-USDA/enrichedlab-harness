@@ -46,13 +46,15 @@ or `.agents/skills` in a project) and hooks (`hooks.beforeTool` / `hooks.afterTo
 
 ```sh
 bun test tests                       # unit tests, including captured adapter requests
-bunx tsc -p tsconfig.json --noEmit   # types across packages
+bun test packages/web/tests/run_versions.test.ts  # research run delivery and steering contract
+bunx tsc -p tsconfig.json --noEmit    # types across packages
 (cd packages/web && bun run check)   # svelte-check for the window
 bun scripts/bench.ts                 # fixed tasks end to end through a real model
 bun scripts/deps.ts audit            # known vulnerabilities in every locked package
 ```
 
-CI runs the tests and type checks on macOS, Linux and Windows for every push (`.github/workflows/test.yml`).
+CI runs the root tests and type checks on macOS, Linux and Windows on pull requests and pushes to `main`
+(`.github/workflows/test.yml`). Run the research run contract test separately when changing that view.
 
 The desktop window has a live check of its own, run by hand or on a release tag on all three systems
 (`.github/workflows/desktop.yml`): `bun scripts/desktop_smoke.ts <folder>` starts a test engine, opens the app on a

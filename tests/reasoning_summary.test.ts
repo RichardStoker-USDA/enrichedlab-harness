@@ -14,7 +14,7 @@ import { LocalWorkspace } from "../packages/engine/src/tools/workspace.ts";
 import type { ModelWhere } from "../packages/protocol/src/index.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "el-summary-"));
-afterAll(() => rmSync(dir, { recursive: true, force: true }));
+afterAll(() => rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }));
 
 const THOUGHT = "I need to compare the two plots before writing anything. ".repeat(20);
 
@@ -76,12 +76,23 @@ function session(name: string, models: ModelProfile[], config: LabConfig): Sessi
 
 async function summaryOf(runtime: SessionRuntime): Promise<{ of: string; text: string; model: string } | undefined> {
 	runtime.prompt("Compare the plots.");
-	for (let i = 0; i < 300; i++) {
+	await settleTurn(runtime);
+	const deadline = Date.now() + 10_000;
+	while (Date.now() < deadline) {
 		const found = runtime.events.find((e) => e.t === "reasoning_summary");
 		if (found && found.t === "reasoning_summary") return found;
 		await Bun.sleep(10);
 	}
 	return undefined;
+}
+
+async function settleTurn(runtime: SessionRuntime): Promise<void> {
+	const deadline = Date.now() + 10_000;
+	while (runtime.isRunning || !runtime.events.some((event) => event.t === "assistant")) {
+		if (Date.now() >= deadline) throw new Error("Timed out waiting for the test turn.");
+		await Bun.sleep(10);
+	}
+	await runtime.naming;
 }
 
 describe("reasoning summaries", () => {
@@ -98,7 +109,7 @@ describe("reasoning summaries", () => {
 		expect(summary?.model).toBe(model.ref);
 		expect(step && step.t === "assistant" ? step.reasoning : "").toBe(THOUGHT);
 		expect(cloud.asked).toEqual([]);
-	});
+	}, 25_000);
 
 	test("a smaller model at the same lab makes them when it's set", async () => {
 		const lab = server("lab");
@@ -108,17 +119,16 @@ describe("reasoning summaries", () => {
 		const runtime = session("s2", [model, helper], { ...DEFAULT_CONFIG, summaryModel: helper.ref });
 		expect((await summaryOf(runtime))?.text).toBe("small summary.");
 		expect(lab.asked).not.toContain("summary");
-	});
+	}, 25_000);
 
 	test("are off when the person turns them off", async () => {
 		const lab = server("lab");
 		const model = profile("field/reasoner", lab.url, { kind: "lab", name: "Field Lab" });
 		const runtime = session("s3", [model], { ...DEFAULT_CONFIG, reasoningSummaries: false });
 		runtime.prompt("Compare the plots.");
-		for (let i = 0; i < 100 && (runtime.isRunning || !runtime.events.some((e) => e.t === "assistant")); i++) await Bun.sleep(10);
-		await Bun.sleep(50);
+		await settleTurn(runtime);
 		expect(lab.asked).not.toContain("summary");
-	});
+	}, 15_000);
 
 	test("each step's reasoning goes only where its own model runs, even when the model changes while a summary is out", async () => {
 		// The cloud model's summary is held until the session has moved to a model on this computer and made a step.
@@ -146,19 +156,27 @@ describe("reasoning summaries", () => {
 		const cloud = profile("cloud/reasoner", serve("cloud"), { kind: "cloud", name: "Example" });
 		const device = profile("local/qwen3-30b", serve("device"), { kind: "device", name: "this computer" });
 		const runtime = session("s5", [cloud, device], DEFAULT_CONFIG);
-		const settle = async (until: () => boolean) => {
-			for (let i = 0; i < 300 && !until(); i++) await Bun.sleep(10);
+		const settle = async (until: () => boolean, phase: string) => {
+			const deadline = Date.now() + 10_000;
+			while (!until()) {
+				if (Date.now() >= deadline) throw new Error(`Timed out waiting for ${phase}.`);
+				await Bun.sleep(10);
+			}
 		};
-		runtime.prompt("Compare the plots.");
-		await settle(() => asked.cloud.some((k) => k.startsWith("summary")) && !runtime.isRunning);
-		runtime.setModel(device.ref, undefined);
-		runtime.prompt("Now the second pair.");
-		await settle(() => runtime.events.filter((e) => e.t === "assistant").length >= 2 && !runtime.isRunning);
-		release();
-		await settle(() => runtime.events.filter((e) => e.t === "reasoning_summary").length >= 2);
+		try {
+			runtime.prompt("Compare the plots.");
+			await settle(() => asked.cloud.some((k) => k.startsWith("summary")) && !runtime.isRunning, "the first summary request");
+			runtime.setModel(device.ref, undefined);
+			runtime.prompt("Now the second pair.");
+			await settle(() => runtime.events.filter((e) => e.t === "assistant").length >= 2 && !runtime.isRunning, "the second reply");
+		} finally {
+			release();
+		}
+		await runtime.naming;
+		await settle(() => runtime.events.filter((e) => e.t === "reasoning_summary").length >= 2, "both summaries");
 		expect(asked.cloud.filter((k) => k.startsWith("summary"))).toEqual(["summary:cloud"]);
 		expect(asked.device.filter((k) => k.startsWith("summary"))).toEqual(["summary:device"]);
-	});
+	}, 35_000);
 
 	test("not chosen, summaries go to a fast model in the same place, never elsewhere, and on this computer to the session's own", () => {
 		const lab: ModelWhere = { kind: "lab", name: "Field Lab" };

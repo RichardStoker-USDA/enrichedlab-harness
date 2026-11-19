@@ -2,7 +2,8 @@
 	// The sidebar: where this person can work (places), and their sessions by project. Its top row is the window's
 	// title bar beside the traffic lights. Every row acts on click, and offers its other actions on right-click and
 	// on its "More" button.
-	import { untrack } from "svelte";
+	import { onMount, untrack } from "svelte";
+	import { runPage } from "../run/contract.ts";
 	import type { SessionSummary } from "@enrichedlab/protocol";
 	import { lab } from "../lib/store.svelte.ts";
 	import { ago, folderName } from "../lib/format.ts";
@@ -15,6 +16,20 @@
 	let expanded = $state<Record<string, boolean>>({});
 	let draft = $state("");
 	const desktop = typeof window !== "undefined" && Boolean(window.labDesktop);
+	let hasRuns = $state(false);
+	onMount(() => {
+		if (desktop) return;
+		const request = new AbortController();
+		void (async () => {
+			try {
+				const r = await fetch("/v1/runs?limit=1", { credentials:"same-origin", cache:"no-store", redirect:"error", signal:request.signal });
+				if (r.ok && r.headers.get("content-type")?.includes("application/json")) {
+					hasRuns = runPage.safeParse(await r.json()).success;
+				}
+			} catch { /* A lab without an accessible runs contract has no runs link. */ }
+		})();
+		return () => request.abort();
+	});
 
 	/** A session's project: its repository for worktree sessions, else its folder. */
 	function projectOf(cwd: string): string {
@@ -172,6 +187,7 @@
 {/if}
 <nav class="rail" class:open class:hidden={!lab.sidebar} aria-label="Places and sessions" inert={narrow && !open}>
 	<div class="toolbar">
+		{#if hasRuns}<a class="runs-link" href="/runs">Research runs</a>{/if}
 		<span class="spacer"></span>
 		<button class="icon-btn wide-only" onclick={() => (lab.sidebar = false)} title={`Hide the sidebar (${mac ? "⌃⌘S" : "Ctrl+Shift+S"})`} aria-label="Hide the sidebar">
 			<svg viewBox="0 0 16 16"><rect x="2" y="2.5" width="12" height="11" rx="2" /><path d="M6 2.5v11" /></svg>
@@ -301,6 +317,7 @@
 </nav>
 
 <style>
+	.runs-link { display:inline-flex; align-items:center; min-height:44px; color:var(--link); font-weight:550; }
 	.rail {
 		display: flex;
 		flex-direction: column;

@@ -101,13 +101,12 @@ export function personAllows(command: string, extra: string[]): boolean {
 
 /** True when every part of a command only reads, inside the project when `inside` is given. Anything unusual
  * (variables, substitution, writing redirection, background jobs, environment prefixes) is not. */
-export function isReadOnlyCommand(command: string, extra: string[] = [], inside?: (path: string) => boolean, judging: Judging = {}): boolean {
+export function isReadOnlyCommand(command: string, extra: string[] = [], inside?: (path: string) => boolean, judging: Judging = {}, posix = process.platform !== "win32"): boolean {
 	const text = command.trim();
 	if (!text) return false;
 	if (allowedCommand(command, extra)) return true;
-	// The check below parses POSIX shell. PowerShell escapes with a backtick and treats \ as a path separator, so on
-	// Windows nothing runs unasked except the person's own allowCommands.
-	if (process.platform === "win32") return false;
+	// The check below parses POSIX shell. PowerShell commands always ask.
+	if (!posix) return false;
 	// The words each command gets, as the shell reads the line (shell_syntax.ts): anything that isn't plain text asks.
 	const commands = plainCommands(text);
 	if (!commands) return false;
