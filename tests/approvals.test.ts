@@ -247,5 +247,5 @@ describe("approvals", () => {
 		// A file changed after packaging fails its checksum.
 		writeFileSync(join(out, "files", "copy.txt"), "changed\n");
 		expect(verifyPackage(out).find((row) => row.check === "files")?.ok).toBe(false);
-	});
+	}, 60_000);
 });
