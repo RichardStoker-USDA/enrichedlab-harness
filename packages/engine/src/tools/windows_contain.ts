@@ -14,7 +14,6 @@ const TOKEN_GROUPS = 2;
 const SE_GROUP_LOGON_ID = 0xc0000000;
 const CREATE_SUSPENDED = 0x4;
 const CREATE_UNICODE_ENVIRONMENT = 0x400;
-const CREATE_NO_WINDOW = 0x08000000;
 const STARTF_USESTDHANDLES = 0x100;
 const HANDLE_FLAG_INHERIT = 0x1;
 const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000;
@@ -177,7 +176,9 @@ export async function runContained(home: string, writable: string[], argv: strin
 	let logonSid = 0;
 	for (let i = 0, count = view.getUint32(0, true); i < count; i++) {
 		const at = 8 + i * 16;
-		if ((view.getUint32(at + 8, true) & SE_GROUP_LOGON_ID) === SE_GROUP_LOGON_ID) logonSid = Number(view.getBigUint64(at, true));
+		const attributes = view.getUint32(at + 8, true);
+		// Both logon flags are high bits. JavaScript bitwise operators return a signed 32-bit result.
+		if (((attributes & SE_GROUP_LOGON_ID) >>> 0) === SE_GROUP_LOGON_ID) logonSid = Number(view.getBigUint64(at, true));
 	}
 	const sidPointer = (text: string) => {
 		const out = new BigUint64Array(1);
@@ -210,8 +211,7 @@ export async function runContained(home: string, writable: string[], argv: strin
 	const info = new Uint8Array(24);
 	const line = wide(commandLine(argv));
 	const application = wide(executable);
-	// The helper is a pipe transport. The child uses those handles without attaching to the helper's console.
-	if (!adv.CreateProcessAsUserW(Number(newToken[0]), ptr(application), ptr(line), null, null, 1, CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW, null, null, ptr(startup), ptr(info))) {
+	if (!adv.CreateProcessAsUserW(Number(newToken[0]), ptr(application), ptr(line), null, null, 1, CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT, null, null, ptr(startup), ptr(info))) {
 		fail(`Starting ${argv[0]}`);
 	}
 	const process_ = Number(read.u64(ptr(info), 0));
