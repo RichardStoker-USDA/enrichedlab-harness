@@ -92,8 +92,10 @@ function grantFolders(saved: string, grant: { access: FolderAccess; id?: string 
 	const now = canonical(saved);
 	if (grant.access === "read") return now === saved ? [saved] : [saved, now];
 	// A grant saved before identities (0.2.30) asks once more and is saved again with one.
-	if (now !== saved || !grant.id || identity(saved) !== grant.id) return [];
-	return [saved];
+	if (!grant.id || identity(now) !== grant.id) return [];
+	// Even a spelling that resolves to the same object cannot carry a grant through a replacement link.
+	if (now !== saved && (process.platform !== "win32" || physical(saved).toLowerCase() !== resolve(saved).toLowerCase())) return [];
+	return [now];
 }
 
 export function folderAccess(config: LabConfig, path: string): FolderAccess | undefined {

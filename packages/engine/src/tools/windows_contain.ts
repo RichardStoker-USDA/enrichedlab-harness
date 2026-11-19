@@ -66,8 +66,8 @@ export function systemCommand(env: NodeJS.ProcessEnv = process.env): string | un
 export function systemGit(env: NodeJS.ProcessEnv = process.env): string | undefined {
 	const programFiles = env.ProgramW6432 ?? env.ProgramFiles;
 	if (!programFiles) return;
-	const install = join(programFiles, "Git");
-	return installedProgram(join(install, "cmd", "git.exe"), install);
+	const path = installedProgram(join(programFiles, "Git", "cmd", "git.exe"), programFiles);
+	return path && atOrBelow(path, join(realpathSync.native(programFiles), "Git")) ? path : undefined;
 }
 
 /** Quote one argument for a Windows command line (the rules CommandLineToArgvW reads back). */
