@@ -16,7 +16,7 @@ and open it:
 | --- | --- |
 | Mac (Apple silicon or Intel, macOS 15 or later) | `EnrichedLab-mac.pkg` (installs into your home folder) |
 | Windows 11 | `EnrichedLab-Setup-x64.exe` (installs for you only) |
-| Linux | `EnrichedLab-linux-x64.AppImage` or `-arm64` |
+| Linux | `EnrichedLab-linux-x64.AppImage` or `EnrichedLab-linux-arm64.AppImage` |
 
 Terminal only, on macOS or Linux:
 
@@ -24,7 +24,9 @@ Terminal only, on macOS or Linux:
 curl -fsSL https://github.com/RichardStoker-USDA/enrichedlab-harness/releases/latest/download/install.sh | sh
 ```
 
-Updates are signed and install themselves the same way: the app offers them, `el update` applies them.
+The app offers signed updates. Run `el update` to apply one from the terminal.
+
+The current installer release is 0.2.33. The research run view described below is in source after that release.
 
 ## First run
 
@@ -46,6 +48,9 @@ Updates are signed and install themselves the same way: the app offers them, `el
 - **Apps on request.** Ask for "an app to compare yield by treatment" and the agent builds one that runs in a pane.
   Apps can be web pages, R or Python Shiny apps, or containers, and you can share them as signed files
   ([docs/apps.md](docs/apps.md)).
+- **Research runs (source preview).** In the web workbench, open Research runs for a lab that provides the runs API.
+  Follow progress and open versioned deliveries with their receipts. When the lab allows it, send direction,
+  request more time, or stop a run from the same view.
 - **The web and PDFs.** The agent can open pages in the built-in browser, where your sign-ins persist, or in a
   browser in your lab's sandbox, which has none of your sign-ins and which you watch live in a pane. It can also
   fill PDF forms.
@@ -86,7 +91,12 @@ el doctor                # check the setup
 - [docs/architecture.md](docs/architecture.md): how the engine, the window and the terminal fit together.
 - [docs/development.md](docs/development.md): building, testing, benchmarks and releases.
 
-Build from source with [Bun](https://bun.com) 1.4: `bun install && bun scripts/build.ts`.
+Build from source with [Bun](https://bun.com) 1.4.
+
+```sh
+bun install --frozen-lockfile
+bun run build
+```
 
 ## License
 
