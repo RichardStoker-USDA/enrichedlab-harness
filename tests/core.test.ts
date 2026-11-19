@@ -364,10 +364,19 @@ describe("permissions", () => {
 		writeFileSync(join(project, "pixi.toml"), manifest("p"));
 		mkdirSync(join(project, ".pixi", "envs", "default", "conda-meta"), { recursive: true });
 		const contained = new LocalWorkspace(project, "workspace");
-		const command = posix ? "printf %s \"$CONDA_PREFIX\"" : "[Console]::Write($env:CONDA_PREFIX)";
-		const said = async (unsandboxed: boolean) => (await contained.exec(command, { timeoutMs: 20_000, signal: AbortSignal.timeout(20_000), unsandboxed })).output;
-		expect(await said(false)).toBe(join(project, ".pixi", "envs", "default"));
-		expect(await said(true)).toBe("");
+		const prefix = join(project, ".pixi", "envs", "default");
+		const options = { timeoutMs: 20_000, signal: AbortSignal.timeout(20_000) };
+		if (posix) {
+			const read = (unsandboxed: boolean) => contained.exec("printf %s \"$CONDA_PREFIX\"", { ...options, unsandboxed });
+			expect(await read(false)).toMatchObject({ exitCode: 0, output: prefix });
+			expect(await read(true)).toMatchObject({ exitCode: 0, output: "" });
+		} else {
+			const expected = prefix.replaceAll("'", "''");
+			const active = await contained.exec(`if ($env:CONDA_PREFIX -ceq '${expected}') { exit 0 } else { exit 19 }`, options);
+			expect(active, `Windows containment facility: ${contained.sandboxed}`).toMatchObject({ exitCode: 0 });
+			const inactive = await contained.exec("if ($env:CONDA_PREFIX) { exit 19 } else { exit 0 }", { ...options, unsandboxed: true });
+			expect(inactive).toMatchObject({ exitCode: 0 });
+		}
 		// A write whose path now leads outside (a link moved) is refused unless the outside path was approved.
 		const outsideDir = realpathSync.native(scratch("env-outside"));
 		symlinkSync(outsideDir, join(project, "moved"));
