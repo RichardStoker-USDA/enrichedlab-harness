@@ -14,6 +14,7 @@ const TOKEN_GROUPS = 2;
 const SE_GROUP_LOGON_ID = 0xc0000000;
 const CREATE_SUSPENDED = 0x4;
 const CREATE_UNICODE_ENVIRONMENT = 0x400;
+const CREATE_NO_WINDOW = 0x08000000;
 const STARTF_USESTDHANDLES = 0x100;
 const HANDLE_FLAG_INHERIT = 0x1;
 const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000;
@@ -209,7 +210,8 @@ export async function runContained(home: string, writable: string[], argv: strin
 	const info = new Uint8Array(24);
 	const line = wide(commandLine(argv));
 	const application = wide(executable);
-	if (!adv.CreateProcessAsUserW(Number(newToken[0]), ptr(application), ptr(line), null, null, 1, CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT, null, null, ptr(startup), ptr(info))) {
+	// The helper is a pipe transport. The child uses those handles without attaching to the helper's console.
+	if (!adv.CreateProcessAsUserW(Number(newToken[0]), ptr(application), ptr(line), null, null, 1, CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW, null, null, ptr(startup), ptr(info))) {
 		fail(`Starting ${argv[0]}`);
 	}
 	const process_ = Number(read.u64(ptr(info), 0));
@@ -220,7 +222,9 @@ export async function runContained(home: string, writable: string[], argv: strin
 	// Wait off the main thread's event loop in short steps, so a kill of this helper is noticed promptly.
 	while (k32.WaitForSingleObject(process_, 200) === 0x102) await Bun.sleep(0);
 	const code = new Uint32Array(1);
-	k32.GetExitCodeProcess(process_, ptr(code));
+	if (!k32.GetExitCodeProcess(process_, ptr(code))) fail("GetExitCodeProcess");
 	k32.CloseHandle(process_);
+	// The CLI exit status only preserves one byte. Report a native startup error before that truncation.
+	if (code[0]! >= 0x80000000) throw new Error(`The Windows command exited with status 0x${code[0]!.toString(16)}.`);
 	return code[0]!;
 }
