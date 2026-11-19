@@ -62,6 +62,14 @@ export function systemCommand(env: NodeJS.ProcessEnv = process.env): string | un
 	return systemRoot ? installedProgram(join(systemRoot, "System32", "cmd.exe"), systemRoot) : undefined;
 }
 
+/** Git for Windows from its system install, independently of the project and its PATH. */
+export function systemGit(env: NodeJS.ProcessEnv = process.env): string | undefined {
+	const programFiles = env.ProgramW6432 ?? env.ProgramFiles;
+	if (!programFiles) return;
+	const install = join(programFiles, "Git");
+	return installedProgram(join(install, "cmd", "git.exe"), install);
+}
+
 /** Quote one argument for a Windows command line (the rules CommandLineToArgvW reads back). */
 export function quoteArg(arg: string): string {
 	if (arg && !/[\s"]/.test(arg)) return arg;
@@ -103,9 +111,10 @@ export function grantWrites(home: string, sid: string, folders: string[]): void 
 	if (!todo.length) return;
 	const quote = (text: string) => `'${text.replaceAll("'", "''")}'`;
 	const script = [
+		"$ErrorActionPreference = 'Stop'",
 		`$sid = New-Object System.Security.Principal.SecurityIdentifier(${quote(sid)})`,
 		"$rule = New-Object System.Security.AccessControl.FileSystemAccessRule($sid, 'Modify', 'ContainerInherit,ObjectInherit', 'None', 'Allow')",
-		`foreach ($p in @(${todo.map(quote).join(",")})) { $d = Get-Item -LiteralPath $p; $acl = $d.GetAccessControl('Access'); $acl.AddAccessRule($rule); $d.SetAccessControl($acl) }`,
+		`foreach ($p in @(${todo.map(quote).join(",")})) { $acl = Get-Acl -LiteralPath $p; $acl.AddAccessRule($rule); Set-Acl -LiteralPath $p -AclObject $acl }`,
 	].join("; ");
 	const powershell = systemPowerShell(folders);
 	if (!powershell) throw new Error("Couldn't find PowerShell in an OS installation folder, so sandbox write access was not changed.");

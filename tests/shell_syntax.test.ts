@@ -11,13 +11,14 @@ import { inEnvironment, type EnvironmentInstaller } from "../packages/engine/src
 import { allowKeys, decide, HIDDEN_REASON, PUSH_REASON, windowsInterpreterHandoff } from "../packages/engine/src/permissions.ts";
 import { restoreSnapshot, snapshot } from "../packages/engine/src/git.ts";
 import { holdGitEntries, mkdirPhysical, openPhysical, removeEmptyTreePhysical, unlinkPhysical } from "../packages/engine/src/tools/anchored.ts";
-import { allowedCommand, isReadOnlyCommand } from "../packages/engine/src/tools/shell.ts";
+import { allowedCommand, isReadOnlyCommand as checkReadOnly } from "../packages/engine/src/tools/shell.ts";
 import type { Tool } from "../packages/engine/src/tools/types.ts";
 import { contained, containedTempEnvironment, createEngineWriteGrant, engineEnvironment, engineTemp, gitQuarantineFolder, gitQuarantineMarker, LocalWorkspace, privateBindPath, projectGitPaths, projectGitPattern, recoverGitQuarantine, safeTemp, sandboxer, trustedGit } from "../packages/engine/src/tools/workspace.ts";
 import { everyCommand, everyPowerShellCommand, plainCommands } from "../packages/engine/src/tools/shell_syntax.ts";
 import { FENCE_PY } from "../packages/engine/src/sites/sandbox_fence.ts";
 import { bashPattern, type SandboxApi, SandboxWorkspace } from "../packages/engine/src/sites/sandbox_workspace.ts";
 
+const isReadOnlyCommand: typeof checkReadOnly = (command, extra, inside, judging) => checkReadOnly(command, extra, inside, judging, true);
 const words = (line: string) => plainCommands(line)?.map((c) => c.words);
 
 describe("shell syntax", () => {
@@ -247,7 +248,7 @@ describe("round 4: what a line can hide", () => {
 		}
 	});
 
-	test("commands run in the system's bash, without startup files or functions passed in", async () => {
+	test.skipIf(process.platform === "win32")("commands run in the system's bash, without startup files or functions passed in", async () => {
 		const dir = realpathSync(mkdtempSync(join(tmpdir(), "el-startup-")));
 		try {
 			const startup = join(dir, "startup.sh");
@@ -262,7 +263,7 @@ describe("round 4: what a line can hide", () => {
 		}
 	});
 
-	test("file operations on a physical path refuse a link anywhere in it", () => {
+	test.skipIf(process.platform === "win32")("file operations on a physical path refuse a link anywhere in it", () => {
 		const base = realpathSync(mkdtempSync(join(tmpdir(), "el-anchored-")));
 		try {
 			mkdirSync(join(base, "real", "sub"), { recursive: true });
@@ -320,7 +321,7 @@ describe("round 5: one boundary", () => {
 		try {
 			const off = new LocalWorkspace(root, "off");
 			expect(decide(shell, { command: "ls" }, off, mode("ask"), new Set()).action).toBe("ask");
-			expect(decide(shell, { command: "ls" }, off, mode("ask", ["ls"]), new Set()).action).toBe("run");
+			expect(decide(shell, { command: "ls" }, off, mode("ask", ["ls"]), new Set()).action).toBe(process.platform === "win32" ? "ask" : "run");
 			expect(decide(shell, { command: "ls *" }, off, mode("ask", ["ls"]), new Set()).action).toBe("ask");
 		} finally {
 			rmSync(root, { recursive: true, force: true });
@@ -666,15 +667,15 @@ describe("round 6: containment is the boundary", () => {
 			rmSync(root, { recursive: true, force: true });
 		}
 		for (const command of ["/usr/lib/git-core/git-svn dcommit", "/usr/lib/git-core/git-svn d[c]ommit", "/usr/lib/git-core/git-p4 submit", "p4 submit", "p4 s[u]bmit"]) {
-			expect([command, allowKeys(shell, { command }).keys[0]]).toEqual([command, "shell!push"]);
+			expect([command, allowKeys(shell, { command }, false).keys[0]]).toEqual([command, "shell!push"]);
 		}
 		for (const command of ["env ./g[[:lower:]]t push origin main", "env ./p[[:digit:]] submit"]) {
-			expect([command, allowKeys(shell, { command }).keys[0]]).toEqual([command, "shell!push"]);
+			expect([command, allowKeys(shell, { command }, false).keys[0]]).toEqual([command, "shell!push"]);
 		}
-		expect(allowKeys(shell, { command: "env ./tool[[:lower:]] status" }).keys[0]).toBe("shell!hidden");
-		expect(allowKeys(shell, { command: "env ./tool[[:unknown:]] status" }).keys[0]).toMatch(/^shell!/);
+		expect(allowKeys(shell, { command: "env ./tool[[:lower:]] status" }, false).keys[0]).toBe("shell!hidden");
+		expect(allowKeys(shell, { command: "env ./tool[[:unknown:]] status" }, false).keys[0]).toMatch(/^shell!/);
 		for (const command of ["timeout 5 env GIT_SSH_COMMAND=./x git fetch", "nice env GIT_CONFIG_COUNT=1 git status", "export GIT_SSH_COMMAND", "declare -x GIT_CONFIG_COUNT", "readonly GIT_ASKPASS", "builtin export GIT_CONFIG_COUNT", "builtin declare -x GIT_SSH_COMMAND", "git -c gc.recentObjectsHook=./x gc", "git -c core.fsm[o]nitor=./x status", "git -c tar.x.command=./y archive HEAD", "git -c difftool.t.cmd=./y difftool"]) {
-			expect([command, allowKeys(shell, { command }).keys[0]]).toEqual([command, "shell!hidden"]);
+			expect([command, allowKeys(shell, { command }, false).keys[0]]).toEqual([command, "shell!hidden"]);
 		}
 		expect(FENCE_PY.match(/425, 426, 427/g)).toHaveLength(2);
 		expect(FENCE_PY).toContain('"x86_64": (0xC000003E, [16,');

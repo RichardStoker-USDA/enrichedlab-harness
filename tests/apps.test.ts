@@ -193,7 +193,10 @@ try {
 		const first = await apps.open({ sessionId: "s1", path: "apps/demo" });
 		// The data template reads files, so it asks first and serves nothing until allowed.
 		expect(first.app.granted).toBe(false);
-		expect(first.asks).toEqual(["Read files in the project"]);
+		expect(first.asks).toEqual([
+			"Read files in the project",
+			...(process.platform === "win32" ? ["Run its backend (backend.js) on this computer with your access"] : []),
+		]);
 		expect(apps.file(first.token, "index.html")).toBeUndefined();
 		apps.grant(first.app.id, true);
 		const opened = await apps.open({ sessionId: "s1", id: first.app.id });

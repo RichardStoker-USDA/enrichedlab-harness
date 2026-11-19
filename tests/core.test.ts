@@ -4,9 +4,9 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import type { SessionEvent } from "../packages/protocol/src/index.ts";
 import { budget, cutPoint, derive, elisionCandidates, SUMMARY_PREFIX } from "../packages/engine/src/session/context.ts";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import type { LabConfig } from "../packages/engine/src/config.ts";
 import { allowKey, allowKeys, canonical, decide, folderAccess, HIDDEN_REASON, identity, pushes } from "../packages/engine/src/permissions.ts";
 import { manifest } from "../packages/engine/src/tools/environment.ts";
@@ -271,7 +271,9 @@ describe("permissions", () => {
 		expect(activated(project, { PATH: "/usr/bin" }).PATH).toBe("/usr/bin");
 		writeFileSync(join(project, "pixi.toml"), manifest("p"));
 		mkdirSync(join(project, ".pixi", "envs", "default", "conda-meta"), { recursive: true });
-		expect(activated(project, { PATH: "/usr/bin" })).toMatchObject({ PATH: `${join(project, ".pixi", "envs", "default", "bin")}:/usr/bin`, CONDA_PREFIX: join(project, ".pixi", "envs", "default") });
+		const prefix = join(project, ".pixi", "envs", "default");
+		const bins = posix ? [join(prefix, "bin")] : [prefix, join(prefix, "Library", "bin"), join(prefix, "Scripts")];
+		expect(activated(project, { PATH: "/usr/bin" })).toMatchObject({ PATH: [...bins, "/usr/bin"].join(delimiter), CONDA_PREFIX: prefix });
 	});
 
 	test("in a lab's sandbox, commands run under the file fence where it holds; where it doesn't, they ask", async () => {
@@ -305,8 +307,8 @@ describe("permissions", () => {
 		const granted = { permissions: { mode: "auto", allowCommands: [] }, folders: { [sub]: { access: "change", at: "", id: identity(sub) } } } as unknown as LabConfig;
 		expect(folderAccess(granted, join(sub, "a.txt"))).toBe("change");
 		// sub replaced by a link to "/": the grant doesn't follow it anywhere.
-		rmSync(sub, { recursive: true });
-		symlinkSync("/", sub);
+		renameSync(sub, join(parent, "original"));
+		symlinkSync(elsewhere, sub, "dir");
 		expect(folderAccess(granted, join(elsewhere, "a.txt"))).toBeUndefined();
 		expect(folderAccess(granted, join(sub, "a.txt"))).toBeUndefined();
 		// Another folder moved into its place isn't the one answered for either.
@@ -319,7 +321,8 @@ describe("permissions", () => {
 		// B1: a backslash is part of a name here, not a separator.
 		const root = realpathSync(scratch("slash"));
 		const q = realpathSync(scratch("slash-q"));
-		symlinkSync(q, join(root, "jump\\part"));
+		if (!posix) mkdirSync(join(root, "jump"));
+		symlinkSync(q, join(root, "jump\\part"), "dir");
 		expect(new LocalWorkspace(root).inside("jump\\part/marker.txt")).toBe(false);
 		// B2: a lab tool that runs commands follows command rules, remembered per program apart from this computer's.
 		const api = { title: "Field Lab", run: async () => ({ exitCode: 0, stdout: "", stderr: "" }) } as unknown as SandboxApi;
@@ -343,13 +346,13 @@ describe("permissions", () => {
 		expect(decide(shell, { command: "rm notes.txt" }, await fencedLab(), askMode, new Set())).toEqual({ action: "run", fence: true });
 		// B6: a variable naming a config, startup or library place is remembered exactly; data variables aren't.
 		for (const command of ["PHP_INI_SCAN_DIR=./ini php a.php", "PHPRC=. php a.php", "DATA_DIR=out python3 a.py", "R_PROFILE_USER=./x Rscript a.R", "RUBYOPT=-r./x ruby a.rb"]) {
-			expect([command, allowKeys(shell, { command }).scope]).toEqual([command, "this exact command"]);
+			expect([command, allowKeys(shell, { command }, false).scope]).toEqual([command, "this exact command"]);
 		}
-		expect(allowKeys(shell, { command: "SEED=1 N_ITER=20 LOG_LEVEL=debug python3 run.py" }).keys).toEqual(["shell:python3"]);
+		expect(allowKeys(shell, { command: "SEED=1 N_ITER=20 LOG_LEVEL=debug python3 run.py" }, false).keys).toEqual(["shell:python3"]);
 		// B8: without history, a contained change asks.
 		const sealed = Object.assign(Object.create(ws), { sandboxed: "seatbelt" });
 		const granted = { permissions: { mode: "auto", allowCommands: [] }, folders: ided({ [home]: { access: "change", at: "" } }) } as unknown as LabConfig;
-		expect(decide(shell, { command: "rm notes.md" }, sealed, granted, new Set()).action).toBe("run");
+		expect(decide(shell, { command: "rm notes.md" }, sealed, granted, new Set()).action).toBe(posix ? "run" : "ask");
 		expect(decide(shell, { command: "rm notes.md" }, sealed, granted, new Set(), undefined, undefined, false).action).toBe("ask");
 		// B9: a grant to change saved without the folder's identity asks again.
 		expect(folderAccess({ folders: { [home]: { access: "change", at: "" } } } as unknown as LabConfig, join(home, "a.txt"))).toBeUndefined();
@@ -379,7 +382,7 @@ describe("permissions", () => {
 		expect(isReadOnlyCommand("python3 --version")).toBe(true);
 		expect(isReadOnlyCommand("/sandbox/work/P/payload --version")).toBe(false);
 		expect(isReadOnlyCommand("./payload --version")).toBe(false);
-		expect(pushes("git $'push' origin HEAD")).toBe(true);
+		expect(allowKeys(shell, { command: "git $'push' origin HEAD" }, false).keys).toEqual(["shell!push"]);
 	});
 
 	test("a path through a link and then .. is judged where the system takes it", () => {
@@ -448,7 +451,7 @@ describe("permissions", () => {
 		expect(decide(write, { path: "/Users/someone/.zshrc" }, ws, config, allowed).action).toBe("ask");
 	});
 
-	test("an answer for the session covers each program a command runs, and says so", () => {
+	test.if(posix)("an answer for the session covers each program a command runs, and says so", () => {
 		expect(allowKeys(shell, { command: "python3 run.py" })).toEqual({ keys: ["shell:python3"], scope: "“python3” commands" });
 		expect(allowKey(shell, { command: "git commit -m x" })).toBe("shell:git commit");
 		expect(allowKey(shell, { command: "pytest -q" })).toBe("shell:pytest");
