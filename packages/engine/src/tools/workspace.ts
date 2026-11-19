@@ -101,7 +101,11 @@ const MAX_EXEC_OUTPUT = 4 * 1024 * 1024;
 function pickShell(project: string): { file: string; args: (command: string) => string[]; name: string } {
 	if (process.platform === "win32") {
 		const shell = systemPowerShell(project);
-		return { file: shell?.file ?? "", args: (c) => ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", c], name: shell?.name ?? "PowerShell unavailable" };
+		return {
+			file: shell?.file ?? "",
+			args: (command) => ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(command, "utf16le").toString("base64")],
+			name: shell?.name ?? "PowerShell unavailable",
+		};
 	}
 	// Always the system's bash, the language the approvals parse (shell_syntax.ts), never a shell named by $SHELL.
 	const file = existsSync("/bin/bash") ? "/bin/bash" : "/bin/sh";
@@ -1358,10 +1362,12 @@ export class LocalWorkspace implements Workspace {
 					// Inside the project's own package environment when it has one (tools/environment.ts), for contained
 					// commands only: its programs are the project's, so they never run uncontained in place of the system's.
 					env: childEnv,
-					stdio: ["ignore", "pipe", "pipe", ...(launch.pass ?? []), ...(launch.syncFd === undefined ? [] : ["pipe" as const])],
+					stdio: [launch.facility === "restricted-token" ? "pipe" : "ignore", "pipe", "pipe", ...(launch.pass ?? []), ...(launch.syncFd === undefined ? [] : ["pipe" as const])],
 					windowsHide: true,
 					detached: process.platform !== "win32",
 				});
+				// Windows passes the handle through its restricted-process helper. Close the writing end to send EOF.
+				child.stdin?.end();
 			} catch (error) {
 				const cleanup = launch.quarantine?.(true);
 				launch.release?.();

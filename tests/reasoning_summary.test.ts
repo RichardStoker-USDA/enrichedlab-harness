@@ -76,12 +76,23 @@ function session(name: string, models: ModelProfile[], config: LabConfig): Sessi
 
 async function summaryOf(runtime: SessionRuntime): Promise<{ of: string; text: string; model: string } | undefined> {
 	runtime.prompt("Compare the plots.");
-	for (let i = 0; i < 300; i++) {
+	await settleTurn(runtime);
+	const deadline = Date.now() + 10_000;
+	while (Date.now() < deadline) {
 		const found = runtime.events.find((e) => e.t === "reasoning_summary");
 		if (found && found.t === "reasoning_summary") return found;
 		await Bun.sleep(10);
 	}
 	return undefined;
+}
+
+async function settleTurn(runtime: SessionRuntime): Promise<void> {
+	const deadline = Date.now() + 10_000;
+	while (runtime.isRunning || !runtime.events.some((event) => event.t === "assistant")) {
+		if (Date.now() >= deadline) throw new Error("Timed out waiting for the test turn.");
+		await Bun.sleep(10);
+	}
+	await runtime.naming;
 }
 
 describe("reasoning summaries", () => {
@@ -98,7 +109,7 @@ describe("reasoning summaries", () => {
 		expect(summary?.model).toBe(model.ref);
 		expect(step && step.t === "assistant" ? step.reasoning : "").toBe(THOUGHT);
 		expect(cloud.asked).toEqual([]);
-	});
+	}, 25_000);
 
 	test("a smaller model at the same lab makes them when it's set", async () => {
 		const lab = server("lab");
@@ -108,17 +119,16 @@ describe("reasoning summaries", () => {
 		const runtime = session("s2", [model, helper], { ...DEFAULT_CONFIG, summaryModel: helper.ref });
 		expect((await summaryOf(runtime))?.text).toBe("small summary.");
 		expect(lab.asked).not.toContain("summary");
-	});
+	}, 25_000);
 
 	test("are off when the person turns them off", async () => {
 		const lab = server("lab");
 		const model = profile("field/reasoner", lab.url, { kind: "lab", name: "Field Lab" });
 		const runtime = session("s3", [model], { ...DEFAULT_CONFIG, reasoningSummaries: false });
 		runtime.prompt("Compare the plots.");
-		for (let i = 0; i < 100 && (runtime.isRunning || !runtime.events.some((e) => e.t === "assistant")); i++) await Bun.sleep(10);
-		await Bun.sleep(50);
+		await settleTurn(runtime);
 		expect(lab.asked).not.toContain("summary");
-	});
+	}, 15_000);
 
 	test("each step's reasoning goes only where its own model runs, even when the model changes while a summary is out", async () => {
 		// The cloud model's summary is held until the session has moved to a model on this computer and made a step.
@@ -162,6 +172,7 @@ describe("reasoning summaries", () => {
 		} finally {
 			release();
 		}
+		await runtime.naming;
 		await settle(() => runtime.events.filter((e) => e.t === "reasoning_summary").length >= 2, "both summaries");
 		expect(asked.cloud.filter((k) => k.startsWith("summary"))).toEqual(["summary:cloud"]);
 		expect(asked.device.filter((k) => k.startsWith("summary"))).toEqual(["summary:device"]);

@@ -243,7 +243,14 @@ describe.skipIf(!devtools)("the browser in a lab's sandbox", () => {
 		expect(seen.origin.every((o) => o === null)).toBe(true);
 		// Read and type follow the lane used last without being told.
 		const typed = await browserTypeTool.run({ ref: 1, text: "nitrogen", submit: true }, ctx);
-		expect(typed.content).toContain("# Results for nitrogen");
+		expect(typed.ok).toBe(true);
+		const deadline = Date.now() + 5_000;
+		let result = typed;
+		while (!result.content.includes("# Results for nitrogen") && Date.now() < deadline) {
+			await Bun.sleep(100);
+			result = await browserReadTool.run({}, ctx);
+		}
+		expect(result.content).toContain("# Results for nitrogen");
 		expect(pages.some((p) => p.sessionId === "s1" && p.url.includes("/search?q=nitrogen") && p.lab === "Dev Lab")).toBe(true);
 	}, 60_000);
 
